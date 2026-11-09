@@ -16,7 +16,16 @@
 
 package dataoperation
 
+import "github.com/fluid-cloudnative/fluid/pkg/common"
+
 const (
 	// OperationLabel is used for pod anti affinity.
 	OperationLabel = "fluid.io/operation"
+
+	// AcceptedSpecAnnotation stores the spec snapshot accepted by the current execution
+	// generation together with the metadata.generation at which the spec was accepted.
+	// Its value is a JSON-encoded acceptedSpecPayload (see spec_binding.go). The annotation
+	// binds a data operation to one immutable spec from the moment it acquires the target
+	// dataset lock until the generation reaches its terminal state and is cleaned up.
+	AcceptedSpecAnnotation = "dataoperation." + common.LabelAnnotationPrefix + "accepted-spec"
 )

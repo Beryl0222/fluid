@@ -53,11 +53,18 @@ func (r *DataProcessReconciler) Build(object client.Object) (dataoperation.Opera
 		return nil, fmt.Errorf("object %v is not a DataProcess", object)
 	}
 
+	// Bind to the spec accepted by the current execution generation (no-op when unbound),
+	// so the processor and policy that created the in-flight Job/CronJob remain authoritative.
+	effective, err := dataoperation.ApplyAcceptedSpec(dataProcess, dataProcess.Status.Phase)
+	if err != nil {
+		return nil, err
+	}
+
 	return &dataProcessOperation{
 		Client:      r.Client,
 		Log:         r.Log,
 		Recorder:    r.Recorder,
-		dataProcess: dataProcess,
+		dataProcess: effective.(*datav1alpha1.DataProcess),
 	}, nil
 }
 

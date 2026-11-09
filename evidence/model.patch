@@ -1,0 +1,1501 @@
+diff --git a/pkg/common/constants.go b/pkg/common/constants.go
+index 66acaf3..de3a618 100644
+--- a/pkg/common/constants.go
++++ b/pkg/common/constants.go
+@@ -70,6 +70,16 @@ const (
+ 	DataOperationCollision = "DataOperationCollision"
+ 
+ 	TargetSSHSecretNameNotSet = "TargetSSHSecretNameNotSet"
++
++	// DataOperationSpecDrifted is recorded when the live spec generation differs from the
++	// generation accepted by the in-flight execution generation. The drift is diagnostic only
++	// and does not change the workloads, dataset lock or scaling basis of the running generation.
++	DataOperationSpecDrifted = "DataOperationSpecDrifted"
++
++	// DataOperationSpecCorrupted is recorded when the accepted-spec snapshot cannot be decoded.
++	// The corrupt snapshot is treated as absent and repaired by re-adopting the current spec, so
++	// it never blocks reconciliation or finalizer removal.
++	DataOperationSpecCorrupted = "DataOperationSpecCorrupted"
+ )
+ 
+ // Events related to dataflow
+diff --git a/pkg/controllers/operation_controller.go b/pkg/controllers/operation_controller.go
+index 96550fd..13ccfdc 100644
+--- a/pkg/controllers/operation_controller.go
++++ b/pkg/controllers/operation_controller.go
+@@ -134,6 +134,22 @@ func (o *OperationReconciler) ReconcileInternal(ctx dataoperation.ReconcileReque
+ 		return o.ReconcileDeletion(ctx, implement)
+ 	}
+ 
++	// 1.5 Reconcile the accepted-spec binding of the current execution generation.
++	//
++	// At Pending the live spec is accepted (frozen) before the engine acquires the dataset lock.
++	// In active phases a missing snapshot is self-healed, while a generation drift only produces
++	// an observable event and never changes the workloads, lock target or scaling basis of the
++	// running generation. The implement built above already interprets the accepted snapshot.
++	// OpStatus is always populated by the concrete reconcilers, but guard nil to stay defensive.
++	var phase common.Phase
++	if ctx.OpStatus != nil {
++		phase = ctx.OpStatus.Phase
++	}
++	if err = dataoperation.ReconcileSpecBinding(o.Client, o.Recorder, ctx.Log, object, phase); err != nil {
++		ctx.Log.Error(err, "failed to reconcile accepted spec binding")
++		return utils.RequeueIfError(err)
++	}
++
+ 	// 2. set target dataset
+ 	targetDataset, err := implement.GetTargetDataset()
+ 	if err != nil {
+diff --git a/pkg/controllers/operation_controller_deletion_test.go b/pkg/controllers/operation_controller_deletion_test.go
+new file mode 100644
+index 0000000..008f457
+--- /dev/null
++++ b/pkg/controllers/operation_controller_deletion_test.go
+@@ -0,0 +1,225 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package controllers
++
++import (
++	"context"
++	"time"
++
++	"github.com/agiledragon/gomonkey/v2"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/helm"
++)
++
++var _ = Describe("OperationReconciler ReconcileDeletion generation convergence", func() {
++	const (
++		finalizerName = "fluid.io/dataload-finalizer"
++		releaseName   = "load-loader"
++		namespace     = "default"
++	)
++
++	var (
++		s        *runtime.Scheme
++		recorder *record.FakeRecorder
++	)
++
++	BeforeEach(func() {
++		s = runtime.NewScheme()
++		Expect(datav1alpha1.AddToScheme(s)).To(Succeed())
++		recorder = record.NewFakeRecorder(16)
++	})
++
++	newDeletingObject := func() *datav1alpha1.DataLoad {
++		return &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:              "load",
++				Namespace:         namespace,
++				Finalizers:        []string{finalizerName},
++				DeletionTimestamp: &metav1.Time{Time: time.Now()},
++			},
++		}
++	}
++
++	It("deletes the stable release, releases the accepted dataset lock and removes the finalizer", func() {
++		obj := newDeletingObject()
++		dataset := &datav1alpha1.Dataset{
++			ObjectMeta: metav1.ObjectMeta{Name: "frozen-ds", Namespace: namespace},
++			Status: datav1alpha1.DatasetStatus{
++				OperationRef: map[string]string{string(dataoperation.DataLoadType): "load"},
++			},
++		}
++		c := fake.NewFakeClientWithScheme(s, obj, dataset)
++		reconciler := NewDataOperationReconciler(
++			&mockOperationInterfaceBuilder{
++				buildFunc: func(object client.Object) (dataoperation.OperationInterface, error) {
++					return &mockOperationInterface{
++						operationObject:                      obj,
++						releaseNamespacedName:                types.NamespacedName{Namespace: namespace, Name: releaseName},
++						targetDataset:                        dataset,
++						possibleTargetDatasetNamespacedNames: []types.NamespacedName{{Namespace: namespace, Name: "frozen-ds"}},
++						operationType:                        dataoperation.DataLoadType,
++					}, nil
++				},
++			}, c, fake.NullLogger(), recorder)
++
++		var deletedReleaseName, deletedReleaseNamespace string
++		patch := gomonkey.ApplyFunc(helm.DeleteReleaseIfExists, func(name, ns string) error {
++			deletedReleaseName, deletedReleaseNamespace = name, ns
++			return nil
++		})
++		defer patch.Reset()
++
++		ctx := dataoperation.ReconcileRequestContext{
++			ReconcileRequestContext: cruntime.ReconcileRequestContext{
++				Context: context.Background(),
++				Client:  c,
++				Log:     fake.NullLogger(),
++			},
++			DataOpFinalizerName: finalizerName,
++		}
++		implement, err := reconciler.implementBuilder.Build(obj)
++		Expect(err).NotTo(HaveOccurred())
++
++		result, err := reconciler.ReconcileDeletion(ctx, implement)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Requeue).To(BeFalse())
++
++		By("the helm release is deleted using the object-name-derived stable identity")
++		Expect(deletedReleaseName).To(Equal(releaseName))
++		Expect(deletedReleaseNamespace).To(Equal(namespace))
++
++		By("the dataset operation lock is released")
++		updatedDataset := &datav1alpha1.Dataset{}
++		Expect(c.Get(context.TODO(), types.NamespacedName{Namespace: namespace, Name: "frozen-ds"}, updatedDataset)).To(Succeed())
++		Expect(updatedDataset.Status.OperationRef).ToNot(HaveKey(string(dataoperation.DataLoadType)))
++
++		By("the finalizer removal lets the deleting object be garbage collected")
++		updatedObj := &datav1alpha1.DataLoad{}
++		err = c.Get(context.TODO(), types.NamespacedName{Namespace: namespace, Name: "load"}, updatedObj)
++		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "object should be removed once its last finalizer is gone")
++	})
++
++	It("still converges when the accepted target dataset was cascade-deleted (NotFound)", func() {
++		obj := newDeletingObject()
++		c := fake.NewFakeClientWithScheme(s, obj)
++		reconciler := NewDataOperationReconciler(
++			&mockOperationInterfaceBuilder{
++				buildFunc: func(object client.Object) (dataoperation.OperationInterface, error) {
++					return &mockOperationInterface{
++						operationObject:                      obj,
++						releaseNamespacedName:                types.NamespacedName{Namespace: namespace, Name: releaseName},
++						targetDatasetErr:                     apierrors.NewNotFound(schema.GroupResource{Group: "data.fluid.io", Resource: "datasets"}, "gone"),
++						possibleTargetDatasetNamespacedNames: []types.NamespacedName{{Namespace: namespace, Name: "gone"}},
++						operationType:                        dataoperation.DataLoadType,
++					}, nil
++				},
++			}, c, fake.NullLogger(), recorder)
++
++		helmCalled := false
++		patch := gomonkey.ApplyFunc(helm.DeleteReleaseIfExists, func(name, ns string) error {
++			helmCalled = true
++			return nil
++		})
++		defer patch.Reset()
++
++		ctx := dataoperation.ReconcileRequestContext{
++			ReconcileRequestContext: cruntime.ReconcileRequestContext{
++				Context: context.Background(),
++				Client:  c,
++				Log:     fake.NullLogger(),
++			},
++			DataOpFinalizerName: finalizerName,
++		}
++		implement, err := reconciler.implementBuilder.Build(obj)
++		Expect(err).NotTo(HaveOccurred())
++
++		result, err := reconciler.ReconcileDeletion(ctx, implement)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Requeue).To(BeFalse())
++		Expect(helmCalled).To(BeTrue())
++
++		updatedObj := &datav1alpha1.DataLoad{}
++		err = c.Get(context.TODO(), types.NamespacedName{Namespace: namespace, Name: "load"}, updatedObj)
++		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "finalizer removal allows the deleting object to be collected")
++	})
++
++	It("does not block finalizer removal when the accepted-spec annotation is corrupt", func() {
++		obj := &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:              "load",
++				Namespace:         namespace,
++				Finalizers:        []string{finalizerName},
++				DeletionTimestamp: &metav1.Time{Time: time.Now()},
++				Annotations:       map[string]string{dataoperation.AcceptedSpecAnnotation: "{not-json"},
++			},
++		}
++		c := fake.NewFakeClientWithScheme(s, obj)
++		reconciler := NewDataOperationReconciler(
++			&mockOperationInterfaceBuilder{
++				buildFunc: func(object client.Object) (dataoperation.OperationInterface, error) {
++					return &mockOperationInterface{
++						operationObject:                      obj,
++						releaseNamespacedName:                types.NamespacedName{Namespace: namespace, Name: releaseName},
++						targetDatasetErr:                     apierrors.NewNotFound(schema.GroupResource{Group: "data.fluid.io", Resource: "datasets"}, "gone"),
++						possibleTargetDatasetNamespacedNames: []types.NamespacedName{{Namespace: namespace, Name: "gone"}},
++						operationType:                        dataoperation.DataLoadType,
++					}, nil
++				},
++			}, c, fake.NullLogger(), recorder)
++
++		helmCalled := false
++		patch := gomonkey.ApplyFunc(helm.DeleteReleaseIfExists, func(name, ns string) error {
++			helmCalled = true
++			return nil
++		})
++		defer patch.Reset()
++
++		By("Build tolerates the corrupt annotation and deletion still converges")
++		implement, err := reconciler.implementBuilder.Build(obj)
++		Expect(err).NotTo(HaveOccurred())
++
++		ctx := dataoperation.ReconcileRequestContext{
++			ReconcileRequestContext: cruntime.ReconcileRequestContext{
++				Context: context.Background(),
++				Client:  c,
++				Log:     fake.NullLogger(),
++			},
++			DataOpFinalizerName: finalizerName,
++		}
++		result, err := reconciler.ReconcileDeletion(ctx, implement)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Requeue).To(BeFalse())
++		Expect(helmCalled).To(BeTrue())
++
++		updatedObj := &datav1alpha1.DataLoad{}
++		err = c.Get(context.TODO(), types.NamespacedName{Namespace: namespace, Name: "load"}, updatedObj)
++		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the object is collected despite the corrupt annotation")
++	})
++})
+diff --git a/pkg/controllers/v1alpha1/dataload/dataload_controller.go b/pkg/controllers/v1alpha1/dataload/dataload_controller.go
+index 40fa37c..1b0ea5e 100644
+--- a/pkg/controllers/v1alpha1/dataload/dataload_controller.go
++++ b/pkg/controllers/v1alpha1/dataload/dataload_controller.go
+@@ -70,11 +70,19 @@ func (r *DataLoadReconciler) Build(object client.Object) (dataoperation.Operatio
+ 		return nil, fmt.Errorf("object %v is not a DataLoad", object)
+ 	}
+ 
++	// Bind the operation to the spec accepted by its current execution generation, so that all
++	// spec-derived reads interpret the in-flight release/Job/CronJob with the spec that created
++	// them. Returns the live object unchanged when no generation is bound.
++	effective, err := dataoperation.ApplyAcceptedSpec(dataLoad, dataLoad.Status.Phase)
++	if err != nil {
++		return nil, err
++	}
++
+ 	return &dataLoadOperation{
+ 		Client:   r.Client,
+ 		Log:      r.Log,
+ 		Recorder: r.Recorder,
+-		dataLoad: dataLoad,
++		dataLoad: effective.(*datav1alpha1.DataLoad),
+ 	}, nil
+ }
+ 
+diff --git a/pkg/controllers/v1alpha1/dataload/spec_binding_test.go b/pkg/controllers/v1alpha1/dataload/spec_binding_test.go
+new file mode 100644
+index 0000000..a28c9d0
+--- /dev/null
++++ b/pkg/controllers/v1alpha1/dataload/spec_binding_test.go
+@@ -0,0 +1,230 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package dataload
++
++import (
++	"time"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
++	"github.com/fluid-cloudnative/fluid/pkg/utils"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++)
++
++var _ = Describe("DataLoadReconciler Build accepted-spec binding", func() {
++	var (
++		scheme     *runtime.Scheme
++		recorder   *record.FakeRecorder
++		reconciler *DataLoadReconciler
++	)
++
++	BeforeEach(func() {
++		scheme = runtime.NewScheme()
++		Expect(datav1alpha1.AddToScheme(scheme)).To(Succeed())
++		recorder = record.NewFakeRecorder(16)
++		reconciler = NewDataLoadReconciler(
++			fake.NewFakeClientWithScheme(scheme),
++			fake.NullLogger(),
++			scheme,
++			recorder,
++		)
++	})
++
++	It("keeps the live spec when no generation is bound", func() {
++		dataLoad := &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-load", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataLoadSpec{
++				Dataset: datav1alpha1.TargetDataset{Name: "live-ds", Namespace: "default"},
++				Policy:  datav1alpha1.Cron,
++			},
++		}
++		dataLoad.Status.Phase = common.PhasePending
++
++		op, err := reconciler.Build(dataLoad)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(op.GetOperationObject()).To(BeIdenticalTo(dataLoad))
++		Expect(op.GetStatusHandler()).To(BeAssignableToTypeOf(&CronStatusHandler{}))
++	})
++
++	It("interprets an active generation with the accepted spec despite live drift", func() {
++		dataLoad := &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-load", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataLoadSpec{
++				Dataset: datav1alpha1.TargetDataset{Name: "frozen-ds", Namespace: "default"},
++				Policy:  datav1alpha1.Once,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, dataLoad)
++		// Accept the generation-1 spec (the one that created the in-flight workloads).
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataLoad)).To(Succeed())
++
++		// The operator then edits the live spec (generation 2) while the operation is Executing.
++		dataLoad.Generation = 2
++		dataLoad.Spec.Dataset.Name = "live-ds"
++		dataLoad.Spec.Policy = datav1alpha1.Cron
++		dataLoad.Status.Phase = common.PhaseExecuting
++
++		op, err := reconciler.Build(dataLoad)
++		Expect(err).NotTo(HaveOccurred())
++
++		bound := op.GetOperationObject().(*datav1alpha1.DataLoad)
++		By("the effective spec is the accepted spec")
++		Expect(bound.Spec.Dataset.Name).To(Equal("frozen-ds"))
++		Expect(bound.Spec.Policy).To(Equal(datav1alpha1.Once))
++
++		By("the status handler is selected from the accepted policy, not the drifted live policy")
++		Expect(op.GetStatusHandler()).To(BeAssignableToTypeOf(&OnceStatusHandler{}))
++
++		By("the input live object is not mutated and keeps the drifted spec")
++		Expect(dataLoad.Spec.Dataset.Name).To(Equal("live-ds"))
++		Expect(dataLoad.Spec.Policy).To(Equal(datav1alpha1.Cron))
++
++		By("metadata is preserved from the live object")
++		Expect(bound.GetName()).To(Equal(dataLoad.GetName()))
++		Expect(bound.GetResourceVersion()).To(Equal(dataLoad.GetResourceVersion()))
++	})
++})
++
++var _ = Describe("DataLoad generation-bound lock and next-generation adoption", func() {
++	var scheme *runtime.Scheme
++
++	BeforeEach(func() {
++		scheme = runtime.NewScheme()
++		Expect(datav1alpha1.AddToScheme(scheme)).To(Succeed())
++	})
++
++	It("keeps the dataset lock target and release name on the accepted generation under target drift", func() {
++		frozenDataset := &datav1alpha1.Dataset{
++			ObjectMeta: metav1.ObjectMeta{Name: "frozen-ds", Namespace: "default"},
++		}
++		liveDataset := &datav1alpha1.Dataset{
++			ObjectMeta: metav1.ObjectMeta{Name: "live-ds", Namespace: "default"},
++		}
++		dataLoad := &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{Name: "load", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataLoadSpec{
++				Dataset: datav1alpha1.TargetDataset{Name: "frozen-ds", Namespace: "default"},
++				Policy:  datav1alpha1.Once,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, frozenDataset, liveDataset, dataLoad)
++		reconciler := NewDataLoadReconciler(client, fake.NullLogger(), scheme, record.NewFakeRecorder(16))
++
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataLoad)).To(Succeed())
++
++		// Target dataset is changed after the generation was accepted.
++		dataLoad.Generation = 2
++		dataLoad.Spec.Dataset.Name = "live-ds"
++		dataLoad.Status.Phase = common.PhaseExecuting
++		op, err := reconciler.Build(dataLoad)
++		Expect(err).NotTo(HaveOccurred())
++
++		By("the lock is acquired/released against the accepted dataset, never the drifted one")
++		target, err := op.GetTargetDataset()
++		Expect(err).NotTo(HaveOccurred())
++		Expect(target.Name).To(Equal("frozen-ds"))
++		Expect(op.GetPossibleTargetDatasetNamespacedNames()).To(Equal([]types.NamespacedName{
++			{Namespace: "default", Name: "frozen-ds"},
++		}))
++
++		By("the helm release identity is derived from the object name and is immune to spec drift")
++		Expect(op.GetReleaseNameSpacedName().Name).To(Equal(utils.GetDataLoadReleaseName(dataLoad.Name)))
++	})
++
++	It("adopts a newly selected policy only after the next Pending generation re-freezes the spec", func() {
++		dataLoad := &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{Name: "load", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataLoadSpec{
++				Dataset: datav1alpha1.TargetDataset{Name: "ds", Namespace: "default"},
++				Policy:  datav1alpha1.Once,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, dataLoad)
++		reconciler := NewDataLoadReconciler(client, fake.NullLogger(), scheme, record.NewFakeRecorder(16))
++
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataLoad)).To(Succeed())
++
++		dataLoad.Generation = 2
++		dataLoad.Spec.Policy = datav1alpha1.Cron
++		dataLoad.Status.Phase = common.PhaseExecuting
++
++		By("the running generation keeps interpreting the accepted Once policy")
++		op, err := reconciler.Build(dataLoad)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(op.GetStatusHandler()).To(BeAssignableToTypeOf(&OnceStatusHandler{}))
++
++		By("a new run returns to Pending and re-freezes the live spec as the next generation")
++		dataLoad.Status.Phase = common.PhasePending
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataLoad)).To(Succeed())
++		dataLoad.Status.Phase = common.PhaseExecuting
++
++		nextOp, err := reconciler.Build(dataLoad)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(nextOp.GetStatusHandler()).To(BeAssignableToTypeOf(&CronStatusHandler{}))
++	})
++
++	It("computes TTL cleanup from the accepted spec even after the live policy/TTL drift", func() {
++		ttl := int32(100)
++		dataLoad := &datav1alpha1.DataLoad{
++			ObjectMeta: metav1.ObjectMeta{Name: "load", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataLoadSpec{
++				Dataset:                  datav1alpha1.TargetDataset{Name: "ds", Namespace: "default"},
++				Policy:                   datav1alpha1.Once,
++				TTLSecondsAfterFinished: &ttl,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, dataLoad)
++		reconciler := NewDataLoadReconciler(client, fake.NullLogger(), scheme, record.NewFakeRecorder(16))
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataLoad)).To(Succeed())
++
++		// Live drift switches to Cron (which would report a nil TTL) and changes the TTL value.
++		dataLoad.Generation = 2
++		dataLoad.Spec.Policy = datav1alpha1.Cron
++		driftedTTL := int32(1)
++		dataLoad.Spec.TTLSecondsAfterFinished = &driftedTTL
++		dataLoad.Status.Phase = common.PhaseComplete
++		dataLoad.Status.Conditions = []datav1alpha1.Condition{{
++			Type:               common.Complete,
++			LastTransitionTime: metav1.NewTime(time.Now()),
++		}}
++
++		op, err := reconciler.Build(dataLoad)
++		Expect(err).NotTo(HaveOccurred())
++
++		By("the accepted Once policy still reports the accepted TTL, not the drifted nil/1s value")
++		acceptedTTL, err := op.GetTTL()
++		Expect(err).NotTo(HaveOccurred())
++		Expect(acceptedTTL).NotTo(BeNil())
++		Expect(*acceptedTTL).To(Equal(int32(100)))
++
++		By("cleanup eligibility and remaining time are derived from the accepted spec")
++		Expect(utils.NeedCleanUp(&dataLoad.Status, op)).To(BeTrue())
++		remaining, err := utils.Timeleft(&dataLoad.Status, op)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(remaining).NotTo(BeNil())
++		Expect(*remaining).To(BeNumerically(">", 50*time.Second))
++	})
++})
+diff --git a/pkg/controllers/v1alpha1/datamigrate/datamigrate_controller.go b/pkg/controllers/v1alpha1/datamigrate/datamigrate_controller.go
+index ca3f78b..5215661 100644
+--- a/pkg/controllers/v1alpha1/datamigrate/datamigrate_controller.go
++++ b/pkg/controllers/v1alpha1/datamigrate/datamigrate_controller.go
+@@ -69,11 +69,18 @@ func (r *DataMigrateReconciler) Build(object client.Object) (dataoperation.Opera
+ 		return nil, fmt.Errorf("object %v is not a DataMigrate", object)
+ 	}
+ 
++	// Bind to the spec accepted by the current execution generation (no-op when unbound),
++	// keeping target dataset, policy and parallelism stable for the in-flight workloads.
++	effective, err := dataoperation.ApplyAcceptedSpec(dataMigrate, dataMigrate.Status.Phase)
++	if err != nil {
++		return nil, err
++	}
++
+ 	return &dataMigrateOperation{
+ 		Client:      r.Client,
+ 		Log:         r.Log,
+ 		Recorder:    r.Recorder,
+-		dataMigrate: dataMigrate,
++		dataMigrate: effective.(*datav1alpha1.DataMigrate),
+ 	}, nil
+ }
+ 
+diff --git a/pkg/controllers/v1alpha1/datamigrate/spec_binding_test.go b/pkg/controllers/v1alpha1/datamigrate/spec_binding_test.go
+new file mode 100644
+index 0000000..83d0248
+--- /dev/null
++++ b/pkg/controllers/v1alpha1/datamigrate/spec_binding_test.go
+@@ -0,0 +1,157 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package datamigrate
++
++import (
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/tools/record"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++)
++
++var _ = Describe("DataMigrateReconciler Build accepted-spec binding", func() {
++	var scheme *runtime.Scheme
++
++	BeforeEach(func() {
++		scheme = runtime.NewScheme()
++		Expect(datav1alpha1.AddToScheme(scheme)).To(Succeed())
++	})
++
++	newReconciler := func() *DataMigrateReconciler {
++		return NewDataMigrateReconciler(
++			fake.NewFakeClientWithScheme(scheme),
++			fake.NullLogger(),
++			scheme,
++			record.NewFakeRecorder(16),
++		)
++	}
++
++	It("keeps the live spec when no generation is bound", func() {
++		dataMigrate := &datav1alpha1.DataMigrate{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-migrate", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataMigrateSpec{
++				From:        datav1alpha1.DataToMigrate{DataSet: &datav1alpha1.DatasetToMigrate{Name: "live-ds", Namespace: "default"}},
++				Parallelism: 5,
++				Policy:      datav1alpha1.Once,
++			},
++		}
++		dataMigrate.Status.Phase = common.PhasePending
++
++		op, err := newReconciler().Build(dataMigrate)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(op.GetOperationObject()).To(BeIdenticalTo(dataMigrate))
++		Expect(op.GetParallelTaskNumber()).To(Equal(int32(5)))
++	})
++
++	It("uses the accepted parallelism, policy and target in an active generation despite drift", func() {
++		dataMigrate := &datav1alpha1.DataMigrate{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-migrate", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataMigrateSpec{
++				From:        datav1alpha1.DataToMigrate{DataSet: &datav1alpha1.DatasetToMigrate{Name: "frozen-ds", Namespace: "default"}},
++				Parallelism: 3,
++				Policy:      datav1alpha1.Cron,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, dataMigrate)
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataMigrate)).To(Succeed())
++
++		// Live drift: target, parallelism and policy are all changed after the generation started.
++		dataMigrate.Generation = 2
++		dataMigrate.Spec.From.DataSet.Name = "live-ds"
++		dataMigrate.Spec.Parallelism = 8
++		dataMigrate.Spec.Policy = datav1alpha1.Once
++		dataMigrate.Status.Phase = common.PhaseExecuting
++
++		op, err := newReconciler().Build(dataMigrate)
++		Expect(err).NotTo(HaveOccurred())
++
++		By("scaling basis stays on the accepted parallelism")
++		Expect(op.GetParallelTaskNumber()).To(Equal(int32(3)))
++
++		By("handler and target stay on the accepted spec")
++		Expect(op.GetStatusHandler()).To(BeAssignableToTypeOf(&CronStatusHandler{}))
++		bound := op.GetOperationObject().(*datav1alpha1.DataMigrate)
++		Expect(bound.Spec.From.DataSet.Name).To(Equal("frozen-ds"))
++		Expect(bound.Spec.Policy).To(Equal(datav1alpha1.Cron))
++		Expect(bound.Spec.Parallelism).To(Equal(int32(3)))
++
++		By("the live object remains untouched and carries the drifted values")
++		Expect(dataMigrate.Spec.Parallelism).To(Equal(int32(8)))
++		Expect(dataMigrate.Spec.From.DataSet.Name).To(Equal("live-ds"))
++	})
++
++	It("adopts the new spec only after a generation re-enters Pending and re-freezes", func() {
++		dataMigrate := &datav1alpha1.DataMigrate{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-migrate", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataMigrateSpec{
++				From:        datav1alpha1.DataToMigrate{DataSet: &datav1alpha1.DatasetToMigrate{Name: "frozen-ds", Namespace: "default"}},
++				Parallelism: 3,
++				Policy:      datav1alpha1.Cron,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, dataMigrate)
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataMigrate)).To(Succeed())
++
++		// A new cron run flips the phase back to Pending and the operator changed the spec.
++		dataMigrate.Generation = 2
++		dataMigrate.Spec.Parallelism = 8
++		dataMigrate.Status.Phase = common.PhasePending
++
++		By("Pending reads the live spec and re-freezes it as the next generation")
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataMigrate)).To(Succeed())
++		dataMigrate.Status.Phase = common.PhaseExecuting
++
++		op, err := newReconciler().Build(dataMigrate)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(op.GetParallelTaskNumber()).To(Equal(int32(8)))
++	})
++
++	It("binds the Cron worker scale-out and terminal scale-to-zero basis to the accepted parallelism", func() {
++		dataMigrate := &datav1alpha1.DataMigrate{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-migrate", Namespace: "default", Generation: 1},
++			Spec: datav1alpha1.DataMigrateSpec{
++				From:        datav1alpha1.DataToMigrate{DataSet: &datav1alpha1.DatasetToMigrate{Name: "frozen-ds", Namespace: "default"}},
++				Parallelism: 3,
++				Policy:      datav1alpha1.Cron,
++			},
++		}
++		client := fake.NewFakeClientWithScheme(scheme, dataMigrate)
++		Expect(dataoperation.FreezeAcceptedSpec(client, dataMigrate)).To(Succeed())
++
++		dataMigrate.Generation = 2
++		dataMigrate.Spec.Parallelism = 8
++		dataMigrate.Status.Phase = common.PhaseExecuting
++
++		op, err := newReconciler().Build(dataMigrate)
++		Expect(err).NotTo(HaveOccurred())
++
++		By("the Cron handler observes the accepted parallelism used for worker scale-out")
++		cronHandler, ok := op.GetStatusHandler().(*CronStatusHandler)
++		Expect(ok).To(BeTrue())
++		Expect(cronHandler.dataMigrate.Spec.Parallelism).To(Equal(int32(3)))
++
++		By("the terminal scale-to-zero gate also reads the accepted parallelism")
++		Expect(op.GetParallelTaskNumber()).To(Equal(int32(3)))
++	})
++})
+diff --git a/pkg/controllers/v1alpha1/dataprocess/dataprocess_controller.go b/pkg/controllers/v1alpha1/dataprocess/dataprocess_controller.go
+index 21b8eca..b2175bb 100644
+--- a/pkg/controllers/v1alpha1/dataprocess/dataprocess_controller.go
++++ b/pkg/controllers/v1alpha1/dataprocess/dataprocess_controller.go
+@@ -53,11 +53,18 @@ func (r *DataProcessReconciler) Build(object client.Object) (dataoperation.Opera
+ 		return nil, fmt.Errorf("object %v is not a DataProcess", object)
+ 	}
+ 
++	// Bind to the spec accepted by the current execution generation (no-op when unbound),
++	// so the processor and policy that created the in-flight Job/CronJob remain authoritative.
++	effective, err := dataoperation.ApplyAcceptedSpec(dataProcess, dataProcess.Status.Phase)
++	if err != nil {
++		return nil, err
++	}
++
+ 	return &dataProcessOperation{
+ 		Client:      r.Client,
+ 		Log:         r.Log,
+ 		Recorder:    r.Recorder,
+-		dataProcess: dataProcess,
++		dataProcess: effective.(*datav1alpha1.DataProcess),
+ 	}, nil
+ }
+ 
+diff --git a/pkg/dataoperation/constants.go b/pkg/dataoperation/constants.go
+index 2085489..f1b09cd 100644
+--- a/pkg/dataoperation/constants.go
++++ b/pkg/dataoperation/constants.go
+@@ -16,7 +16,16 @@
+ 
+ package dataoperation
+ 
++import "github.com/fluid-cloudnative/fluid/pkg/common"
++
+ const (
+ 	// OperationLabel is used for pod anti affinity.
+ 	OperationLabel = "fluid.io/operation"
++
++	// AcceptedSpecAnnotation stores the spec snapshot accepted by the current execution
++	// generation together with the metadata.generation at which the spec was accepted.
++	// Its value is a JSON-encoded acceptedSpecPayload (see spec_binding.go). The annotation
++	// binds a data operation to one immutable spec from the moment it acquires the target
++	// dataset lock until the generation reaches its terminal state and is cleaned up.
++	AcceptedSpecAnnotation = "dataoperation." + common.LabelAnnotationPrefix + "accepted-spec"
+ )
+diff --git a/pkg/dataoperation/spec_binding.go b/pkg/dataoperation/spec_binding.go
+new file mode 100644
+index 0000000..9b9bf01
+--- /dev/null
++++ b/pkg/dataoperation/spec_binding.go
+@@ -0,0 +1,277 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package dataoperation
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++
++	"github.com/go-logr/logr"
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/client-go/tools/record"
++	"k8s.io/client-go/util/retry"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++)
++
++// acceptedSpecPayload is the JSON payload persisted in the AcceptedSpecAnnotation.
++// It captures the exact spec that was accepted for an execution generation and the
++// object's metadata.generation at acceptance time.
++type acceptedSpecPayload struct {
++	// Generation is metadata.generation of the object when the spec was accepted.
++	Generation int64 `json:"generation"`
++	// Spec is the raw JSON serialization of the accepted spec.
++	Spec json.RawMessage `json:"spec"`
++}
++
++// IsGenerationBound reports whether the given phase represents an execution generation
++// that must be bound to its accepted spec. Only the phases after acceptance are bound;
++// None and Pending always interpret the live spec because no generation has been accepted yet.
++func IsGenerationBound(phase common.Phase) bool {
++	switch phase {
++	case common.PhaseExecuting, common.PhaseComplete, common.PhaseFailed:
++		return true
++	default:
++		return false
++	}
++}
++
++// extractSpecRaw returns the raw JSON of the object's spec field in a type-agnostic way.
++func extractSpecRaw(obj client.Object) (json.RawMessage, error) {
++	data, err := json.Marshal(obj)
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal object %s/%s to extract spec: %w", obj.GetNamespace(), obj.GetName(), err)
++	}
++	var body map[string]json.RawMessage
++	if err = json.Unmarshal(data, &body); err != nil {
++		return nil, fmt.Errorf("failed to decode object %s/%s to extract spec: %w", obj.GetNamespace(), obj.GetName(), err)
++	}
++	specRaw, ok := body["spec"]
++	if !ok {
++		return nil, fmt.Errorf("object %s/%s has no spec field to accept", obj.GetNamespace(), obj.GetName())
++	}
++	return specRaw, nil
++}
++
++// FreezeAcceptedSpec persists the object's current spec and metadata.generation into the
++// accepted-spec annotation, establishing the immutable spec of the current execution generation.
++//
++// It is idempotent: when the annotation already reflects the current generation and spec, no
++// update is issued. The write is retried on conflicts and the in-memory object is mirrored with
++// the persisted annotation on success so that callers observe a coherent state within the same
++// reconcile loop. The annotation update only touches metadata and therefore never increments
++// metadata.generation.
++func FreezeAcceptedSpec(c client.Client, obj client.Object) error {
++	specRaw, err := extractSpecRaw(obj)
++	if err != nil {
++		return err
++	}
++	payloadRaw, err := json.Marshal(&acceptedSpecPayload{
++		Generation: obj.GetGeneration(),
++		Spec:       specRaw,
++	})
++	if err != nil {
++		return err
++	}
++	payloadStr := string(payloadRaw)
++
++	// Fast path: the in-memory object already carries the up-to-date snapshot and no write
++	// happened, so its resourceVersion remains authoritative.
++	if existing := obj.GetAnnotations()[AcceptedSpecAnnotation]; existing == payloadStr {
++		return nil
++	}
++
++	var latest client.Object
++	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++		// Re-fetch to avoid overwriting concurrent metadata changes.
++		latest = obj.DeepCopyObject().(client.Object)
++		if getErr := c.Get(context.TODO(), client.ObjectKeyFromObject(obj), latest); getErr != nil {
++			return getErr
++		}
++		if current := latest.GetAnnotations()[AcceptedSpecAnnotation]; current == payloadStr {
++			return nil
++		}
++		annotations := latest.GetAnnotations()
++		if annotations == nil {
++			annotations = map[string]string{}
++		}
++		annotations[AcceptedSpecAnnotation] = payloadStr
++		latest.SetAnnotations(annotations)
++		return c.Update(context.TODO(), latest)
++	})
++	if err != nil {
++		return err
++	}
++
++	// Mirror the authoritative metadata onto the in-memory object. Syncing the resourceVersion
++	// keeps later same-loop writes (status update, finalizer/owner update) on a current
++	// optimistic-concurrency token, since the annotation update advanced the stored token.
++	obj.SetAnnotations(latest.GetAnnotations())
++	obj.SetResourceVersion(latest.GetResourceVersion())
++	return nil
++}
++
++// loadAcceptedSpec reads and decodes the accepted-spec annotation. It returns ok=false (without
++// error) when the annotation is absent, and an error when the present annotation is malformed.
++func loadAcceptedSpec(obj client.Object) (payload acceptedSpecPayload, ok bool, err error) {
++	raw, found := obj.GetAnnotations()[AcceptedSpecAnnotation]
++	if !found || len(raw) == 0 {
++		return payload, false, nil
++	}
++	if err = json.Unmarshal([]byte(raw), &payload); err != nil {
++		return payload, false, fmt.Errorf("malformed accepted-spec annotation on %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
++	}
++	if len(payload.Spec) == 0 {
++		return payload, false, fmt.Errorf("invalid accepted-spec annotation on %s/%s: empty spec snapshot", obj.GetNamespace(), obj.GetName())
++	}
++	return payload, true, nil
++}
++
++// DetectSpecDrift reports whether the object's live metadata.generation differs from the
++// generation recorded in the accepted spec snapshot. It returns both generations for diagnostics.
++// No drift is reported when no accepted snapshot exists.
++func DetectSpecDrift(obj client.Object) (drifted bool, acceptedGeneration, currentGeneration int64, err error) {
++	payload, ok, err := loadAcceptedSpec(obj)
++	if err != nil {
++		return false, 0, obj.GetGeneration(), err
++	}
++	currentGeneration = obj.GetGeneration()
++	if !ok {
++		return false, 0, currentGeneration, nil
++	}
++	return currentGeneration != payload.Generation, payload.Generation, currentGeneration, nil
++}
++
++// ApplyAcceptedSpec returns the object that spec-derived reconciliation must read from.
++//
++// When the phase belongs to a bound execution generation (Executing/Complete/Failed) and a valid,
++// applicable accepted-spec snapshot exists, a deep copy is returned whose spec is replaced by the
++// accepted snapshot while all metadata (name, namespace, resourceVersion, finalizers, owner
++// references, deletion timestamp) is kept live. Otherwise the original object is returned unchanged.
++//
++// Any unreadable or inapplicable snapshot (malformed JSON, empty spec, or type-incompatible
++// payload) is tolerated rather than treated as a hard error: the live object is returned so
++// reconciliation (including finalizer removal during deletion) is never blocked.
++// ReconcileSpecBinding is responsible for observing and repairing the corruption.
++//
++// The result is the single chokepoint that guarantees target dataset, policy handler, parallelism,
++// TTL and helm value generation all interpret the workloads of the current generation with the
++// exact spec that created them, regardless of later live spec edits.
++func ApplyAcceptedSpec(obj client.Object, phase common.Phase) (client.Object, error) {
++	if !IsGenerationBound(phase) {
++		return obj, nil
++	}
++	effective, applicable := buildEffectiveObject(obj)
++	if !applicable {
++		// Corrupt/inapplicable annotation or no snapshot: degrade gracefully to the live object
++		// instead of blocking. The corruption is surfaced and repaired by ReconcileSpecBinding.
++		return obj, nil
++	}
++	return effective, nil
++}
++
++// buildEffectiveObject attempts to construct the spec-bound object. It returns ok=false (without
++// panicking or returning a hard error) when no usable snapshot exists or the snapshot cannot be
++// applied to the concrete object type, so callers can always fall back to the live object.
++func buildEffectiveObject(obj client.Object) (effective client.Object, applicable bool) {
++	payload, ok, err := loadAcceptedSpec(obj)
++	if err != nil || !ok {
++		return nil, false
++	}
++
++	effective = obj.DeepCopyObject().(client.Object)
++	original, err := json.Marshal(effective)
++	if err != nil {
++		return nil, false
++	}
++	var body map[string]json.RawMessage
++	if err = json.Unmarshal(original, &body); err != nil {
++		return nil, false
++	}
++	body["spec"] = payload.Spec
++	merged, err := json.Marshal(body)
++	if err != nil {
++		return nil, false
++	}
++	if err = json.Unmarshal(merged, effective); err != nil {
++		// Covers type-incompatible (but syntactically valid) snapshots, e.g. a string where the
++		// concrete spec struct expects an integer.
++		return nil, false
++	}
++	return effective, true
++}
++
++// ReconcileSpecBinding reconciles the accepted-spec bookkeeping for one loop. It never mutates
++// any workload, dataset lock or scaling state; its only side effects are the accepted-spec
++// annotation and, on drift, an observable warning event plus a log line.
++//
++//   - Pending: accept (freeze) the current live spec as the generation's spec. The engine acquires
++//     the dataset lock and transitions the phase to Executing in the same reconcile window.
++//   - Executing/Complete/Failed: self-heal a missing snapshot by adopting the current spec,
++//     otherwise compare generations and emit a diagnostic when the live spec has drifted.
++//   - None or any other phase: no-op.
++func ReconcileSpecBinding(c client.Client, recorder record.EventRecorder, log logr.Logger, obj client.Object, phase common.Phase) error {
++	switch phase {
++	case common.PhasePending:
++		return FreezeAcceptedSpec(c, obj)
++	case common.PhaseExecuting, common.PhaseComplete, common.PhaseFailed:
++		payload, ok, err := loadAcceptedSpec(obj)
++		// repairCorrupt re-adopts the current spec to fix an unreadable or inapplicable snapshot,
++		// emitting a warning so the corruption is observable without blocking reconciliation.
++		repairCorrupt := func(cause string) error {
++			log.Info("Accepted spec snapshot is corrupt, re-adopting the current spec",
++				"phase", phase, "namespace", obj.GetNamespace(), "name", obj.GetName(), "cause", cause)
++			if recorder != nil {
++				recorder.Eventf(obj, v1.EventTypeWarning, common.DataOperationSpecCorrupted,
++					"Accepted spec snapshot is corrupt and will be repaired by re-adopting the current spec: %s", cause)
++			}
++			return FreezeAcceptedSpec(c, obj)
++		}
++		if err != nil {
++			// Malformed JSON or empty spec.
++			return repairCorrupt(err.Error())
++		}
++		if !ok {
++			// Self-heal: restore the invariant for objects that entered an active phase without a
++			// snapshot (partial write, controller restart, or upgraded pre-existing objects).
++			log.Info("Accepted spec snapshot is missing in an active phase, adopting the current spec",
++				"phase", phase, "namespace", obj.GetNamespace(), "name", obj.GetName())
++			return FreezeAcceptedSpec(c, obj)
++		}
++		if _, applicable := buildEffectiveObject(obj); !applicable {
++			// Syntactically valid but type-incompatible with the concrete object (e.g. a string
++			// where the spec struct expects an integer): repair instead of getting stuck.
++			return repairCorrupt("accepted spec cannot be applied to the current object type")
++		}
++		if obj.GetGeneration() != payload.Generation {
++			log.Info("Spec drift detected during an active execution generation; the new spec will take effect in the next generation",
++				"namespace", obj.GetNamespace(), "name", obj.GetName(),
++				"acceptedGeneration", payload.Generation, "currentGeneration", obj.GetGeneration())
++			if recorder != nil {
++				recorder.Eventf(obj, v1.EventTypeWarning, common.DataOperationSpecDrifted,
++					"Spec drift detected: accepted generation %d, current generation %d. "+
++						"The running generation keeps using the accepted spec; the new spec takes effect in the next execution generation.",
++					payload.Generation, obj.GetGeneration())
++			}
++		}
++		return nil
++	default:
++		return nil
++	}
++}
+diff --git a/pkg/dataoperation/spec_binding_test.go b/pkg/dataoperation/spec_binding_test.go
+new file mode 100644
+index 0000000..d0a86a2
+--- /dev/null
++++ b/pkg/dataoperation/spec_binding_test.go
+@@ -0,0 +1,440 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package dataoperation
++
++import (
++	"context"
++	"encoding/json"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/tools/record"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++)
++
++// updateCountingClient counts Update calls to assert idempotent writes.
++type updateCountingClient struct {
++	client.Client
++	updateCount int
++}
++
++func (u *updateCountingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
++	u.updateCount++
++	return u.Client.Update(ctx, obj, opts...)
++}
++
++func newTestScheme() *runtime.Scheme {
++	s := runtime.NewScheme()
++	Expect(v1.AddToScheme(s)).To(Succeed())
++	Expect(datav1alpha1.AddToScheme(s)).To(Succeed())
++	return s
++}
++
++func decodePayload(raw string) acceptedSpecPayload {
++	var payload acceptedSpecPayload
++	Expect(json.Unmarshal([]byte(raw), &payload)).To(Succeed())
++	return payload
++}
++
++var _ = Describe("Accepted spec binding", func() {
++	const namespace = "default"
++
++	Context("FreezeAcceptedSpec", func() {
++		It("persists the current generation and spec and is idempotent", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:       "load-freeze",
++					Namespace:  namespace,
++					Generation: 1,
++				},
++				Spec: datav1alpha1.DataLoadSpec{
++					Dataset: datav1alpha1.TargetDataset{Name: "dataset-a", Namespace: namespace},
++					Policy:  datav1alpha1.Once,
++				},
++			}
++			base := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			counting := &updateCountingClient{Client: base}
++
++			By("first freeze writes the annotation once")
++			Expect(FreezeAcceptedSpec(counting, dataLoad)).To(Succeed())
++			Expect(counting.updateCount).To(Equal(1))
++
++			persisted := &datav1alpha1.DataLoad{}
++			Expect(base.Get(context.TODO(), client.ObjectKeyFromObject(dataLoad), persisted)).To(Succeed())
++			raw, found := persisted.Annotations[AcceptedSpecAnnotation]
++			Expect(found).To(BeTrue())
++			payload := decodePayload(raw)
++			Expect(payload.Generation).To(Equal(int64(1)))
++
++			var frozenSpec datav1alpha1.DataLoadSpec
++			Expect(json.Unmarshal(payload.Spec, &frozenSpec)).To(Succeed())
++			Expect(frozenSpec.Dataset.Name).To(Equal("dataset-a"))
++			Expect(frozenSpec.Policy).To(Equal(datav1alpha1.Once))
++
++			By("second freeze with the same generation issues no update")
++			Expect(FreezeAcceptedSpec(counting, dataLoad)).To(Succeed())
++			Expect(counting.updateCount).To(Equal(1))
++		})
++
++		It("re-freezes when the generation changes", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "load-regen", Namespace: namespace, Generation: 1},
++				Spec:       datav1alpha1.DataLoadSpec{Dataset: datav1alpha1.TargetDataset{Name: "dataset-a"}},
++			}
++			base := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			Expect(FreezeAcceptedSpec(base, dataLoad)).To(Succeed())
++
++			dataLoad.Generation = 2
++			dataLoad.Spec.Dataset.Name = "dataset-b"
++			Expect(FreezeAcceptedSpec(base, dataLoad)).To(Succeed())
++
++			persisted := &datav1alpha1.DataLoad{}
++			Expect(base.Get(context.TODO(), client.ObjectKeyFromObject(dataLoad), persisted)).To(Succeed())
++			payload := decodePayload(persisted.Annotations[AcceptedSpecAnnotation])
++			Expect(payload.Generation).To(Equal(int64(2)))
++			var frozenSpec datav1alpha1.DataLoadSpec
++			Expect(json.Unmarshal(payload.Spec, &frozenSpec)).To(Succeed())
++			Expect(frozenSpec.Dataset.Name).To(Equal("dataset-b"))
++		})
++	})
++
++	Context("IsGenerationBound", func() {
++		It("binds only the active execution phases", func() {
++			Expect(IsGenerationBound(common.PhaseNone)).To(BeFalse())
++			Expect(IsGenerationBound(common.PhasePending)).To(BeFalse())
++			Expect(IsGenerationBound(common.PhaseExecuting)).To(BeTrue())
++			Expect(IsGenerationBound(common.PhaseComplete)).To(BeTrue())
++			Expect(IsGenerationBound(common.PhaseFailed)).To(BeTrue())
++		})
++	})
++
++	DescribeTable("ApplyAcceptedSpec restores the frozen spec for every operation type",
++		func(liveObj client.Object, frozenTargetName string, mutateLive func(client.Object), effectiveTarget func(client.Object) string) {
++			scheme := newTestScheme()
++			base := fake.NewFakeClientWithScheme(scheme, liveObj)
++
++			// Freeze the original (generation 1) spec, then simulate a live drift to generation 2.
++			Expect(FreezeAcceptedSpec(base, liveObj)).To(Succeed())
++			frozenAnnotation := liveObj.GetAnnotations()[AcceptedSpecAnnotation]
++
++			liveObj.SetGeneration(2)
++			mutateLive(liveObj)
++
++			By("non-bound phases keep using the live spec")
++			pending, err := ApplyAcceptedSpec(liveObj, common.PhasePending)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(pending).To(BeIdenticalTo(liveObj))
++
++			By("bound phase without annotation is a no-op")
++			liveObj.SetAnnotations(nil)
++			noSnapshot, err := ApplyAcceptedSpec(liveObj, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(noSnapshot).To(BeIdenticalTo(liveObj))
++			liveObj.SetAnnotations(map[string]string{AcceptedSpecAnnotation: frozenAnnotation})
++
++			By("bound phase with snapshot returns the frozen spec but live metadata")
++			effective, err := ApplyAcceptedSpec(liveObj, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(effective).NotTo(BeIdenticalTo(liveObj))
++			Expect(effectiveTarget(effective)).To(Equal(frozenTargetName))
++			Expect(effective.GetName()).To(Equal(liveObj.GetName()))
++			Expect(effective.GetNamespace()).To(Equal(liveObj.GetNamespace()))
++			Expect(effective.GetResourceVersion()).To(Equal(liveObj.GetResourceVersion()))
++			Expect(effective.GetFinalizers()).To(Equal(liveObj.GetFinalizers()))
++
++			By("the live object is not mutated by applying the snapshot")
++			Expect(effectiveTarget(liveObj)).ToNot(Equal(frozenTargetName))
++
++			By("Complete and Failed are bound as well")
++			for _, phase := range []common.Phase{common.PhaseComplete, common.PhaseFailed} {
++				terminal, err := ApplyAcceptedSpec(liveObj, phase)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(effectiveTarget(terminal)).To(Equal(frozenTargetName))
++			}
++		},
++		Entry("DataLoad",
++			&datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "load", Namespace: namespace, Generation: 1, Finalizers: []string{"f"}},
++				Spec:       datav1alpha1.DataLoadSpec{Dataset: datav1alpha1.TargetDataset{Name: "frozen-ds"}, Policy: datav1alpha1.Once},
++			},
++			"frozen-ds",
++			func(o client.Object) { o.(*datav1alpha1.DataLoad).Spec.Dataset.Name = "live-ds" },
++			func(o client.Object) string { return o.(*datav1alpha1.DataLoad).Spec.Dataset.Name },
++		),
++		Entry("DataMigrate",
++			&datav1alpha1.DataMigrate{
++				ObjectMeta: metav1.ObjectMeta{Name: "migrate", Namespace: namespace, Generation: 1},
++				Spec: datav1alpha1.DataMigrateSpec{
++					From:        datav1alpha1.DataToMigrate{DataSet: &datav1alpha1.DatasetToMigrate{Name: "frozen-ds", Namespace: namespace}},
++					Parallelism: 3,
++					Policy:      datav1alpha1.Cron,
++				},
++			},
++			"frozen-ds",
++			func(o client.Object) { o.(*datav1alpha1.DataMigrate).Spec.From.DataSet.Name = "live-ds" },
++			func(o client.Object) string { return o.(*datav1alpha1.DataMigrate).Spec.From.DataSet.Name },
++		),
++		Entry("DataProcess",
++			&datav1alpha1.DataProcess{
++				ObjectMeta: metav1.ObjectMeta{Name: "process", Namespace: namespace, Generation: 1},
++				Spec: datav1alpha1.DataProcessSpec{
++					Dataset:   datav1alpha1.TargetDatasetWithMountPath{TargetDataset: datav1alpha1.TargetDataset{Name: "frozen-ds", Namespace: namespace}, MountPath: "/data"},
++					Policy:    datav1alpha1.Once,
++					Processor: datav1alpha1.Processor{Script: &datav1alpha1.ScriptProcessor{Source: "echo frozen"}},
++				},
++			},
++			"frozen-ds",
++			func(o client.Object) { o.(*datav1alpha1.DataProcess).Spec.Dataset.Name = "live-ds" },
++			func(o client.Object) string { return o.(*datav1alpha1.DataProcess).Spec.Dataset.Name },
++		),
++	)
++
++	Context("ApplyAcceptedSpec with a malformed annotation", func() {
++		It("tolerates the corruption and falls back to the live object instead of erroring", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        "load-bad",
++					Namespace:   namespace,
++					Annotations: map[string]string{AcceptedSpecAnnotation: "{not-json"},
++				},
++				Status: datav1alpha1.OperationStatus{Phase: common.PhaseExecuting},
++			}
++			effective, err := ApplyAcceptedSpec(dataLoad, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(effective).To(BeIdenticalTo(dataLoad))
++		})
++	})
++
++	Context("ApplyAcceptedSpec with a syntactically valid but type-incompatible snapshot", func() {
++		incompatibleAnnotation := func() map[string]string {
++			// loadMetadata is a bool in DataLoadSpec; a string makes the apply round-trip fail.
++			payload, err := json.Marshal(&acceptedSpecPayload{
++				Generation: 1,
++				Spec:       json.RawMessage(`{"loadMetadata":"not-a-bool"}`),
++			})
++			Expect(err).NotTo(HaveOccurred())
++			return map[string]string{AcceptedSpecAnnotation: string(payload)}
++		}
++
++		It("falls back to the live object without returning a blocking error", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        "load-type-mismatch",
++					Namespace:   namespace,
++					Annotations: incompatibleAnnotation(),
++				},
++				Status: datav1alpha1.OperationStatus{Phase: common.PhaseExecuting},
++			}
++			effective, err := ApplyAcceptedSpec(dataLoad, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(effective).To(BeIdenticalTo(dataLoad))
++		})
++
++		It("is repaired by ReconcileSpecBinding with a warning and a valid re-adopted snapshot", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        "load-type-mismatch",
++					Namespace:   namespace,
++					Generation:  3,
++					Annotations: incompatibleAnnotation(),
++				},
++				Spec: datav1alpha1.DataLoadSpec{
++					Dataset:      datav1alpha1.TargetDataset{Name: "ds"},
++					LoadMetadata: true,
++				},
++			}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			recorder := record.NewFakeRecorder(8)
++			Expect(ReconcileSpecBinding(c, recorder, fake.NullLogger(), dataLoad, common.PhaseExecuting)).To(Succeed())
++
++			Expect(<-recorder.Events).To(ContainSubstring(common.DataOperationSpecCorrupted))
++
++			persisted := &datav1alpha1.DataLoad{}
++			Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(dataLoad), persisted)).To(Succeed())
++			payload := decodePayload(persisted.Annotations[AcceptedSpecAnnotation])
++			Expect(payload.Generation).To(Equal(int64(3)))
++			var repaired datav1alpha1.DataLoadSpec
++			Expect(json.Unmarshal(payload.Spec, &repaired)).To(Succeed())
++			Expect(repaired.LoadMetadata).To(BeTrue())
++
++			By("the repaired snapshot now applies without falling back")
++			effective, err := ApplyAcceptedSpec(persisted, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(effective).NotTo(BeIdenticalTo(persisted))
++			Expect(effective.(*datav1alpha1.DataLoad).Spec.Dataset.Name).To(Equal("ds"))
++		})
++	})
++
++	Context("DetectSpecDrift", func() {
++		It("reports no drift without a snapshot", func() {
++			dataLoad := &datav1alpha1.DataLoad{ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: namespace, Generation: 3}}
++			drifted, accepted, current, err := DetectSpecDrift(dataLoad)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(drifted).To(BeFalse())
++			Expect(accepted).To(Equal(int64(0)))
++			Expect(current).To(Equal(int64(3)))
++		})
++
++		It("compares accepted and current generations", func() {
++			dataLoad := &datav1alpha1.DataLoad{ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: namespace, Generation: 1}}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			Expect(FreezeAcceptedSpec(c, dataLoad)).To(Succeed())
++
++			By("same generation -> no drift")
++			drifted, accepted, current, err := DetectSpecDrift(dataLoad)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(drifted).To(BeFalse())
++			Expect(accepted).To(Equal(int64(1)))
++			Expect(current).To(Equal(int64(1)))
++
++			By("advanced generation -> drift")
++			dataLoad.Generation = 2
++			drifted, accepted, current, err = DetectSpecDrift(dataLoad)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(drifted).To(BeTrue())
++			Expect(accepted).To(Equal(int64(1)))
++			Expect(current).To(Equal(int64(2)))
++		})
++
++		It("returns an error for a malformed snapshot", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "n", Namespace: namespace, Generation: 2,
++					Annotations: map[string]string{AcceptedSpecAnnotation: "bad"}},
++			}
++			_, _, _, err := DetectSpecDrift(dataLoad)
++			Expect(err).To(HaveOccurred())
++		})
++	})
++
++	Context("ReconcileSpecBinding", func() {
++		It("freezes the live spec at Pending", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "pending", Namespace: namespace, Generation: 1},
++				Spec:       datav1alpha1.DataLoadSpec{Dataset: datav1alpha1.TargetDataset{Name: "ds"}},
++			}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			recorder := record.NewFakeRecorder(8)
++			Expect(ReconcileSpecBinding(c, recorder, fake.NullLogger(), dataLoad, common.PhasePending)).To(Succeed())
++			Expect(dataLoad.GetAnnotations()).To(HaveKey(AcceptedSpecAnnotation))
++			Expect(recorder.Events).To(BeEmpty())
++		})
++
++		It("self-heals a missing snapshot in an active phase", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "heal", Namespace: namespace, Generation: 1},
++			}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			Expect(ReconcileSpecBinding(c, record.NewFakeRecorder(8), fake.NullLogger(), dataLoad, common.PhaseExecuting)).To(Succeed())
++			Expect(dataLoad.GetAnnotations()).To(HaveKey(AcceptedSpecAnnotation))
++		})
++
++		It("repairs a corrupt snapshot with a warning and re-adopts the current spec", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        "corrupt",
++					Namespace:   namespace,
++					Generation:  2,
++					Annotations: map[string]string{AcceptedSpecAnnotation: "{not-json"},
++				},
++				Spec: datav1alpha1.DataLoadSpec{Dataset: datav1alpha1.TargetDataset{Name: "ds"}},
++			}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			recorder := record.NewFakeRecorder(8)
++			Expect(ReconcileSpecBinding(c, recorder, fake.NullLogger(), dataLoad, common.PhaseExecuting)).To(Succeed())
++
++			By("a corruption warning is emitted")
++			Expect(<-recorder.Events).To(ContainSubstring(common.DataOperationSpecCorrupted))
++
++			By("the annotation is repaired to a valid snapshot of the current spec/generation")
++			persisted := &datav1alpha1.DataLoad{}
++			Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(dataLoad), persisted)).To(Succeed())
++			payload := decodePayload(persisted.Annotations[AcceptedSpecAnnotation])
++			Expect(payload.Generation).To(Equal(int64(2)))
++			var frozenSpec datav1alpha1.DataLoadSpec
++			Expect(json.Unmarshal(payload.Spec, &frozenSpec)).To(Succeed())
++			Expect(frozenSpec.Dataset.Name).To(Equal("ds"))
++
++			By("subsequent reads no longer report an error")
++			effective, err := ApplyAcceptedSpec(persisted, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(effective.GetAnnotations()[AcceptedSpecAnnotation]).To(Equal(persisted.Annotations[AcceptedSpecAnnotation]))
++		})
++
++		It("emits a warning event on drift but changes nothing else", func() {
++			dataLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: namespace, Generation: 1},
++				Spec:       datav1alpha1.DataLoadSpec{Dataset: datav1alpha1.TargetDataset{Name: "ds-a"}},
++			}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			Expect(FreezeAcceptedSpec(c, dataLoad)).To(Succeed())
++
++			liveBefore := dataLoad.DeepCopy()
++			dataLoad.Generation = 2
++			dataLoad.Spec.Dataset.Name = "ds-b"
++			// Persist the drift so the fake client reflects what the API server would store.
++			Expect(c.Update(context.TODO(), dataLoad)).To(Succeed())
++			recorder := record.NewFakeRecorder(8)
++			Expect(ReconcileSpecBinding(c, recorder, fake.NullLogger(), dataLoad, common.PhaseExecuting)).To(Succeed())
++
++			By("a single warning event carrying both generations is recorded")
++			event := <-recorder.Events
++			Expect(event).To(ContainSubstring(common.DataOperationSpecDrifted))
++			Expect(event).To(ContainSubstring("1"))
++			Expect(event).To(ContainSubstring("2"))
++			Expect(recorder.Events).To(BeEmpty())
++
++			By("the persisted object keeps the original snapshot and is otherwise untouched")
++			persisted := &datav1alpha1.DataLoad{}
++			Expect(c.Get(context.TODO(), client.ObjectKeyFromObject(dataLoad), persisted)).To(Succeed())
++			payload := decodePayload(persisted.Annotations[AcceptedSpecAnnotation])
++			Expect(payload.Generation).To(Equal(int64(1)))
++			var frozenSpec datav1alpha1.DataLoadSpec
++			Expect(json.Unmarshal(payload.Spec, &frozenSpec)).To(Succeed())
++			Expect(frozenSpec.Dataset.Name).To(Equal("ds-a"))
++			Expect(persisted.Generation).To(Equal(int64(2)))
++			Expect(persisted.Spec.Dataset.Name).To(Equal("ds-b"))
++			Expect(persisted.Annotations).To(Equal(liveBefore.Annotations))
++		})
++
++		It("does not emit events when the generation matches", func() {
++			dataLoad := &datav1alpha1.DataLoad{ObjectMeta: metav1.ObjectMeta{Name: "stable", Namespace: namespace, Generation: 1}}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), dataLoad)
++			Expect(FreezeAcceptedSpec(c, dataLoad)).To(Succeed())
++			recorder := record.NewFakeRecorder(8)
++			Expect(ReconcileSpecBinding(c, recorder, fake.NullLogger(), dataLoad, common.PhaseComplete)).To(Succeed())
++			Expect(recorder.Events).To(BeEmpty())
++		})
++
++		It("is a no-op at None and unknown phases", func() {
++			configMap := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm", Namespace: namespace}}
++			c := fake.NewFakeClientWithScheme(newTestScheme(), configMap)
++			Expect(ReconcileSpecBinding(c, record.NewFakeRecorder(8), fake.NullLogger(), configMap, common.PhaseNone)).To(Succeed())
++			Expect(configMap.GetAnnotations()).To(BeEmpty())
++
++			effective, err := ApplyAcceptedSpec(configMap, common.PhaseExecuting)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(effective).To(BeIdenticalTo(configMap))
++		})
++	})
++})

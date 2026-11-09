@@ -69,11 +69,18 @@ func (r *DataMigrateReconciler) Build(object client.Object) (dataoperation.Opera
 		return nil, fmt.Errorf("object %v is not a DataMigrate", object)
 	}
 
+	// Bind to the spec accepted by the current execution generation (no-op when unbound),
+	// keeping target dataset, policy and parallelism stable for the in-flight workloads.
+	effective, err := dataoperation.ApplyAcceptedSpec(dataMigrate, dataMigrate.Status.Phase)
+	if err != nil {
+		return nil, err
+	}
+
 	return &dataMigrateOperation{
 		Client:      r.Client,
 		Log:         r.Log,
 		Recorder:    r.Recorder,
-		dataMigrate: dataMigrate,
+		dataMigrate: effective.(*datav1alpha1.DataMigrate),
 	}, nil
 }
 

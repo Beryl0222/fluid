@@ -134,6 +134,22 @@ func (o *OperationReconciler) ReconcileInternal(ctx dataoperation.ReconcileReque
 		return o.ReconcileDeletion(ctx, implement)
 	}
 
+	// 1.5 Reconcile the accepted-spec binding of the current execution generation.
+	//
+	// At Pending the live spec is accepted (frozen) before the engine acquires the dataset lock.
+	// In active phases a missing snapshot is self-healed, while a generation drift only produces
+	// an observable event and never changes the workloads, lock target or scaling basis of the
+	// running generation. The implement built above already interprets the accepted snapshot.
+	// OpStatus is always populated by the concrete reconcilers, but guard nil to stay defensive.
+	var phase common.Phase
+	if ctx.OpStatus != nil {
+		phase = ctx.OpStatus.Phase
+	}
+	if err = dataoperation.ReconcileSpecBinding(o.Client, o.Recorder, ctx.Log, object, phase); err != nil {
+		ctx.Log.Error(err, "failed to reconcile accepted spec binding")
+		return utils.RequeueIfError(err)
+	}
+
 	// 2. set target dataset
 	targetDataset, err := implement.GetTargetDataset()
 	if err != nil {

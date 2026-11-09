@@ -70,6 +70,16 @@ const (
 	DataOperationCollision = "DataOperationCollision"
 
 	TargetSSHSecretNameNotSet = "TargetSSHSecretNameNotSet"
+
+	// DataOperationSpecDrifted is recorded when the live spec generation differs from the
+	// generation accepted by the in-flight execution generation. The drift is diagnostic only
+	// and does not change the workloads, dataset lock or scaling basis of the running generation.
+	DataOperationSpecDrifted = "DataOperationSpecDrifted"
+
+	// DataOperationSpecCorrupted is recorded when the accepted-spec snapshot cannot be decoded.
+	// The corrupt snapshot is treated as absent and repaired by re-adopting the current spec, so
+	// it never blocks reconciliation or finalizer removal.
+	DataOperationSpecCorrupted = "DataOperationSpecCorrupted"
 )
 
 // Events related to dataflow

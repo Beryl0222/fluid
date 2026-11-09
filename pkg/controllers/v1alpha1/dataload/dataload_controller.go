@@ -70,11 +70,19 @@ func (r *DataLoadReconciler) Build(object client.Object) (dataoperation.Operatio
 		return nil, fmt.Errorf("object %v is not a DataLoad", object)
 	}
 
+	// Bind the operation to the spec accepted by its current execution generation, so that all
+	// spec-derived reads interpret the in-flight release/Job/CronJob with the spec that created
+	// them. Returns the live object unchanged when no generation is bound.
+	effective, err := dataoperation.ApplyAcceptedSpec(dataLoad, dataLoad.Status.Phase)
+	if err != nil {
+		return nil, err
+	}
+
 	return &dataLoadOperation{
 		Client:   r.Client,
 		Log:      r.Log,
 		Recorder: r.Recorder,
-		dataLoad: dataLoad,
+		dataLoad: effective.(*datav1alpha1.DataLoad),
 	}, nil
 }
 
