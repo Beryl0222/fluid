@@ -25,6 +25,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,17 +68,35 @@ func (r *dataBackupOperation) UpdateStatusInfoForCompleted(infos map[string]stri
 
 	infos[cdatabackup.BackupLocationPath] = dataBackup.Spec.BackupPath
 
-	if strings.HasPrefix(dataBackup.Spec.BackupPath, common.PathScheme.String()) {
-		podName := dataBackup.GetName() + "-pod"
-		backupPod, err := kubeclient.GetPodByName(r.Client, podName, dataBackup.GetNamespace())
-		if err != nil {
-			r.Log.Error(err, "Failed to get backup pod")
-			return fmt.Errorf("failed to get backup pod")
-		}
-		infos[cdatabackup.BackupLocationNodeName] = backupPod.Spec.NodeName
-	} else {
+	if !strings.HasPrefix(dataBackup.Spec.BackupPath, common.PathScheme.String()) {
+		// pvc:// and other non-local targets are backed by networked storage: they do not
+		// depend on any specific node, keep the node location node-independent.
 		infos[cdatabackup.BackupLocationNodeName] = "NA"
+		return nil
 	}
+
+	// local:// backups are written to the node the backup pod was scheduled to. Prefer the
+	// node name persisted together with the observed terminal state so that pod garbage
+	// collection after completion can no longer block the finalization.
+	if nodeName, ok := infos[cdatabackup.BackupPodNodeName]; ok {
+		infos[cdatabackup.BackupLocationNodeName] = nodeName
+		return nil
+	}
+
+	// Fallback for statuses produced before the terminal evidence was introduced: read the
+	// node from the live pod while it still exists.
+	podName := utils.GetDataBackupPodName(dataBackup.GetName())
+	backupPod, err := kubeclient.GetPodByName(r.Client, podName, dataBackup.GetNamespace())
+	if err != nil {
+		r.Log.Error(err, "Failed to get backup pod", "pod", podName)
+		return fmt.Errorf("failed to get backup pod %s: %w", podName, err)
+	}
+	if backupPod == nil {
+		// No live pod and no persisted evidence: never guess the node, surface a diagnosable
+		// error and let the reconcile retry/backoff instead of recording a wrong location.
+		return fmt.Errorf("backup pod %s not found and no persisted node evidence in DataBackup status, cannot determine the backup location node", podName)
+	}
+	infos[cdatabackup.BackupLocationNodeName] = backupPod.Spec.NodeName
 
 	return nil
 }
@@ -133,11 +152,23 @@ func (r *dataBackupOperation) GetReleaseNameSpacedName() types.NamespacedName {
 func (r *dataBackupOperation) UpdateOperationApiStatus(opStatus *datav1alpha1.OperationStatus) error {
 	var dataBackupCpy = r.dataBackup.DeepCopy()
 	dataBackupCpy.Status = *opStatus.DeepCopy()
-	return r.Status().Update(context.Background(), dataBackupCpy)
+	err := r.Status().Update(context.Background(), dataBackupCpy)
+	if err != nil {
+		if apierrors.IsConflict(err) {
+			// The cached DataBackup is stale. Returning the conflict triggers a requeue and the
+			// next reconcile re-gets the latest object, then either re-observes the backup pod or
+			// relies on the persisted terminal evidence, so no terminal result is lost.
+			r.Log.Info("conflict updating DataBackup status, will requeue and retry with the latest object",
+				"namespace", r.dataBackup.GetNamespace(), "name", r.dataBackup.GetName(),
+				"resourceVersion", r.dataBackup.GetResourceVersion())
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *dataBackupOperation) GetStatusHandler() dataoperation.StatusHandler {
-	return &OnceHandler{}
+	return &OnceHandler{dataBackup: r.dataBackup}
 }
 
 // GetTTL implements dataoperation.OperationInterface.

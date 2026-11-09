@@ -1,0 +1,932 @@
+diff --git a/pkg/controllers/v1alpha1/databackup/implement.go b/pkg/controllers/v1alpha1/databackup/implement.go
+index 6e9e4b3..f08e347 100644
+--- a/pkg/controllers/v1alpha1/databackup/implement.go
++++ b/pkg/controllers/v1alpha1/databackup/implement.go
+@@ -25,6 +25,7 @@ import (
+ 	"time"
+ 
+ 	v1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+@@ -67,18 +68,36 @@ func (r *dataBackupOperation) UpdateStatusInfoForCompleted(infos map[string]stri
+ 
+ 	infos[cdatabackup.BackupLocationPath] = dataBackup.Spec.BackupPath
+ 
+-	if strings.HasPrefix(dataBackup.Spec.BackupPath, common.PathScheme.String()) {
+-		podName := dataBackup.GetName() + "-pod"
+-		backupPod, err := kubeclient.GetPodByName(r.Client, podName, dataBackup.GetNamespace())
+-		if err != nil {
+-			r.Log.Error(err, "Failed to get backup pod")
+-			return fmt.Errorf("failed to get backup pod")
+-		}
+-		infos[cdatabackup.BackupLocationNodeName] = backupPod.Spec.NodeName
+-	} else {
++	if !strings.HasPrefix(dataBackup.Spec.BackupPath, common.PathScheme.String()) {
++		// pvc:// and other non-local targets are backed by networked storage: they do not
++		// depend on any specific node, keep the node location node-independent.
+ 		infos[cdatabackup.BackupLocationNodeName] = "NA"
++		return nil
++	}
++
++	// local:// backups are written to the node the backup pod was scheduled to. Prefer the
++	// node name persisted together with the observed terminal state so that pod garbage
++	// collection after completion can no longer block the finalization.
++	if nodeName, ok := infos[cdatabackup.BackupPodNodeName]; ok {
++		infos[cdatabackup.BackupLocationNodeName] = nodeName
++		return nil
+ 	}
+ 
++	// Fallback for statuses produced before the terminal evidence was introduced: read the
++	// node from the live pod while it still exists.
++	podName := utils.GetDataBackupPodName(dataBackup.GetName())
++	backupPod, err := kubeclient.GetPodByName(r.Client, podName, dataBackup.GetNamespace())
++	if err != nil {
++		r.Log.Error(err, "Failed to get backup pod", "pod", podName)
++		return fmt.Errorf("failed to get backup pod %s: %w", podName, err)
++	}
++	if backupPod == nil {
++		// No live pod and no persisted evidence: never guess the node, surface a diagnosable
++		// error and let the reconcile retry/backoff instead of recording a wrong location.
++		return fmt.Errorf("backup pod %s not found and no persisted node evidence in DataBackup status, cannot determine the backup location node", podName)
++	}
++	infos[cdatabackup.BackupLocationNodeName] = backupPod.Spec.NodeName
++
+ 	return nil
+ }
+ 
+@@ -133,11 +152,23 @@ func (r *dataBackupOperation) GetReleaseNameSpacedName() types.NamespacedName {
+ func (r *dataBackupOperation) UpdateOperationApiStatus(opStatus *datav1alpha1.OperationStatus) error {
+ 	var dataBackupCpy = r.dataBackup.DeepCopy()
+ 	dataBackupCpy.Status = *opStatus.DeepCopy()
+-	return r.Status().Update(context.Background(), dataBackupCpy)
++	err := r.Status().Update(context.Background(), dataBackupCpy)
++	if err != nil {
++		if apierrors.IsConflict(err) {
++			// The cached DataBackup is stale. Returning the conflict triggers a requeue and the
++			// next reconcile re-gets the latest object, then either re-observes the backup pod or
++			// relies on the persisted terminal evidence, so no terminal result is lost.
++			r.Log.Info("conflict updating DataBackup status, will requeue and retry with the latest object",
++				"namespace", r.dataBackup.GetNamespace(), "name", r.dataBackup.GetName(),
++				"resourceVersion", r.dataBackup.GetResourceVersion())
++		}
++		return err
++	}
++	return nil
+ }
+ 
+ func (r *dataBackupOperation) GetStatusHandler() dataoperation.StatusHandler {
+-	return &OnceHandler{}
++	return &OnceHandler{dataBackup: r.dataBackup}
+ }
+ 
+ // GetTTL implements dataoperation.OperationInterface.
+diff --git a/pkg/controllers/v1alpha1/databackup/implement_test.go b/pkg/controllers/v1alpha1/databackup/implement_test.go
+index 8e7d591..4564814 100644
+--- a/pkg/controllers/v1alpha1/databackup/implement_test.go
++++ b/pkg/controllers/v1alpha1/databackup/implement_test.go
+@@ -17,6 +17,9 @@ limitations under the License.
+ package databackup
+ 
+ import (
++	"context"
++	"fmt"
++
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 
+@@ -27,11 +30,13 @@ import (
+ 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
+ 	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/client-go/tools/record"
+ 	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
+ var _ = Describe("dataBackupOperation", func() {
+@@ -235,6 +240,56 @@ var _ = Describe("dataBackupOperation", func() {
+ 			Expect(infos[cdatabackup.BackupLocationPath]).To(Equal("local:///tmp/backup"))
+ 			Expect(infos[cdatabackup.BackupLocationNodeName]).To(Equal("node-1"))
+ 		})
++
++		It("should use the persisted node evidence for local:// path when the backup pod is already deleted", func() {
++			// No pod exists in the client: the terminal evidence persisted at the observed
++			// terminal state must be enough to fill the node location without panicking.
++			dataBackup2 := dataBackup.DeepCopy()
++			dataBackup2.Spec.BackupPath = "local:///tmp/backup"
++			fakeClient2 := fake.NewFakeClientWithScheme(testScheme, dataBackup2)
++			op2 := &dataBackupOperation{
++				Client:     fakeClient2,
++				Log:        ctrl.Log.WithName("test"),
++				Recorder:   record.NewFakeRecorder(10),
++				dataBackup: dataBackup2,
++			}
++
++			infos := map[string]string{
++				cdatabackup.BackupPodNodeName: "node-from-evidence",
++			}
++			err := op2.UpdateStatusInfoForCompleted(infos)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(infos[cdatabackup.BackupLocationPath]).To(Equal("local:///tmp/backup"))
++			Expect(infos[cdatabackup.BackupLocationNodeName]).To(Equal("node-from-evidence"))
++		})
++
++		It("should return a diagnosable error for local:// path when both pod and persisted evidence are missing", func() {
++			dataBackup2 := dataBackup.DeepCopy()
++			dataBackup2.Spec.BackupPath = "local:///tmp/backup"
++			fakeClient2 := fake.NewFakeClientWithScheme(testScheme, dataBackup2)
++			op2 := &dataBackupOperation{
++				Client:     fakeClient2,
++				Log:        ctrl.Log.WithName("test"),
++				Recorder:   record.NewFakeRecorder(10),
++				dataBackup: dataBackup2,
++			}
++
++			infos := map[string]string{}
++			err := op2.UpdateStatusInfoForCompleted(infos)
++			Expect(err).To(HaveOccurred())
++			Expect(err.Error()).To(ContainSubstring("not found"))
++			// the node location must not be guessed
++			Expect(infos).NotTo(HaveKey(cdatabackup.BackupLocationNodeName))
++		})
++	})
++
++	Describe("GetStatusHandler", func() {
++		It("should return an OnceHandler bound to the dataBackup object", func() {
++			handler := op.GetStatusHandler()
++			onceHandler, ok := handler.(*OnceHandler)
++			Expect(ok).To(BeTrue())
++			Expect(onceHandler.dataBackup).To(Equal(dataBackup))
++		})
+ 	})
+ 
+ 	Describe("UpdateOperationApiStatus", func() {
+@@ -255,6 +310,20 @@ var _ = Describe("dataBackupOperation", func() {
+ 			err := op4.UpdateOperationApiStatus(opStatus)
+ 			Expect(err).NotTo(HaveOccurred())
+ 		})
++
++		It("should return and keep propagating a status update conflict for retry", func() {
++			conflictClient := newConflictStatusClient(fake.NewFakeClientWithScheme(testScheme, dataBackup))
++			opConflict := &dataBackupOperation{
++				Client:     conflictClient,
++				Log:        ctrl.Log.WithName("test"),
++				Recorder:   record.NewFakeRecorder(10),
++				dataBackup: dataBackup,
++			}
++
++			err := opConflict.UpdateOperationApiStatus(&datav1alpha1.OperationStatus{Phase: common.PhaseComplete})
++			Expect(err).To(HaveOccurred())
++			Expect(apierrors.IsConflict(err)).To(BeTrue())
++		})
+ 	})
+ 
+ 	Describe("GetTargetDataset", func() {
+@@ -288,3 +357,33 @@ var _ = Describe("dataBackupOperation", func() {
+ 		})
+ 	})
+ })
++
++// conflictStatusClient wraps a fake client and makes every status subresource Update fail
++// with a Conflict error, simulating a stale resourceVersion in a real apiserver.
++type conflictStatusClient struct {
++	client.Client
++}
++
++func newConflictStatusClient(inner client.Client) client.Client {
++	return &conflictStatusClient{Client: inner}
++}
++
++func (c *conflictStatusClient) Status() client.SubResourceWriter {
++	return &conflictSubResourceWriter{inner: c.Client.Status()}
++}
++
++type conflictSubResourceWriter struct {
++	inner client.SubResourceWriter
++}
++
++func (w *conflictSubResourceWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
++	return w.inner.Create(ctx, obj, subResource, opts...)
++}
++
++func (w *conflictSubResourceWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
++	return apierrors.NewConflict(corev1.Resource("databackups"), obj.GetName(), fmt.Errorf("injected status update conflict"))
++}
++
++func (w *conflictSubResourceWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
++	return w.inner.Patch(ctx, obj, patch, opts...)
++}
+diff --git a/pkg/controllers/v1alpha1/databackup/status_handler.go b/pkg/controllers/v1alpha1/databackup/status_handler.go
+index 9a1196b..b2b2ad2 100644
+--- a/pkg/controllers/v1alpha1/databackup/status_handler.go
++++ b/pkg/controllers/v1alpha1/databackup/status_handler.go
+@@ -17,15 +17,17 @@
+ package databackup
+ 
+ import (
++	"fmt"
+ 	"time"
+ 
+ 	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
++	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
+ 	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
+-	"github.com/fluid-cloudnative/fluid/pkg/runtime"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
+-	v1 "k8s.io/api/core/v1"
++	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+@@ -35,58 +37,262 @@ type OnceHandler struct {
+ 
+ var _ dataoperation.StatusHandler = &OnceHandler{}
+ 
+-// UpdateStatusByHelmStatus update the operation status according to helm job status
+-func (o *OnceHandler) GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *v1alpha1.OperationStatus) (result *v1alpha1.OperationStatus, err error) {
++// backupPodMissingGracePeriod is how long the controller tolerates a missing backup pod
++// when no terminal state has ever been observed. It absorbs pod creation and informer
++// cache lag; once it elapses, the DataBackup is marked Failed with a diagnosable condition
++// instead of being stuck in Executing or guessing an unconfirmed successful result.
++var backupPodMissingGracePeriod = 2 * time.Minute
++
++// terminalEvidenceKeys lists all infos keys that make up the persisted terminal-state
++// evidence of a backup pod.
++var terminalEvidenceKeys = []string{
++	cdatabackup.BackupPodName,
++	cdatabackup.BackupPodUID,
++	cdatabackup.BackupPodNodeName,
++	cdatabackup.BackupPodPhase,
++	cdatabackup.BackupPodStartTime,
++	cdatabackup.BackupPodFinishTime,
++}
++
++// GetOperationStatus resolves the DataBackup status from the backup pod.
++//
++// Once the backup pod is observed in a terminal phase (Succeeded/Failed), the execution
++// identity (pod name/UID) and the result (phase, node, start/finish timestamps) are
++// persisted into the DataBackup status together with the phase transition. The controller
++// can therefore finish the remaining bookkeeping (phase, infos, dataset lock release, TTL
++// and finalizer) even if the pod is garbage collected before the next reconcile or the
++// controller is restarted. A pod that disappears without any observed terminal state is
++// never treated as successful: after a bounded grace period the DataBackup is marked
++// Failed with the BackupPodMissing reason.
++func (o *OnceHandler) GetOperationStatus(ctx cruntime.ReconcileRequestContext, opStatus *v1alpha1.OperationStatus) (result *v1alpha1.OperationStatus, err error) {
+ 	result = opStatus.DeepCopy()
+ 	object := o.dataBackup
+-	// 1. gdt pod name
+ 	backupPodName := utils.GetDataBackupPodName(object.GetName())
++
+ 	backupPod, err := kubeclient.GetPodByName(ctx.Client, backupPodName, object.GetNamespace())
+ 	if err != nil {
++		// Real API errors (everything except NotFound, which is normalized to (nil, nil)
++		// by GetPodByName) keep being propagated to the reconcile retry loop.
+ 		ctx.Log.Error(err, "Failed to get databackup-pod")
+ 		return
+ 	}
+ 
+-	// 2. only update status if finished
+-	if !kubeclient.IsFinishedPod(backupPod) {
+-		return
++	// Case 1: the backup pod still exists, observe its state directly.
++	if backupPod != nil {
++		// The pod came back, any previous missing-grace marker is obsolete.
++		if _, ok := result.Infos[cdatabackup.BackupPodMissingSince]; ok {
++			ctx.Log.Info("backup pod reappeared, clear the missing grace marker", "pod", backupPodName)
++			delete(result.Infos, cdatabackup.BackupPodMissingSince)
++		}
++
++		// A persisted UID that differs from the live pod means the same-name executor was
++		// recreated (e.g. the DataBackup was deleted and recreated). Discard the stale
++		// terminal evidence and re-baseline on the new pod instead of misattributing results.
++		if persistedUID, ok := result.Infos[cdatabackup.BackupPodUID]; ok && persistedUID != "" && persistedUID != string(backupPod.UID) {
++			ctx.Log.Info("detected a recreated backup pod with a new UID, discard stale terminal evidence and re-observe",
++				"pod", backupPodName, "persistedPodUID", persistedUID, "livePodUID", string(backupPod.UID),
++				"dataBackupUID", string(object.GetUID()))
++			clearTerminalEvidence(result.Infos)
++		}
++
++		// Running or pending pod: no phase transition and no status write, preserving the
++		// behavior for normally running pods.
++		if !kubeclient.IsFinishedPod(backupPod) {
++			return result, nil
++		}
++
++		// Terminal state observed. Persist the execution identity and the result in the SAME
++		// status update as the phase transition so that a later pod deletion or a controller
++		// restart cannot strip the DataBackup of its terminal evidence.
++		finishTime := getPodFinishTime(backupPod)
++		result.Duration = utils.CalculateDuration(backupPod.CreationTimestamp.Time, finishTime)
++		if result.Infos == nil {
++			result.Infos = map[string]string{}
++		}
++		persistTerminalEvidence(result.Infos, backupPod, finishTime)
++
++		if kubeclient.IsSucceededPod(backupPod) {
++			result.Phase = common.PhaseComplete
++			result.Conditions = []v1alpha1.Condition{
++				buildBackupCondition(common.Complete, "BackupSuccessful", "Backup Pod exec successfully and finish", finishTime),
++			}
++		} else if kubeclient.IsFailedPod(backupPod) {
++			result.Phase = common.PhaseFailed
++			result.Conditions = []v1alpha1.Condition{
++				buildBackupCondition(common.Failed, "BackupFailed", "Backup Pod exec failed and exit", finishTime),
++			}
++		}
++		return result, nil
+ 	}
+ 
+-	// TODO: inject nodeaffinity like other data operations when using job instead of pod
+-
+-	var finishTime time.Time
+-	if len(backupPod.Status.Conditions) != 0 {
+-		finishTime = backupPod.Status.Conditions[0].LastTransitionTime.Time
+-	} else {
+-		// fail to get finishTime, use current time as default
+-		finishTime = time.Now()
+-	}
+-	result.Duration = utils.CalculateDuration(backupPod.CreationTimestamp.Time, finishTime)
+-
+-	if kubeclient.IsSucceededPod(backupPod) {
+-		result.Phase = common.PhaseComplete
+-		result.Conditions = []v1alpha1.Condition{
+-			{
+-				Type:               common.Complete,
+-				Status:             v1.ConditionTrue,
+-				Reason:             "BackupSuccessful",
+-				Message:            "Backup Pod exec successfully and finish",
+-				LastProbeTime:      metav1.NewTime(time.Now()),
+-				LastTransitionTime: metav1.NewTime(finishTime),
+-			},
++	// Case 2: the backup pod is gone.
++	// 2a: the terminal state was observed and persisted before the pod was deleted. Rebuild
++	// any drifted phase/duration from the CR-borne evidence and let the reconcile continue
++	// without accessing the pod.
++	if hasTerminalEvidence(opStatus.Infos) {
++		ctx.Log.Info("backup pod is deleted after its terminal state was observed, rely on the persisted terminal evidence",
++			"pod", backupPodName, "podUID", opStatus.Infos[cdatabackup.BackupPodUID])
++		reconstructTerminalStatusFromEvidence(ctx, result)
++		return result, nil
++	}
++
++	// 2b: the DataBackup is already terminal without structured evidence (for example a
++	// failure synthesized by an older controller version). Trust the persisted phase instead
++	// of inferring anything from the missing pod.
++	if result.Phase == common.PhaseComplete || result.Phase == common.PhaseFailed {
++		ctx.Log.Info("backup pod is missing while DataBackup is already in a terminal phase, keep the persisted phase",
++			"pod", backupPodName, "phase", result.Phase)
++		return result, nil
++	}
++
++	// 2c: the pod is missing and a terminal state was NEVER observed. A successful result
++	// must not be guessed. Apply a bounded grace period to tolerate pod creation / cache lag,
++	// then mark the DataBackup Failed with a diagnosable condition.
++	since, ok := result.Infos[cdatabackup.BackupPodMissingSince]
++	if !ok || since == "" {
++		if result.Infos == nil {
++			result.Infos = map[string]string{}
+ 		}
+-	} else if kubeclient.IsFailedPod(backupPod) {
+-		result.Phase = common.PhaseFailed
+-		result.Conditions = []v1alpha1.Condition{
+-			{
+-				Type:               common.Failed,
+-				Status:             v1.ConditionTrue,
+-				Reason:             "BackupFailed",
+-				Message:            "Backup Pod exec failed and exit",
+-				LastProbeTime:      metav1.NewTime(time.Now()),
+-				LastTransitionTime: metav1.NewTime(finishTime),
+-			},
++		result.Infos[cdatabackup.BackupPodMissingSince] = time.Now().UTC().Format(time.RFC3339)
++		ctx.Log.Info("backup pod not found and no terminal state has been observed, start the missing grace period",
++			"pod", backupPodName, "gracePeriod", backupPodMissingGracePeriod.String())
++		return result, nil
++	}
++
++	missingAt, parseErr := time.Parse(time.RFC3339, since)
++	if parseErr != nil {
++		// A malformed marker must not cause an immediate failure: restart the grace period.
++		ctx.Log.Error(parseErr, "failed to parse the backup pod missing timestamp, restart the grace period", "raw", since)
++		result.Infos[cdatabackup.BackupPodMissingSince] = time.Now().UTC().Format(time.RFC3339)
++		return result, nil
++	}
++
++	if time.Since(missingAt) < backupPodMissingGracePeriod {
++		ctx.Log.V(1).Info("backup pod still missing within the grace period, keep waiting",
++			"pod", backupPodName, "elapsed", time.Since(missingAt).String())
++		// Return the untouched status so that no redundant status update is issued; the
++		// executing-phase reconcile requeues periodically anyway.
++		return opStatus.DeepCopy(), nil
++	}
++
++	// Grace period exhausted: surface a diagnosable failure and unblock lock release, TTL
++	// and finalizer processing.
++	reason := cdatabackup.BackupPodMissingReason
++	message := fmt.Sprintf("Backup pod %s disappeared before its terminal state was observed, mark the DataBackup as Failed instead of guessing an unconfirmed result", backupPodName)
++	ctx.Log.Error(fmt.Errorf("backup pod missing before its terminal state was observed"), message,
++		"pod", backupPodName, "namespace", object.GetNamespace(), "name", object.GetName(),
++		"dataBackupUID", string(object.GetUID()))
++	if ctx.Recorder != nil {
++		ctx.Recorder.Eventf(object, corev1.EventTypeWarning, cdatabackup.BackupPodMissingReason, "%s", message)
++	}
++
++	delete(result.Infos, cdatabackup.BackupPodMissingSince)
++	result.Phase = common.PhaseFailed
++	result.Duration = utils.CalculateDuration(object.GetCreationTimestamp().Time, time.Now())
++	result.Conditions = []v1alpha1.Condition{
++		buildBackupCondition(common.Failed, reason, message, time.Now()),
++	}
++	return result, nil
++}
++
++// getPodFinishTime returns the pod's terminal transition time, falling back to the current
++// time when the pod does not report any condition.
++func getPodFinishTime(pod *corev1.Pod) time.Time {
++	if len(pod.Status.Conditions) != 0 {
++		return pod.Status.Conditions[0].LastTransitionTime.Time
++	}
++	// fail to get finishTime, use current time as default
++	return time.Now()
++}
++
++// persistTerminalEvidence writes the execution identity and result of the terminated backup
++// pod into the DataBackup infos so that the evidence survives the pod's deletion.
++func persistTerminalEvidence(infos map[string]string, pod *corev1.Pod, finishTime time.Time) {
++	infos[cdatabackup.BackupPodName] = pod.Name
++	infos[cdatabackup.BackupPodUID] = string(pod.UID)
++	infos[cdatabackup.BackupPodNodeName] = pod.Spec.NodeName
++	infos[cdatabackup.BackupPodPhase] = string(pod.Status.Phase)
++	infos[cdatabackup.BackupPodStartTime] = pod.CreationTimestamp.UTC().Format(time.RFC3339)
++	infos[cdatabackup.BackupPodFinishTime] = finishTime.UTC().Format(time.RFC3339)
++}
++
++// clearTerminalEvidence drops all backup-pod terminal evidence from the given infos.
++func clearTerminalEvidence(infos map[string]string) {
++	for _, key := range terminalEvidenceKeys {
++		delete(infos, key)
++	}
++}
++
++// hasTerminalEvidence reports whether the infos carry a complete, terminal observation of
++// the backup pod.
++func hasTerminalEvidence(infos map[string]string) bool {
++	if infos == nil {
++		return false
++	}
++	if _, ok := infos[cdatabackup.BackupPodFinishTime]; !ok {
++		return false
++	}
++	phase := infos[cdatabackup.BackupPodPhase]
++	return phase == string(corev1.PodSucceeded) || phase == string(corev1.PodFailed)
++}
++
++// reconstructTerminalStatusFromEvidence rebuilds the phase, conditions and duration from the
++// persisted evidence when the backup pod is already gone. Fields that are already consistent
++// are left untouched; only drifted fields are repaired and logged.
++func reconstructTerminalStatusFromEvidence(ctx cruntime.ReconcileRequestContext, result *v1alpha1.OperationStatus) {
++	infos := result.Infos
++
++	finishTime, err := time.Parse(time.RFC3339, infos[cdatabackup.BackupPodFinishTime])
++	if err != nil {
++		// Do not guess anything from unparseable evidence: the already persisted phase and
++		// conditions remain authoritative.
++		ctx.Log.Error(err, "failed to parse the persisted backup pod finish time, keep the current phase",
++			"raw", infos[cdatabackup.BackupPodFinishTime])
++		return
++	}
++
++	var wantPhase common.Phase
++	var condition v1alpha1.Condition
++	switch infos[cdatabackup.BackupPodPhase] {
++	case string(corev1.PodSucceeded):
++		wantPhase = common.PhaseComplete
++		condition = buildBackupCondition(common.Complete, "BackupSuccessful", "Backup Pod exec successfully and finish", finishTime)
++	case string(corev1.PodFailed):
++		wantPhase = common.PhaseFailed
++		condition = buildBackupCondition(common.Failed, "BackupFailed", "Backup Pod exec failed and exit", finishTime)
++	default:
++		ctx.Log.Info("persisted terminal evidence carries an unknown pod phase, keep the current phase",
++			"podPhase", infos[cdatabackup.BackupPodPhase])
++		return
++	}
++
++	// Recompute the duration deterministically from the persisted executor timestamps only
++	// when it is missing, covering cases where the status update carrying the duration was
++	// lost, while avoiding redundant status writes during steady-state reconciliation.
++	if result.Duration == "" || result.Duration == "Unfinished" {
++		if startTime, err := time.Parse(time.RFC3339, infos[cdatabackup.BackupPodStartTime]); err == nil {
++			if duration := utils.CalculateDuration(startTime, finishTime); duration != "" {
++				result.Duration = duration
++			}
+ 		}
+ 	}
+-	return
++
++	if result.Phase != wantPhase {
++		ctx.Log.Info("reconstruct the DataBackup terminal phase from persisted evidence after the backup pod was deleted",
++			"oldPhase", result.Phase, "newPhase", wantPhase, "podUID", infos[cdatabackup.BackupPodUID])
++		result.Phase = wantPhase
++		result.Conditions = []v1alpha1.Condition{condition}
++	}
++}
++
++// buildBackupCondition constructs a terminal DataBackup condition with consistent timestamps.
++func buildBackupCondition(conditionType common.ConditionType, reason, message string, transitionTime time.Time) v1alpha1.Condition {
++	return v1alpha1.Condition{
++		Type:               conditionType,
++		Status:             corev1.ConditionTrue,
++		Reason:             reason,
++		Message:            message,
++		LastProbeTime:      metav1.NewTime(time.Now()),
++		LastTransitionTime: metav1.NewTime(transitionTime),
++	}
+ }
+diff --git a/pkg/controllers/v1alpha1/databackup/status_handler_test.go b/pkg/controllers/v1alpha1/databackup/status_handler_test.go
+index 204193f..0cef343 100644
+--- a/pkg/controllers/v1alpha1/databackup/status_handler_test.go
++++ b/pkg/controllers/v1alpha1/databackup/status_handler_test.go
+@@ -24,12 +24,14 @@ import (
+ 
+ 	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
++	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
+ 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
+ 	corev1 "k8s.io/api/core/v1"
+ 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
+ )
+ 
+ var _ = Describe("OnceHandler", func() {
+@@ -132,9 +134,11 @@ var _ = Describe("OnceHandler", func() {
+ 			Expect(opStatus.Phase).To(Equal(mockDataBackup.Status.Phase))
+ 		})
+ 
+-		It("should return unchanged status when backup pod does not exist", func() {
+-			// No pod in the fake client: GetPodByName returns (nil, nil) for not-found
+-			// IsFinishedPod(nil) returns false, so status is returned unchanged
++		It("should start the missing grace period when backup pod does not exist and no terminal state was observed", func() {
++			// No pod in the fake client: GetPodByName returns (nil, nil) for not-found.
++			// The terminal state was never observed, so the phase must not flip to Complete
++			// (never guess success). Instead a missing-grace marker is persisted and the phase
++			// stays unchanged.
+ 			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup)
+ 			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
+ 			ctx := cruntime.ReconcileRequestContext{
+@@ -142,13 +146,299 @@ var _ = Describe("OnceHandler", func() {
+ 					Namespace: "default",
+ 					Name:      "",
+ 				},
+-				Client: client,
+-				Log:    fake.NullLogger(),
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
+ 			}
+ 
+ 			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &mockDataBackup.Status)
+ 			Expect(err).NotTo(HaveOccurred())
+ 			Expect(opStatus.Phase).To(Equal(mockDataBackup.Status.Phase))
++			Expect(opStatus.Infos).To(HaveKey(cdatabackup.BackupPodMissingSince))
++			Expect(opStatus.Infos[cdatabackup.BackupPodMissingSince]).NotTo(BeEmpty())
++		})
++
++		It("should persist terminal evidence when the backup pod succeeded", func() {
++			mockPod := corev1.Pod{
++				ObjectMeta: v1.ObjectMeta{
++					Name:              "test-pod",
++					Namespace:         "default",
++					UID:               types.UID("pod-uid-1"),
++					CreationTimestamp: v1.NewTime(time.Now().Add(-30 * time.Second)),
++				},
++				Spec: corev1.PodSpec{
++					NodeName: "node-1",
++				},
++				Status: corev1.PodStatus{
++					Phase: corev1.PodSucceeded,
++					Conditions: []corev1.PodCondition{
++						{LastTransitionTime: v1.Now()},
++					},
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup, &mockPod)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &mockDataBackup.Status)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseComplete))
++			Expect(opStatus.Duration).NotTo(BeEmpty())
++			Expect(opStatus.Infos[cdatabackup.BackupPodName]).To(Equal("test-pod"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodUID]).To(Equal("pod-uid-1"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodNodeName]).To(Equal("node-1"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodPhase]).To(Equal(string(corev1.PodSucceeded)))
++			Expect(opStatus.Infos[cdatabackup.BackupPodStartTime]).NotTo(BeEmpty())
++			Expect(opStatus.Infos[cdatabackup.BackupPodFinishTime]).NotTo(BeEmpty())
++			// transient missing marker must not coexist with terminal evidence
++			Expect(opStatus.Infos).NotTo(HaveKey(cdatabackup.BackupPodMissingSince))
++		})
++
++		It("should persist terminal evidence when the backup pod failed", func() {
++			mockFailedPod := corev1.Pod{
++				ObjectMeta: v1.ObjectMeta{
++					Name:      "test-pod",
++					Namespace: "default",
++					UID:       types.UID("pod-uid-failed"),
++				},
++				Spec: corev1.PodSpec{
++					NodeName: "node-2",
++				},
++				Status: corev1.PodStatus{
++					Phase: corev1.PodFailed,
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup, &mockFailedPod)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &mockDataBackup.Status)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseFailed))
++			Expect(opStatus.Infos[cdatabackup.BackupPodUID]).To(Equal("pod-uid-failed"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodNodeName]).To(Equal("node-2"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodPhase]).To(Equal(string(corev1.PodFailed)))
++		})
++
++		It("should keep the terminal phase from persisted evidence when the pod is deleted after terminal state was observed", func() {
++			startTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
++			finishTime := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
++			statusWithEvidence := v1alpha1.OperationStatus{
++				Phase:    common.PhaseComplete,
++				Duration: "30s",
++				Infos: map[string]string{
++					cdatabackup.BackupPodName:       "test-pod",
++					cdatabackup.BackupPodUID:        "pod-uid-1",
++					cdatabackup.BackupPodNodeName:   "node-1",
++					cdatabackup.BackupPodPhase:      string(corev1.PodSucceeded),
++					cdatabackup.BackupPodStartTime:  startTime,
++					cdatabackup.BackupPodFinishTime: finishTime,
++				},
++				Conditions: []v1alpha1.Condition{
++					{Type: common.Complete, Status: corev1.ConditionTrue},
++				},
++			}
++			// no pod exists in the client any more
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &statusWithEvidence)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseComplete))
++			Expect(opStatus.Conditions).To(HaveLen(1))
++			Expect(opStatus.Conditions[0].Type).To(Equal(common.Complete))
++			Expect(opStatus.Infos[cdatabackup.BackupPodNodeName]).To(Equal("node-1"))
++		})
++
++		It("should reconstruct a drifted terminal phase from persisted evidence when the pod is gone", func() {
++			startTime := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
++			finishTime := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
++			driftedStatus := v1alpha1.OperationStatus{
++				Phase:    common.PhaseExecuting,
++				Duration: "Unfinished",
++				Infos: map[string]string{
++					cdatabackup.BackupPodName:       "test-pod",
++					cdatabackup.BackupPodUID:        "pod-uid-1",
++					cdatabackup.BackupPodNodeName:   "node-1",
++					cdatabackup.BackupPodPhase:      string(corev1.PodSucceeded),
++					cdatabackup.BackupPodStartTime:  startTime,
++					cdatabackup.BackupPodFinishTime: finishTime,
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &driftedStatus)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseComplete))
++			Expect(opStatus.Conditions).To(HaveLen(1))
++			Expect(opStatus.Conditions[0].Type).To(Equal(common.Complete))
++			Expect(opStatus.Conditions[0].Reason).To(Equal("BackupSuccessful"))
++			Expect(opStatus.Duration).NotTo(Equal("Unfinished"))
++		})
++
++		It("should keep waiting without status writes while the pod is missing within the grace period", func() {
++			statusWithMarker := v1alpha1.OperationStatus{
++				Phase: common.PhaseExecuting,
++				Infos: map[string]string{
++					cdatabackup.BackupPodMissingSince: time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339),
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &statusWithMarker)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseExecuting))
++			Expect(opStatus.Infos[cdatabackup.BackupPodMissingSince]).To(Equal(statusWithMarker.Infos[cdatabackup.BackupPodMissingSince]))
++		})
++
++		It("should mark Failed with BackupPodMissing after the grace period when the pod never reached an observed terminal state", func() {
++			statusWithExpiredMarker := v1alpha1.OperationStatus{
++				Phase: common.PhaseExecuting,
++				Infos: map[string]string{
++					cdatabackup.BackupPodMissingSince: time.Now().Add(-3 * time.Minute).UTC().Format(time.RFC3339),
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup)
++			recorder := record.NewFakeRecorder(10)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: recorder,
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &statusWithExpiredMarker)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseFailed))
++			Expect(opStatus.Conditions).To(HaveLen(1))
++			Expect(opStatus.Conditions[0].Type).To(Equal(common.Failed))
++			Expect(opStatus.Conditions[0].Reason).To(Equal(cdatabackup.BackupPodMissingReason))
++			Expect(opStatus.Conditions[0].Message).To(ContainSubstring("test-pod"))
++			Expect(opStatus.Infos).NotTo(HaveKey(cdatabackup.BackupPodMissingSince))
++			// a warning event must be emitted for diagnosability
++			Eventually(recorder.Events).Should(Receive(ContainSubstring(cdatabackup.BackupPodMissingReason)))
++		})
++
++		It("should clear the missing marker and keep the phase when the pod reappears running", func() {
++			runningPod := corev1.Pod{
++				ObjectMeta: v1.ObjectMeta{
++					Name:      "test-pod",
++					Namespace: "default",
++					UID:       types.UID("pod-uid-1"),
++				},
++				Status: corev1.PodStatus{
++					Phase: corev1.PodRunning,
++				},
++			}
++			statusWithMarker := v1alpha1.OperationStatus{
++				Phase: common.PhaseExecuting,
++				Infos: map[string]string{
++					cdatabackup.BackupPodMissingSince: time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339),
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup, &runningPod)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &statusWithMarker)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseExecuting))
++			Expect(opStatus.Infos).NotTo(HaveKey(cdatabackup.BackupPodMissingSince))
++		})
++
++		It("should discard stale evidence and re-observe when a same-name pod is recreated with a new UID", func() {
++			recreatedPod := corev1.Pod{
++				ObjectMeta: v1.ObjectMeta{
++					Name:              "test-pod",
++					Namespace:         "default",
++					UID:               types.UID("pod-uid-new"),
++					CreationTimestamp: v1.NewTime(time.Now().Add(-10 * time.Second)),
++				},
++				Spec: corev1.PodSpec{
++					NodeName: "node-3",
++				},
++				Status: corev1.PodStatus{
++					Phase: corev1.PodSucceeded,
++					Conditions: []corev1.PodCondition{
++						{LastTransitionTime: v1.Now()},
++					},
++				},
++			}
++			statusWithStaleEvidence := v1alpha1.OperationStatus{
++				Phase: common.PhaseComplete,
++				Infos: map[string]string{
++					cdatabackup.BackupPodName:       "test-pod",
++					cdatabackup.BackupPodUID:        "pod-uid-old",
++					cdatabackup.BackupPodNodeName:   "node-old",
++					cdatabackup.BackupPodPhase:      string(corev1.PodFailed),
++					cdatabackup.BackupPodStartTime:  time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
++					cdatabackup.BackupPodFinishTime: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup, &recreatedPod)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &statusWithStaleEvidence)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseComplete))
++			Expect(opStatus.Infos[cdatabackup.BackupPodUID]).To(Equal("pod-uid-new"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodNodeName]).To(Equal("node-3"))
++			Expect(opStatus.Infos[cdatabackup.BackupPodPhase]).To(Equal(string(corev1.PodSucceeded)))
++		})
++
++		It("should keep an already terminal phase when the pod is missing without structured evidence", func() {
++			terminalStatus := v1alpha1.OperationStatus{
++				Phase: common.PhaseFailed,
++				Conditions: []v1alpha1.Condition{
++					{Type: common.Failed, Status: corev1.ConditionTrue, Reason: cdatabackup.BackupPodMissingReason},
++				},
++			}
++			client := fake.NewFakeClientWithScheme(testScheme, mockDataBackup)
++			onceStatusHandler := &OnceHandler{dataBackup: mockDataBackup}
++			ctx := cruntime.ReconcileRequestContext{
++				Client:   client,
++				Log:      fake.NullLogger(),
++				Recorder: record.NewFakeRecorder(10),
++			}
++
++			opStatus, err := onceStatusHandler.GetOperationStatus(ctx, &terminalStatus)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(opStatus.Phase).To(Equal(common.PhaseFailed))
++			Expect(opStatus.Conditions[0].Reason).To(Equal(cdatabackup.BackupPodMissingReason))
+ 		})
+ 
+ 		It("should use conditions LastTransitionTime when conditions are set on succeeded pod", func() {
+diff --git a/pkg/databackup/constants.go b/pkg/databackup/constants.go
+index b4a7270..2824892 100644
+--- a/pkg/databackup/constants.go
++++ b/pkg/databackup/constants.go
+@@ -24,3 +24,40 @@ const (
+ 	BackupLocationPath     = "BackupLocationPath"
+ 	BackupLocationNodeName = "BackupLocationNodeName"
+ )
++
++// Keys persisted into DataBackup.status.infos as the terminal-state evidence of the
++// backup pod. They are written atomically with the phase transition once the backup pod
++// is observed in a terminal phase (Succeeded/Failed), so that later reconciles, controller
++// restarts and pod garbage collection (Pod GC, manual deletion or owner cascading deletion)
++// can still finish the phase, infos, dataset lock release, TTL and finalizer bookkeeping.
++const (
++	// BackupPodName is the name of the pod that executed the backup.
++	BackupPodName = "BackupPodName"
++	// BackupPodUID is the UID of the pod that executed the backup. It binds the persisted
++	// evidence to a specific executor so that a same-name DataBackup (and its pod) recreation
++	// cannot reuse stale evidence.
++	BackupPodUID = "BackupPodUID"
++	// BackupPodNodeName is the node the backup pod was scheduled to. local:// backup files
++	// reside on that node, while pvc:// backups stay node-independent and record "NA" in
++	// BackupLocationNodeName instead.
++	BackupPodNodeName = "BackupPodNodeName"
++	// BackupPodPhase is the observed terminal pod phase, either Succeeded or Failed.
++	BackupPodPhase = "BackupPodPhase"
++	// BackupPodStartTime and BackupPodFinishTime are RFC3339 timestamps observed from the
++	// backup pod and allow the duration to be reconstructed after the pod is deleted.
++	BackupPodStartTime  = "BackupPodStartTime"
++	BackupPodFinishTime = "BackupPodFinishTime"
++	// BackupPodMissingSince is an RFC3339 timestamp marking the first reconcile where the
++	// backup pod was missing while no terminal state had ever been observed. It is transient:
++	// removed when the pod reappears or when the DataBackup is marked failed after the grace
++	// period.
++	BackupPodMissingSince = "BackupPodMissingSince"
++)
++
++// Condition reasons used by the DataBackup controller.
++const (
++	// BackupPodMissingReason is used when the backup pod disappears before its terminal state
++	// is ever observed. The DataBackup is marked failed with this reason instead of guessing
++	// an unconfirmed successful result.
++	BackupPodMissingReason = "BackupPodMissing"
++)

@@ -17,6 +17,9 @@ limitations under the License.
 package databackup
 
 import (
+	"context"
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -27,11 +30,13 @@ import (
 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var _ = Describe("dataBackupOperation", func() {
@@ -235,6 +240,56 @@ var _ = Describe("dataBackupOperation", func() {
 			Expect(infos[cdatabackup.BackupLocationPath]).To(Equal("local:///tmp/backup"))
 			Expect(infos[cdatabackup.BackupLocationNodeName]).To(Equal("node-1"))
 		})
+
+		It("should use the persisted node evidence for local:// path when the backup pod is already deleted", func() {
+			// No pod exists in the client: the terminal evidence persisted at the observed
+			// terminal state must be enough to fill the node location without panicking.
+			dataBackup2 := dataBackup.DeepCopy()
+			dataBackup2.Spec.BackupPath = "local:///tmp/backup"
+			fakeClient2 := fake.NewFakeClientWithScheme(testScheme, dataBackup2)
+			op2 := &dataBackupOperation{
+				Client:     fakeClient2,
+				Log:        ctrl.Log.WithName("test"),
+				Recorder:   record.NewFakeRecorder(10),
+				dataBackup: dataBackup2,
+			}
+
+			infos := map[string]string{
+				cdatabackup.BackupPodNodeName: "node-from-evidence",
+			}
+			err := op2.UpdateStatusInfoForCompleted(infos)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(infos[cdatabackup.BackupLocationPath]).To(Equal("local:///tmp/backup"))
+			Expect(infos[cdatabackup.BackupLocationNodeName]).To(Equal("node-from-evidence"))
+		})
+
+		It("should return a diagnosable error for local:// path when both pod and persisted evidence are missing", func() {
+			dataBackup2 := dataBackup.DeepCopy()
+			dataBackup2.Spec.BackupPath = "local:///tmp/backup"
+			fakeClient2 := fake.NewFakeClientWithScheme(testScheme, dataBackup2)
+			op2 := &dataBackupOperation{
+				Client:     fakeClient2,
+				Log:        ctrl.Log.WithName("test"),
+				Recorder:   record.NewFakeRecorder(10),
+				dataBackup: dataBackup2,
+			}
+
+			infos := map[string]string{}
+			err := op2.UpdateStatusInfoForCompleted(infos)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not found"))
+			// the node location must not be guessed
+			Expect(infos).NotTo(HaveKey(cdatabackup.BackupLocationNodeName))
+		})
+	})
+
+	Describe("GetStatusHandler", func() {
+		It("should return an OnceHandler bound to the dataBackup object", func() {
+			handler := op.GetStatusHandler()
+			onceHandler, ok := handler.(*OnceHandler)
+			Expect(ok).To(BeTrue())
+			Expect(onceHandler.dataBackup).To(Equal(dataBackup))
+		})
 	})
 
 	Describe("UpdateOperationApiStatus", func() {
@@ -254,6 +309,20 @@ var _ = Describe("dataBackupOperation", func() {
 			}
 			err := op4.UpdateOperationApiStatus(opStatus)
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should return and keep propagating a status update conflict for retry", func() {
+			conflictClient := newConflictStatusClient(fake.NewFakeClientWithScheme(testScheme, dataBackup))
+			opConflict := &dataBackupOperation{
+				Client:     conflictClient,
+				Log:        ctrl.Log.WithName("test"),
+				Recorder:   record.NewFakeRecorder(10),
+				dataBackup: dataBackup,
+			}
+
+			err := opConflict.UpdateOperationApiStatus(&datav1alpha1.OperationStatus{Phase: common.PhaseComplete})
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsConflict(err)).To(BeTrue())
 		})
 	})
 
@@ -288,3 +357,33 @@ var _ = Describe("dataBackupOperation", func() {
 		})
 	})
 })
+
+// conflictStatusClient wraps a fake client and makes every status subresource Update fail
+// with a Conflict error, simulating a stale resourceVersion in a real apiserver.
+type conflictStatusClient struct {
+	client.Client
+}
+
+func newConflictStatusClient(inner client.Client) client.Client {
+	return &conflictStatusClient{Client: inner}
+}
+
+func (c *conflictStatusClient) Status() client.SubResourceWriter {
+	return &conflictSubResourceWriter{inner: c.Client.Status()}
+}
+
+type conflictSubResourceWriter struct {
+	inner client.SubResourceWriter
+}
+
+func (w *conflictSubResourceWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+	return w.inner.Create(ctx, obj, subResource, opts...)
+}
+
+func (w *conflictSubResourceWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	return apierrors.NewConflict(corev1.Resource("databackups"), obj.GetName(), fmt.Errorf("injected status update conflict"))
+}
+
+func (w *conflictSubResourceWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	return w.inner.Patch(ctx, obj, patch, opts...)
+}
