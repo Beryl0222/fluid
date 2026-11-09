@@ -100,13 +100,28 @@ func (a *FluidMutatingHandler) Handle(ctx context.Context, req admission.Request
 	if err := a.MutatePod(pod, false); err != nil {
 		setupLog.Error(err, "failed to mutate pod with cache client", "Pod", pod.Name, "Namespace", pod.Namespace)
 		if webhookutils.IsNeedRetryWithApiReaderError(err) {
-			setupLog.Info("retrying with API reader",
-				"namespace", pod.Namespace,
-				"pod", pod.Name,
-				"reason", err.Error(),
-			)
+			if webhookutils.IsStaleRuntimeInfoCacheError(err) {
+				// A stale runtime info cache entry was detected. Redo the whole mutation
+				// from the original pod with the direct API reader instead of reusing any
+				// stale data, so the resulting patch can never mix old and new states.
+				setupLog.Info("stale runtime info cache detected, redoing the whole mutation from the original pod with API reader",
+					"namespace", pod.Namespace,
+					"pod", pod.Name,
+					"reason", err.Error(),
+				)
+			} else {
+				setupLog.Info("retrying with API reader",
+					"namespace", pod.Namespace,
+					"pod", pod.Name,
+					"reason", err.Error(),
+				)
+			}
 			pod = backupPod
 			if err := a.MutatePod(pod, true); err != nil {
+				// The authoritative API state cannot be fetched either. Reject the
+				// admission with the explicit error rather than risking a mixed patch.
+				setupLog.Error(err, "failed to redo pod mutation with API reader, rejecting the admission",
+					"Pod", pod.Name, "Namespace", pod.Namespace)
 				return admission.Errored(http.StatusInternalServerError, err)
 			}
 		}
@@ -141,8 +156,10 @@ func (a *FluidMutatingHandler) MutatePod(pod *corev1.Pod, useDirectReader bool) 
 	var setupLog = ctrl.Log.WithName("AddScheduleInfoToPod")
 	setupLog.V(1).Info("start to add schedule info", "Pod", pod.Name, "Namespace", pod.Namespace)
 	pvcNames := kubeclient.GetPVCNamesFromPod(pod)
+	// When mutating with the direct API reader, the runtime info cache must be bypassed so
+	// that the retried mutation rebuilds one consistent snapshot from authoritative state.
 	runtimeInfos, err := webhookutils.CollectRuntimeInfosFromPVCs(handlerClient, pvcNames, pod.Namespace, setupLog,
-		utils.SkipPrecheckEnable(pod.Annotations))
+		utils.SkipPrecheckEnable(pod.Annotations), useDirectReader)
 	if err != nil {
 		setupLog.Error(err, "failed to collect runtime infos from PVCs", "pvcNames", pvcNames)
 		return webhookutils.NewNeedRetryWithApiReaderError(errors.Wrapf(err, "failed to collect runtime infos from PVCs %v", pvcNames))

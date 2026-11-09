@@ -77,7 +77,7 @@ func (p *FuseSidecar) Mutate(pod *corev1.Pod, runtimeInfos map[string]base.Runti
 		out.DeepCopyInto(pod)
 		pvcNames := kubeclient.GetPVCNamesFromPod(pod)
 		runtimeInfos, err = webhookutils.CollectRuntimeInfosFromPVCs(p.client, pvcNames, pod.Namespace, p.log,
-			utils.SkipPrecheckEnable(pod.Annotations))
+			utils.SkipPrecheckEnable(pod.Annotations), false)
 		if err != nil {
 			return shouldStop, webhookutils.NewNeedRetryWithApiReaderError(errors.Wrapf(err, "failed to collect runtime infos from PVCs %v", pvcNames))
 		}

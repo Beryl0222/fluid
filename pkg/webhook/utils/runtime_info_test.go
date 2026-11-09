@@ -3,6 +3,7 @@ package utils
 import (
 	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
 	"github.com/fluid-cloudnative/fluid/pkg/common"
+	"github.com/fluid-cloudnative/fluid/pkg/webhook/cache"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +28,13 @@ var _ = Describe("RuntimeInfo Utilities", func() {
 
 	BeforeEach(func() {
 		scheme = setupScheme()
+		// These specs exercise the historical cache-disabled behavior, so make sure the
+		// global cache is turned off even if another spec enabled it.
+		cache.DisableRuntimeInfoCacheForTest()
+	})
+
+	AfterEach(func() {
+		cache.DisableRuntimeInfoCacheForTest()
 	})
 
 	Describe("CollectRuntimeInfosFromPVCs", func() {
@@ -52,6 +60,7 @@ var _ = Describe("RuntimeInfo Utilities", func() {
 					"default",
 					setupLog,
 					false,
+					false,
 				)
 
 				Expect(err).NotTo(HaveOccurred())
@@ -70,6 +79,7 @@ var _ = Describe("RuntimeInfo Utilities", func() {
 					[]string{"nonexistent"},
 					"default",
 					setupLog,
+					false,
 					false,
 				)
 
@@ -111,6 +121,7 @@ var _ = Describe("RuntimeInfo Utilities", func() {
 					[]string{"test-pvc"},
 					"default",
 					setupLog,
+					false,
 					false,
 				)
 

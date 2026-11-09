@@ -1,0 +1,1606 @@
+diff --git a/pkg/webhook/cache/runtime_info_cache.go b/pkg/webhook/cache/runtime_info_cache.go
+index e759183..5ef7e63 100644
+--- a/pkg/webhook/cache/runtime_info_cache.go
++++ b/pkg/webhook/cache/runtime_info_cache.go
+@@ -42,10 +42,51 @@ var (
+ 	timeToLive        = 5 * time.Minute
+ )
+ 
+-// PersistentVolumeClaimInfoCache represents runtime info and whether it belongs dataset
++// SourceObjectIdentity records the identities of the source objects (the PVC, its
++// Dataset and its Runtime) from which a PersistentVolumeClaimInfoCache entry is built.
++//
++// A cached entry may be reused only when every recorded identity still matches the
++// current objects. Therefore any update (ResourceVersion change), deletion/recreation
++// (UID change) or runtime type change of the source objects invalidates the entry,
++// which prevents stale "is dataset" decisions and stale RuntimeInfo from being reused.
++type SourceObjectIdentity struct {
++	// PVC identity. UID changes when the PVC is deleted and recreated with the same name,
++	// while ResourceVersion changes on every PVC update (e.g. label flips).
++	PVCUID             types.UID
++	PVCResourceVersion string
++
++	// Dataset identity. Both fields are empty when the PVC is not backed by a Dataset.
++	// A Dataset rebinding another Runtime bumps the Dataset ResourceVersion.
++	DatasetUID             types.UID
++	DatasetResourceVersion string
++
++	// Runtime identity. All fields are empty when the PVC is not backed by a Dataset.
++	// Runtime spec updates (e.g. FUSE node selector changes) bump the Runtime ResourceVersion.
++	RuntimeType            string
++	RuntimeName            string
++	RuntimeNamespace       string
++	RuntimeUID             types.UID
++	RuntimeResourceVersion string
++}
++
++// PersistentVolumeClaimInfoCache represents runtime info and whether it belongs dataset,
++// together with the identities of the PVC/Dataset/Runtime source objects at the time the
++// entry is built.
+ type PersistentVolumeClaimInfoCache struct {
+ 	info      base.RuntimeInfoInterface
+ 	isDataset bool
++	identity  SourceObjectIdentity
++}
++
++// NewPersistentVolumeClaimInfoCache builds a cache entry with the RuntimeInfo that later
++// plugins consume, the "whether the PVC belongs to a Dataset" decision and the identities
++// of the source objects from which both are derived.
++func NewPersistentVolumeClaimInfoCache(runtimeInfo base.RuntimeInfoInterface, isDataset bool, identity SourceObjectIdentity) *PersistentVolumeClaimInfoCache {
++	return &PersistentVolumeClaimInfoCache{
++		info:      runtimeInfo,
++		isDataset: isDataset,
++		identity:  identity,
++	}
+ }
+ 
+ func (c PersistentVolumeClaimInfoCache) GetRuntimeInfo() base.RuntimeInfoInterface {
+@@ -56,6 +97,16 @@ func (c PersistentVolumeClaimInfoCache) IsBelongToDataset() bool {
+ 	return c.isDataset
+ }
+ 
++func (c PersistentVolumeClaimInfoCache) GetIdentity() SourceObjectIdentity {
++	return c.identity
++}
++
++// IsRuntimeInfoCacheEnabled reports whether the runtime info cache is enabled.
++// By default, the cache is disabled unless ENABLE_RUNTIMEINFO_CACHE=true is set.
++func IsRuntimeInfoCacheEnabled() bool {
++	return runtimeInfoCache != nil
++}
++
+ // By default, cache is disabled
+ func init() {
+ 	var (
+@@ -93,9 +144,13 @@ func GetRuntimeInfoByKey(key types.NamespacedName) (info *PersistentVolumeClaimI
+ 	return
+ }
+ 
+-func AddRuntimeInfoByKey(key types.NamespacedName, runtimeInfo base.RuntimeInfoInterface, isDataset bool) {
++// SetRuntimeInfoByKey unconditionally stores the entry under the key, overwriting and
++// refreshing the TTL of any previously cached entry. Overwriting is required so that a
++// refreshed entry built from current PVC/Dataset/Runtime objects can replace a stale one
++// instead of being skipped forever until the TTL expires.
++func SetRuntimeInfoByKey(key types.NamespacedName, info *PersistentVolumeClaimInfoCache) {
+ 	if utils.IsTimeTrackerDebugEnabled() {
+-		defer utils.TimeTrack(time.Now(), "runtimeInfoCache.AddRuntimeInfoByKey",
++		defer utils.TimeTrack(time.Now(), "runtimeInfoCache.SetRuntimeInfoByKey",
+ 			"pvc.name", key.Name, "pvc.namespace", key.Namespace)
+ 	}
+ 	if runtimeInfoCache == nil {
+@@ -103,17 +158,35 @@ func AddRuntimeInfoByKey(key types.NamespacedName, runtimeInfo base.RuntimeInfoI
+ 		return
+ 	}
+ 
+-	result, found := runtimeInfoCache.Get(key.String())
+-	if !found {
+-		info := &PersistentVolumeClaimInfoCache{
+-			isDataset: isDataset,
+-			info:      runtimeInfo,
+-		}
+-		runtimeInfoCache.Add(key.String(), info, timeToLive)
+-		log.V(1).Info("add to runtimeInfoCache",
+-			"key", key, "info", info)
+-	} else {
+-		log.V(1).Info("skip adding to runtimeInfoCache, because it's already there",
+-			"key", key, "info", result)
++	runtimeInfoCache.Add(key.String(), info, timeToLive)
++	log.V(1).Info("set runtimeInfoCache entry",
++		"key", key, "isDataset", info.IsBelongToDataset(), "identity", info.GetIdentity())
++}
++
++// RemoveRuntimeInfoByKey invalidates the entry cached under the key when it is found to
++// be stale against current source objects. It is a no-op when no entry is cached.
++func RemoveRuntimeInfoByKey(key types.NamespacedName) {
++	if runtimeInfoCache == nil {
++		return
+ 	}
++	runtimeInfoCache.Remove(key.String())
++	log.V(1).Info("removed runtimeInfoCache entry", "key", key)
++}
++
++// EnableRuntimeInfoCacheForTest resets and enables the runtime info caches with the given
++// size and TTL. It is only meant for unit tests that need deterministic cache state.
++func EnableRuntimeInfoCacheForTest(size int, ttl time.Duration) {
++	if size <= 0 {
++		size = defaultCacheSize
++	}
++	runtimeInfoCache = utilcache.NewLRUExpireCache(size)
++	fuseTemplateCache = utilcache.NewLRUExpireCache(size)
++	timeToLive = ttl
++}
++
++// DisableRuntimeInfoCacheForTest turns off the runtime info caches. It is only meant for
++// unit tests that need to exercise the cache-disabled code path.
++func DisableRuntimeInfoCacheForTest() {
++	runtimeInfoCache = nil
++	fuseTemplateCache = nil
+ }
+diff --git a/pkg/webhook/cache/runtime_info_cache_test.go b/pkg/webhook/cache/runtime_info_cache_test.go
+new file mode 100644
+index 0000000..f3ee1e9
+--- /dev/null
++++ b/pkg/webhook/cache/runtime_info_cache_test.go
+@@ -0,0 +1,156 @@
++/*
++Copyright 2022 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cache
++
++import (
++	"testing"
++	"time"
++
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++func testKey(name string) types.NamespacedName {
++	return types.NamespacedName{Name: name, Namespace: "default"}
++}
++
++func TestRuntimeInfoCacheDisabledByDefault(t *testing.T) {
++	DisableRuntimeInfoCacheForTest()
++	if IsRuntimeInfoCacheEnabled() {
++		t.Fatalf("expected runtime info cache to be disabled")
++	}
++	if _, found := GetRuntimeInfoByKey(testKey("pvc")); found {
++		t.Fatalf("expected no cache hit when cache is disabled")
++	}
++	// Writes must be dropped when the cache is disabled.
++	SetRuntimeInfoByKey(testKey("pvc"), NewPersistentVolumeClaimInfoCache(nil, false, SourceObjectIdentity{}))
++	if _, found := GetRuntimeInfoByKey(testKey("pvc")); found {
++		t.Fatalf("expected disabled cache to drop writes")
++	}
++}
++
++func TestRuntimeInfoCacheSetAndGet(t *testing.T) {
++	EnableRuntimeInfoCacheForTest(defaultCacheSize, time.Minute)
++	defer DisableRuntimeInfoCacheForTest()
++
++	info, err := base.BuildRuntimeInfo("ds", "default", common.AlluxioRuntime)
++	if err != nil {
++		t.Fatalf("failed to build runtime info: %v", err)
++	}
++	identity := SourceObjectIdentity{
++		PVCUID:                  "pvc-uid-1",
++		PVCResourceVersion:      "100",
++		DatasetUID:              "dataset-uid-1",
++		DatasetResourceVersion:  "200",
++		RuntimeType:             common.AlluxioRuntime,
++		RuntimeName:             "ds",
++		RuntimeNamespace:        "default",
++		RuntimeUID:              "runtime-uid-1",
++		RuntimeResourceVersion:  "300",
++	}
++	entry := NewPersistentVolumeClaimInfoCache(info, true, identity)
++	SetRuntimeInfoByKey(testKey("pvc"), entry)
++
++	got, found := GetRuntimeInfoByKey(testKey("pvc"))
++	if !found {
++		t.Fatalf("expected cache hit after Set")
++	}
++	if !got.IsBelongToDataset() {
++		t.Fatalf("expected cached entry to belong to a dataset")
++	}
++	if got.GetRuntimeInfo() != info {
++		t.Fatalf("expected the exact cached RuntimeInfo to be returned")
++	}
++	if got.GetIdentity() != identity {
++		t.Fatalf("expected cached identity %v, got %v", identity, got.GetIdentity())
++	}
++}
++
++func TestRuntimeInfoCacheSetOverwritesStaleEntry(t *testing.T) {
++	EnableRuntimeInfoCacheForTest(defaultCacheSize, time.Minute)
++	defer DisableRuntimeInfoCacheForTest()
++
++	key := testKey("pvc")
++	staleInfo, _ := base.BuildRuntimeInfo("ds", "default", common.AlluxioRuntime)
++	staleEntry := NewPersistentVolumeClaimInfoCache(staleInfo, true, SourceObjectIdentity{
++		PVCUID:             "pvc-uid-1",
++		PVCResourceVersion: "100",
++	})
++	SetRuntimeInfoByKey(key, staleEntry)
++
++	freshInfo, _ := base.BuildRuntimeInfo("ds", "default", common.JuiceFSRuntime)
++	freshEntry := NewPersistentVolumeClaimInfoCache(freshInfo, false, SourceObjectIdentity{
++		PVCUID:             "pvc-uid-2",
++		PVCResourceVersion: "101",
++	})
++	// Unconditional overwrite must replace the stale entry instead of skipping it.
++	SetRuntimeInfoByKey(key, freshEntry)
++
++	got, found := GetRuntimeInfoByKey(key)
++	if !found {
++		t.Fatalf("expected cache hit after overwrite")
++	}
++	if got.IsBelongToDataset() {
++		t.Fatalf("expected overwritten entry to reflect the new isDataset=false value")
++	}
++	if got.GetRuntimeInfo() != freshInfo {
++		t.Fatalf("expected overwritten entry to hold the fresh RuntimeInfo")
++	}
++	if got.GetIdentity().PVCResourceVersion != "101" {
++		t.Fatalf("expected overwritten identity, got %v", got.GetIdentity())
++	}
++}
++
++func TestRuntimeInfoCacheRemove(t *testing.T) {
++	EnableRuntimeInfoCacheForTest(defaultCacheSize, time.Minute)
++	defer DisableRuntimeInfoCacheForTest()
++
++	key := testKey("pvc")
++	SetRuntimeInfoByKey(key, NewPersistentVolumeClaimInfoCache(nil, false, SourceObjectIdentity{
++		PVCUID: "pvc-uid-1",
++	}))
++	if _, found := GetRuntimeInfoByKey(key); !found {
++		t.Fatalf("expected cache hit before removal")
++	}
++
++	RemoveRuntimeInfoByKey(key)
++	if _, found := GetRuntimeInfoByKey(key); found {
++		t.Fatalf("expected cache miss after removal")
++	}
++
++	// Removing a missing key is a no-op and must not panic.
++	RemoveRuntimeInfoByKey(testKey("never-cached"))
++}
++
++func TestRuntimeInfoCacheTTLExpiry(t *testing.T) {
++	EnableRuntimeInfoCacheForTest(defaultCacheSize, 50*time.Millisecond)
++	defer DisableRuntimeInfoCacheForTest()
++
++	key := testKey("pvc")
++	SetRuntimeInfoByKey(key, NewPersistentVolumeClaimInfoCache(nil, false, SourceObjectIdentity{
++		PVCUID: "pvc-uid-1",
++	}))
++	if _, found := GetRuntimeInfoByKey(key); !found {
++		t.Fatalf("expected cache hit before TTL expiry")
++	}
++
++	time.Sleep(80 * time.Millisecond)
++	if _, found := GetRuntimeInfoByKey(key); found {
++		t.Fatalf("expected cache entry to expire after its TTL")
++	}
++}
+diff --git a/pkg/webhook/handler/mutating/mutating_handler.go b/pkg/webhook/handler/mutating/mutating_handler.go
+index 1e52805..12ca199 100644
+--- a/pkg/webhook/handler/mutating/mutating_handler.go
++++ b/pkg/webhook/handler/mutating/mutating_handler.go
+@@ -100,13 +100,28 @@ func (a *FluidMutatingHandler) Handle(ctx context.Context, req admission.Request
+ 	if err := a.MutatePod(pod, false); err != nil {
+ 		setupLog.Error(err, "failed to mutate pod with cache client", "Pod", pod.Name, "Namespace", pod.Namespace)
+ 		if webhookutils.IsNeedRetryWithApiReaderError(err) {
+-			setupLog.Info("retrying with API reader",
+-				"namespace", pod.Namespace,
+-				"pod", pod.Name,
+-				"reason", err.Error(),
+-			)
++			if webhookutils.IsStaleRuntimeInfoCacheError(err) {
++				// A stale runtime info cache entry was detected. Redo the whole mutation
++				// from the original pod with the direct API reader instead of reusing any
++				// stale data, so the resulting patch can never mix old and new states.
++				setupLog.Info("stale runtime info cache detected, redoing the whole mutation from the original pod with API reader",
++					"namespace", pod.Namespace,
++					"pod", pod.Name,
++					"reason", err.Error(),
++				)
++			} else {
++				setupLog.Info("retrying with API reader",
++					"namespace", pod.Namespace,
++					"pod", pod.Name,
++					"reason", err.Error(),
++				)
++			}
+ 			pod = backupPod
+ 			if err := a.MutatePod(pod, true); err != nil {
++				// The authoritative API state cannot be fetched either. Reject the
++				// admission with the explicit error rather than risking a mixed patch.
++				setupLog.Error(err, "failed to redo pod mutation with API reader, rejecting the admission",
++					"Pod", pod.Name, "Namespace", pod.Namespace)
+ 				return admission.Errored(http.StatusInternalServerError, err)
+ 			}
+ 		}
+@@ -141,8 +156,10 @@ func (a *FluidMutatingHandler) MutatePod(pod *corev1.Pod, useDirectReader bool)
+ 	var setupLog = ctrl.Log.WithName("AddScheduleInfoToPod")
+ 	setupLog.V(1).Info("start to add schedule info", "Pod", pod.Name, "Namespace", pod.Namespace)
+ 	pvcNames := kubeclient.GetPVCNamesFromPod(pod)
++	// When mutating with the direct API reader, the runtime info cache must be bypassed so
++	// that the retried mutation rebuilds one consistent snapshot from authoritative state.
+ 	runtimeInfos, err := webhookutils.CollectRuntimeInfosFromPVCs(handlerClient, pvcNames, pod.Namespace, setupLog,
+-		utils.SkipPrecheckEnable(pod.Annotations))
++		utils.SkipPrecheckEnable(pod.Annotations), useDirectReader)
+ 	if err != nil {
+ 		setupLog.Error(err, "failed to collect runtime infos from PVCs", "pvcNames", pvcNames)
+ 		return webhookutils.NewNeedRetryWithApiReaderError(errors.Wrapf(err, "failed to collect runtime infos from PVCs %v", pvcNames))
+diff --git a/pkg/webhook/handler/mutating/mutating_handler_cache_test.go b/pkg/webhook/handler/mutating/mutating_handler_cache_test.go
+new file mode 100644
+index 0000000..ae0ddcf
+--- /dev/null
++++ b/pkg/webhook/handler/mutating/mutating_handler_cache_test.go
+@@ -0,0 +1,274 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package mutating
++
++import (
++	"context"
++	"os"
++	"time"
++
++	"github.com/agiledragon/gomonkey/v2"
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	"github.com/fluid-cloudnative/fluid/pkg/webhook/cache"
++	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins"
++	webhookutils "github.com/fluid-cloudnative/fluid/pkg/webhook/utils"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	admissionv1 "k8s.io/api/admission/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
++	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
++)
++
++const cachedPVCNamespacedName = "cached-ds-pvc"
++
++func cacheConsistencyScheme() *runtime.Scheme {
++	s := runtime.NewScheme()
++	Expect(corev1.AddToScheme(s)).To(Succeed())
++	Expect(datav1alpha1.AddToScheme(s)).To(Succeed())
++	return s
++}
++
++func cacheConsistencyObjects() []runtime.Object {
++	pvc := &corev1.PersistentVolumeClaim{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:            cachedPVCNamespacedName,
++			Namespace:       "default",
++			UID:             types.UID("pvc-uid-1"),
++			ResourceVersion: "pvc-rv-2",
++			Labels: map[string]string{
++				common.LabelAnnotationStorageCapacityPrefix + "default-cached-ds-pvc": common.True,
++			},
++		},
++	}
++	dataset := &datav1alpha1.Dataset{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:            cachedPVCNamespacedName,
++			Namespace:       "default",
++			UID:             types.UID("dataset-uid-1"),
++			ResourceVersion: "dataset-rv-1",
++		},
++		Status: datav1alpha1.DatasetStatus{
++			Phase: datav1alpha1.BoundDatasetPhase,
++			Runtimes: []datav1alpha1.Runtime{
++				{
++					Name:      cachedPVCNamespacedName,
++					Namespace: "default",
++					Type:      common.AlluxioRuntime,
++				},
++			},
++		},
++	}
++	alluxioRuntime := &datav1alpha1.AlluxioRuntime{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:            cachedPVCNamespacedName,
++			Namespace:       "default",
++			UID:             types.UID("runtime-uid-1"),
++			ResourceVersion: "runtime-rv-1",
++		},
++	}
++	return []runtime.Object{pvc, dataset, alluxioRuntime}
++}
++
++func seedStaleRuntimeInfoCacheEntry() {
++	runtimeInfo, err := base.BuildRuntimeInfo(cachedPVCNamespacedName, "default", common.AlluxioRuntime)
++	Expect(err).NotTo(HaveOccurred())
++	cache.SetRuntimeInfoByKey(
++		types.NamespacedName{Name: cachedPVCNamespacedName, Namespace: "default"},
++		cache.NewPersistentVolumeClaimInfoCache(runtimeInfo, true, cache.SourceObjectIdentity{
++			PVCUID:                  types.UID("pvc-uid-1"),
++			PVCResourceVersion:      "stale-pvc-rv",
++			DatasetUID:              types.UID("dataset-uid-1"),
++			DatasetResourceVersion:  "dataset-rv-1",
++			RuntimeType:             common.AlluxioRuntime,
++			RuntimeName:             cachedPVCNamespacedName,
++			RuntimeNamespace:        "default",
++			RuntimeUID:              types.UID("runtime-uid-1"),
++			RuntimeResourceVersion:  "runtime-rv-1",
++		}))
++}
++
++func podMountingCachedPVC() *corev1.Pod {
++	return &corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "cache-test-pod",
++			Namespace: "default",
++		},
++		Spec: corev1.PodSpec{
++			Containers: []corev1.Container{
++				{
++					Name:  "app",
++					Image: "test",
++					VolumeMounts: []corev1.VolumeMount{
++						{Name: "data", MountPath: "/data"},
++					},
++				},
++			},
++			Volumes: []corev1.Volume{
++				{
++					Name: "data",
++					VolumeSource: corev1.VolumeSource{
++						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
++							ClaimName: cachedPVCNamespacedName,
++						},
++					},
++				},
++			},
++		},
++	}
++}
++
++func cacheConsistencyRequest() admission.Request {
++	return admission.Request{
++		AdmissionRequest: admissionv1.AdmissionRequest{
++			Namespace: "default",
++			Object: runtime.RawExtension{
++				Raw: []byte(`{
++					"apiVersion": "v1",
++					"kind": "Pod",
++					"metadata": {
++						"name": "cache-test-pod",
++						"namespace": "default"
++					},
++					"spec": {
++						"containers": [
++							{
++								"name": "app",
++								"image": "test",
++								"volumeMounts": [
++									{
++										"name": "data",
++										"mountPath": "/data"
++									}
++								]
++							}
++						],
++						"volumes": [
++							{
++								"name": "data",
++								"persistentVolumeClaim": {
++									"claimName": "cached-ds-pvc"
++								}
++							}
++						]
++					}
++				}`),
++			},
++		},
++	}
++}
++
++var _ = Describe("Mutating Handler - RuntimeInfo Cache Consistency", func() {
++	var (
++		s     *runtime.Scheme
++
++		patch *gomonkey.Patches
++	)
++
++	BeforeEach(func() {
++		s = cacheConsistencyScheme()
++		cache.EnableRuntimeInfoCacheForTest(64, time.Minute)
++
++		mockReadFile := func(content string) ([]byte, error) {
++			return []byte(pluginsProfile), nil
++		}
++		patch = gomonkey.ApplyFunc(os.ReadFile, mockReadFile)
++	})
++
++	AfterEach(func() {
++		patch.Reset()
++		cache.DisableRuntimeInfoCacheForTest()
++	})
++
++	It("returns a retryable stale error when the cached client hits a stale cache entry", func() {
++		cachedClient := fake.NewFakeClientWithScheme(s, cacheConsistencyObjects()...)
++		Expect(plugins.RegisterMutatingHandlers(cachedClient)).To(Succeed())
++		seedStaleRuntimeInfoCacheEntry()
++
++		handler := &FluidMutatingHandler{Client: cachedClient}
++		err := handler.MutatePod(podMountingCachedPVC(), false)
++		Expect(err).To(HaveOccurred())
++		Expect(webhookutils.IsNeedRetryWithApiReaderError(err)).To(BeTrue())
++		Expect(webhookutils.IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++		Expect(err.Error()).To(ContainSubstring("PVC resourceVersion changed"))
++	})
++
++	It("redoes the whole mutation from the original pod with the API reader and heals the cache", func() {
++		cachedClient := fake.NewFakeClientWithScheme(s, cacheConsistencyObjects()...)
++		apiReader := fake.NewFakeClientWithScheme(s, cacheConsistencyObjects()...)
++		Expect(plugins.RegisterMutatingHandlers(cachedClient)).To(Succeed())
++		seedStaleRuntimeInfoCacheEntry()
++
++		handler := &FluidMutatingHandler{}
++		handler.Setup(cachedClient, apiReader, admission.NewDecoder(clientgoscheme.Scheme))
++
++		resp := handler.Handle(context.TODO(), cacheConsistencyRequest())
++		Expect(resp.AdmissionResponse.Allowed).To(BeTrue())
++
++		// The retried mutation bypassed the stale entry and healed it with identities
++		// observed from the authoritative API reader.
++		cached, found := cache.GetRuntimeInfoByKey(types.NamespacedName{
++			Name:      cachedPVCNamespacedName,
++			Namespace: "default",
++		})
++		Expect(found).To(BeTrue())
++		Expect(cached.IsBelongToDataset()).To(BeTrue())
++		Expect(cached.GetIdentity().PVCResourceVersion).To(Equal("pvc-rv-2"))
++		Expect(cached.GetIdentity().DatasetResourceVersion).To(Equal("dataset-rv-1"))
++		Expect(cached.GetIdentity().RuntimeResourceVersion).To(Equal("runtime-rv-1"))
++	})
++
++	It("rejects the admission with a clear error when the API reader redo also fails", func() {
++		cachedClient := fake.NewFakeClientWithScheme(s, cacheConsistencyObjects()...)
++		// The direct API reader sees none of the objects, so the authoritative redo cannot
++		// build any consistent snapshot.
++		apiReader := fake.NewFakeClientWithScheme(s)
++		Expect(plugins.RegisterMutatingHandlers(cachedClient)).To(Succeed())
++		seedStaleRuntimeInfoCacheEntry()
++
++		handler := &FluidMutatingHandler{}
++		handler.Setup(cachedClient, apiReader, admission.NewDecoder(clientgoscheme.Scheme))
++
++		resp := handler.Handle(context.TODO(), cacheConsistencyRequest())
++		Expect(resp.AdmissionResponse.Allowed).To(BeFalse())
++		Expect(resp.Result).NotTo(BeNil())
++		Expect(resp.Result.Message).To(ContainSubstring("persistentvolumeclaims"))
++	})
++
++	It("allows the pod when the cached entry passes identity validation without source changes", func() {
++		cachedClient := fake.NewFakeClientWithScheme(s, cacheConsistencyObjects()...)
++		Expect(plugins.RegisterMutatingHandlers(cachedClient)).To(Succeed())
++
++		// First admission populates the cache from current objects.
++		firstHandler := &FluidMutatingHandler{}
++		firstHandler.Setup(cachedClient, cachedClient, admission.NewDecoder(clientgoscheme.Scheme))
++		firstResp := firstHandler.Handle(context.TODO(), cacheConsistencyRequest())
++		Expect(firstResp.AdmissionResponse.Allowed).To(BeTrue())
++
++		// Second admission reuses the validated cache entry successfully.
++		secondHandler := &FluidMutatingHandler{}
++		secondHandler.Setup(cachedClient, cachedClient, admission.NewDecoder(clientgoscheme.Scheme))
++		secondResp := secondHandler.Handle(context.TODO(), cacheConsistencyRequest())
++		Expect(secondResp.AdmissionResponse.Allowed).To(BeTrue())
++	})
++})
+diff --git a/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go b/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go
+index 896d5f1..a6e0a2d 100644
+--- a/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go
++++ b/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go
+@@ -77,7 +77,7 @@ func (p *FuseSidecar) Mutate(pod *corev1.Pod, runtimeInfos map[string]base.Runti
+ 		out.DeepCopyInto(pod)
+ 		pvcNames := kubeclient.GetPVCNamesFromPod(pod)
+ 		runtimeInfos, err = webhookutils.CollectRuntimeInfosFromPVCs(p.client, pvcNames, pod.Namespace, p.log,
+-			utils.SkipPrecheckEnable(pod.Annotations))
++			utils.SkipPrecheckEnable(pod.Annotations), false)
+ 		if err != nil {
+ 			return shouldStop, webhookutils.NewNeedRetryWithApiReaderError(errors.Wrapf(err, "failed to collect runtime infos from PVCs %v", pvcNames))
+ 		}
+diff --git a/pkg/webhook/utils/errors.go b/pkg/webhook/utils/errors.go
+index 0efbbae..a9b2392 100644
+--- a/pkg/webhook/utils/errors.go
++++ b/pkg/webhook/utils/errors.go
+@@ -1,7 +1,17 @@
+ package utils
+ 
++import (
++	"errors"
++	"fmt"
++
++	"k8s.io/apimachinery/pkg/types"
++)
++
+ type NeedRetryWithApiReaderError struct {
+ 	ErrMsg string
++	// cause keeps the original error so that wrapped errors (e.g. stale cache errors)
++	// remain discoverable through errors.As/Is after the retry marker is attached.
++	cause error
+ }
+ 
+ var _ error = &NeedRetryWithApiReaderError{}
+@@ -11,12 +21,17 @@ func (e *NeedRetryWithApiReaderError) Error() string {
+ 	return e.ErrMsg
+ }
+ 
++// Unwrap returns the original error that triggers the retry with the API reader.
++func (e *NeedRetryWithApiReaderError) Unwrap() error {
++	return e.cause
++}
++
+ func IsNeedRetryWithApiReaderError(err error) bool {
+-	if _, ok := err.(*NeedRetryWithApiReaderError); ok {
+-		return true
++	if err == nil {
++		return false
+ 	}
+-
+-	return false
++	var retryErr *NeedRetryWithApiReaderError
++	return errors.As(err, &retryErr)
+ }
+ 
+ func NewNeedRetryWithApiReaderError(err error) *NeedRetryWithApiReaderError {
+@@ -25,5 +40,34 @@ func NewNeedRetryWithApiReaderError(err error) *NeedRetryWithApiReaderError {
+ 	}
+ 	return &NeedRetryWithApiReaderError{
+ 		ErrMsg: err.Error(),
++		cause:  err,
++	}
++}
++
++// StaleRuntimeInfoCacheError indicates that a runtime info cache entry failed identity
++// validation against the current PVC/Dataset/Runtime objects (for example because one of
++// them was updated, deleted, recreated or changed type). When this happens, no partially
++// refreshed result may be used: the whole pod mutation must be redone from the original
++// pod with the direct API reader, which bypasses the cache and rebuilds one consistent
++// snapshot. If the direct API read fails as well, the admission must be rejected.
++type StaleRuntimeInfoCacheError struct {
++	Key    types.NamespacedName
++	Reason string
++}
++
++var _ error = &StaleRuntimeInfoCacheError{}
++
++// Error implements the Error interface.
++func (e *StaleRuntimeInfoCacheError) Error() string {
++	return fmt.Sprintf("stale runtime info cache entry for PVC %q: %s", e.Key.String(), e.Reason)
++}
++
++// IsStaleRuntimeInfoCacheError reports whether err is a StaleRuntimeInfoCacheError,
++// unwrapping wrapped errors when necessary.
++func IsStaleRuntimeInfoCacheError(err error) bool {
++	if err == nil {
++		return false
+ 	}
++	var staleErr *StaleRuntimeInfoCacheError
++	return errors.As(err, &staleErr)
+ }
+diff --git a/pkg/webhook/utils/errors_test.go b/pkg/webhook/utils/errors_test.go
+new file mode 100644
+index 0000000..b2dfb8e
+--- /dev/null
++++ b/pkg/webhook/utils/errors_test.go
+@@ -0,0 +1,55 @@
++package utils
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/pkg/errors"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++func TestNeedRetryWithApiReaderErrorWrapsCause(t *testing.T) {
++	staleErr := &StaleRuntimeInfoCacheError{
++		Key:    types.NamespacedName{Name: "pvc", Namespace: "default"},
++		Reason: "PVC resourceVersion changed",
++	}
++
++	wrapped := NewNeedRetryWithApiReaderError(errors.Wrapf(staleErr, "failed to collect runtime infos from PVCs"))
++	if wrapped == nil {
++		t.Fatalf("expected a non-nil retry error")
++	}
++	if !IsNeedRetryWithApiReaderError(wrapped) {
++		t.Fatalf("expected the error to be recognized as a retry-with-api-reader error")
++	}
++	if !IsStaleRuntimeInfoCacheError(wrapped) {
++		t.Fatalf("expected the wrapped stale error to remain discoverable through errors.As")
++	}
++	if wrapped.Error() == "" {
++		t.Fatalf("expected a non-empty error message")
++	}
++}
++
++func TestNewNeedRetryWithApiReaderErrorNilInput(t *testing.T) {
++	if NewNeedRetryWithApiReaderError(nil) != nil {
++		t.Fatalf("expected nil retry error for nil input")
++	}
++}
++
++func TestStaleRuntimeInfoCacheErrorMessage(t *testing.T) {
++	err := &StaleRuntimeInfoCacheError{
++		Key:    types.NamespacedName{Name: "pvc", Namespace: "default"},
++		Reason: "Dataset UID changed",
++	}
++	if !IsStaleRuntimeInfoCacheError(err) {
++		t.Fatalf("expected the error to be recognized as stale")
++	}
++	if IsStaleRuntimeInfoCacheError(nil) {
++		t.Fatalf("nil error must not be recognized as stale")
++	}
++	msg := err.Error()
++	for _, fragment := range []string{"default/pvc", "Dataset UID changed"} {
++		if !strings.Contains(msg, fragment) {
++			t.Fatalf("expected error message %q to contain %q", msg, fragment)
++		}
++	}
++}
+diff --git a/pkg/webhook/utils/runtime_info.go b/pkg/webhook/utils/runtime_info.go
+index e50cc42..ea866b9 100644
+--- a/pkg/webhook/utils/runtime_info.go
++++ b/pkg/webhook/utils/runtime_info.go
+@@ -13,15 +13,111 @@ import (
+ 	"github.com/go-logr/logr"
+ 	"github.com/pkg/errors"
+ 	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
+-func CollectRuntimeInfosFromPVCs(client client.Reader, pvcNames []string, namespace string, setupLog logr.Logger, skipPrecheck bool) (runtimeInfos map[string]base.RuntimeInfoInterface, err error) {
++// CollectRuntimeInfosFromPVCs resolves every given PVC to the RuntimeInfo that later
++// webhook plugins consume and returns one all-or-nothing result for a single pod
++// admission.
++//
++// When the runtime info cache is disabled (the default), the function keeps its original
++// behavior and reads/builds everything from the passed reader.
++//
++// When the cache is enabled:
++//   - A cached entry is reused only after its recorded PVC/Dataset/Runtime identities are
++//     validated against the current objects. Any update, deletion, recreation or type
++//     change is detected as a stale entry and aborts the whole collection with a
++//     StaleRuntimeInfoCacheError, so a single admission can never mix stale and fresh
++//     entries (this also covers multi-PVC pods, TTL expiry and webhook restarts, where
++//     some entries may be missing while others are still cached).
++//   - On cache miss, entries are built from the current objects and cached together with
++//     their source object identities.
++//   - When forceRefresh is true (i.e. the mutation is redone with the direct API reader),
++//     the global cache is bypassed entirely, every entry is rebuilt from the authoritative
++//     API state and the cache is healed with consistent entries.
++//
++// Read errors from the passed reader are returned as errors so that callers can trigger
++// the retry-with-API-reader flow; if the retry also fails, the admission is rejected.
++func CollectRuntimeInfosFromPVCs(reader client.Reader, pvcNames []string, namespace string,
++	setupLog logr.Logger, skipPrecheck bool, forceRefresh bool) (runtimeInfos map[string]base.RuntimeInfoInterface, err error) {
+ 	if utils.IsTimeTrackerDebugEnabled() {
+ 		defer utils.TimeTrack(time.Now(), "CreateUpdatePodForSchedulingHandler.checkIfDatasetPVCs",
+ 			"pvc.names", pvcNames, "pvc.namespace", namespace)
+ 	}
++
++	runtimeInfos = map[string]base.RuntimeInfoInterface{}
++	if len(pvcNames) == 0 {
++		return
++	}
++
++	// When the cache is disabled, preserve the original behavior exactly: no identity
++	// validation and no extra PVC reads beyond the original per-PVC lookup.
++	if !cache.IsRuntimeInfoCacheEnabled() {
++		return collectRuntimeInfosWithoutCache(reader, pvcNames, namespace, setupLog, skipPrecheck)
++	}
++
++	// Cache enabled: resolve all PVCs into one consistent snapshot. The loop returns an
++	// error on the first stale entry or read failure instead of returning a partially
++	// refreshed map, so the caller can redo the whole mutation from the original pod.
++	for _, pvcName := range pvcNames {
++		key := types.NamespacedName{
++			Name:      pvcName,
++			Namespace: namespace,
++		}
++
++		// Always read the current PVC first so that a cached entry can only be reused
++		// after being validated against the current PVC identity.
++		pvc, pvcErr := kubeclient.GetPersistentVolumeClaim(reader, pvcName, namespace)
++		if pvcErr != nil {
++			return nil, errors.Wrapf(pvcErr,
++				"failed to get current PVC %q to validate the runtime info cache", key.String())
++		}
++
++		if !forceRefresh {
++			if cachedEntry, found := cache.GetRuntimeInfoByKey(key); found {
++				stale, reason, validateErr := validateCachedRuntimeInfo(reader, cachedEntry, pvc)
++				if validateErr != nil {
++					return nil, errors.Wrapf(validateErr,
++						"failed to validate the runtime info cache entry of PVC %q", key.String())
++				}
++				if !stale {
++					if cachedEntry.IsBelongToDataset() {
++						runtimeInfos[pvcName] = cachedEntry.GetRuntimeInfo()
++					}
++					continue
++				}
++
++				// The entry is stale: invalidate it and abort the whole collection so that
++				// the admission is redone from the original pod with the API reader.
++				setupLog.Info("stale runtime info cache entry detected, invalidating it",
++					"pvc", key.String(), "reason", reason)
++				cache.RemoveRuntimeInfoByKey(key)
++				return nil, &StaleRuntimeInfoCacheError{Key: key, Reason: reason}
++			}
++		}
++
++		// Cache miss or forced refresh: build the entry (and its source object identities)
++		// from the current objects through the same reader, which keeps the whole snapshot
++		// consistent with one reader view.
++		entry, isDatasetPVC, buildErr := buildPVCInfoCacheEntry(reader, pvc, setupLog, skipPrecheck)
++		if buildErr != nil {
++			return nil, buildErr
++		}
++		cache.SetRuntimeInfoByKey(key, entry)
++		if isDatasetPVC {
++			runtimeInfos[pvcName] = entry.GetRuntimeInfo()
++		}
++	}
++
++	return
++}
++
++// collectRuntimeInfosWithoutCache keeps the historical cache-disabled resolution path:
++// per-PVC lookup, dataset check and runtime info build, aggregating unreadable PVCs.
++func collectRuntimeInfosWithoutCache(reader client.Reader, pvcNames []string, namespace string,
++	setupLog logr.Logger, skipPrecheck bool) (runtimeInfos map[string]base.RuntimeInfoInterface, err error) {
+ 	errPVCs := []string{}
+ 	runtimeInfos = map[string]base.RuntimeInfoInterface{}
+ 	for _, pvcName := range pvcNames {
+@@ -29,38 +125,24 @@ func CollectRuntimeInfosFromPVCs(client client.Reader, pvcNames []string, namesp
+ 			isDatasetPVC bool
+ 			runtimeInfo  base.RuntimeInfoInterface
+ 		)
+-		if cachedInfo, found := cache.GetRuntimeInfoByKey(types.NamespacedName{
+-			Name:      pvcName,
+-			Namespace: namespace,
+-		}); found {
+-			isDatasetPVC = cachedInfo.IsBelongToDataset()
+-			if isDatasetPVC {
+-				runtimeInfos[pvcName] = cachedInfo.GetRuntimeInfo()
+-			}
+-		} else {
+-			pvc, pvcErr := kubeclient.GetPersistentVolumeClaim(client, pvcName, namespace)
+-			if pvcErr != nil {
+-				setupLog.Error(pvcErr, "unable to check pvc, ignore and continue to check next pvc",
+-					"pvc",
+-					pvcName,
+-					"namespace",
+-					namespace)
+-				errPVCs = append(errPVCs, pvcName)
+-				continue
+-			}
+-			isDatasetPVC = kubeclient.CheckIfPVCIsDataset(pvc)
+-			if isDatasetPVC {
+-				runtimeInfo, err = buildRuntimeInfoInternalWithPrecheck(client, pvc, setupLog, skipPrecheck)
+-				if err != nil {
+-					err = errors.Wrapf(err, "failed to build runtime info for PVC \"%v/%v\"", namespace, pvcName)
+-					return
+-				}
+-				runtimeInfos[pvcName] = runtimeInfo
++		pvc, pvcErr := kubeclient.GetPersistentVolumeClaim(reader, pvcName, namespace)
++		if pvcErr != nil {
++			setupLog.Error(pvcErr, "unable to check pvc, ignore and continue to check next pvc",
++				"pvc",
++				pvcName,
++				"namespace",
++				namespace)
++			errPVCs = append(errPVCs, pvcName)
++			continue
++		}
++		isDatasetPVC = kubeclient.CheckIfPVCIsDataset(pvc)
++		if isDatasetPVC {
++			runtimeInfo, err = buildRuntimeInfoInternalWithPrecheck(reader, pvc, setupLog, skipPrecheck)
++			if err != nil {
++				err = errors.Wrapf(err, "failed to build runtime info for PVC \"%v/%v\"", namespace, pvcName)
++				return
+ 			}
+-			cache.AddRuntimeInfoByKey(types.NamespacedName{
+-				Name:      pvcName,
+-				Namespace: namespace,
+-			}, runtimeInfo, isDatasetPVC)
++			runtimeInfos[pvcName] = runtimeInfo
+ 		}
+ 	}
+ 
+@@ -72,6 +154,155 @@ func CollectRuntimeInfosFromPVCs(client client.Reader, pvcNames []string, namesp
+ 	return
+ }
+ 
++// validateCachedRuntimeInfo checks whether the cached entry still matches the current
++// source objects visible through reader. It returns stale=true with a human-readable
++// reason when an identity mismatch is detected. A non-nil error means the current state
++// cannot be verified (e.g. a source object cannot be read), in which case the caller must
++// retry with the API reader instead of trusting the entry.
++func validateCachedRuntimeInfo(reader client.Reader, entry *cache.PersistentVolumeClaimInfoCache,
++	pvc *corev1.PersistentVolumeClaim) (stale bool, reason string, err error) {
++	identity := entry.GetIdentity()
++
++	// 1. PVC identity: a UID change means delete-and-recreate with the same name, while a
++	// ResourceVersion change means an update (including dataset label flips).
++	if identity.PVCUID != pvc.UID {
++		return true, fmt.Sprintf("PVC UID changed from %q to %q", identity.PVCUID, pvc.UID), nil
++	}
++	if identity.PVCResourceVersion != pvc.ResourceVersion {
++		return true, fmt.Sprintf("PVC resourceVersion changed from %q to %q",
++			identity.PVCResourceVersion, pvc.ResourceVersion), nil
++	}
++
++	// 2. The "belongs to Dataset" decision must stay consistent with the current PVC.
++	currentIsDataset := kubeclient.CheckIfPVCIsDataset(pvc)
++	if currentIsDataset != entry.IsBelongToDataset() {
++		return true, fmt.Sprintf("PVC dataset membership changed from %v to %v",
++			entry.IsBelongToDataset(), currentIsDataset), nil
++	}
++
++	// A non-dataset PVC has no further source objects to validate.
++	if !currentIsDataset {
++		return false, "", nil
++	}
++
++	// 3. Dataset identity: catches Dataset recreation (UID) as well as Dataset updates such
++	// as rebinding another Runtime (ResourceVersion).
++	datasetName := resolveDatasetName(pvc)
++	dataset, err := utils.GetDataset(reader, datasetName, pvc.GetNamespace())
++	if err != nil {
++		return false, "", errors.Wrapf(err,
++			"failed to get current Dataset %q/%q for runtime info cache validation",
++			pvc.GetNamespace(), datasetName)
++	}
++	if identity.DatasetUID != dataset.UID {
++		return true, fmt.Sprintf("Dataset UID changed from %q to %q", identity.DatasetUID, dataset.UID), nil
++	}
++	if identity.DatasetResourceVersion != dataset.ResourceVersion {
++		return true, fmt.Sprintf("Dataset %q resourceVersion changed from %q to %q",
++			datasetName, identity.DatasetResourceVersion, dataset.ResourceVersion), nil
++	}
++
++	// 4. Runtime identity: catches Runtime recreation (UID), Runtime spec updates such as
++	// FUSE node selector changes (ResourceVersion) and type/name changes recorded in the
++	// entry (a rebind is already covered by the Dataset ResourceVersion check above).
++	runtimeObject, err := getRuntimeObject(reader, identity.RuntimeType, identity.RuntimeName, identity.RuntimeNamespace)
++	if err != nil {
++		return false, "", errors.Wrapf(err,
++			"failed to get current Runtime %q/%q of type %q for runtime info cache validation",
++			identity.RuntimeNamespace, identity.RuntimeName, identity.RuntimeType)
++	}
++	if identity.RuntimeUID != runtimeObject.GetUID() {
++		return true, fmt.Sprintf("Runtime UID changed from %q to %q",
++			identity.RuntimeUID, runtimeObject.GetUID()), nil
++	}
++	if identity.RuntimeResourceVersion != runtimeObject.GetResourceVersion() {
++		return true, fmt.Sprintf("Runtime %q/%q resourceVersion changed from %q to %q",
++			identity.RuntimeNamespace, identity.RuntimeName,
++			identity.RuntimeResourceVersion, runtimeObject.GetResourceVersion()), nil
++	}
++
++	return false, "", nil
++}
++
++// buildPVCInfoCacheEntry resolves a single PVC into a cache entry that contains the
++// "belongs to Dataset" decision, the RuntimeInfo used by later plugins and the identities
++// of the PVC/Dataset/Runtime objects from which they are derived.
++func buildPVCInfoCacheEntry(reader client.Reader, pvc *corev1.PersistentVolumeClaim,
++	setupLog logr.Logger, skipPrecheck bool) (entry *cache.PersistentVolumeClaimInfoCache, isDatasetPVC bool, err error) {
++	isDatasetPVC = kubeclient.CheckIfPVCIsDataset(pvc)
++	identity := cache.SourceObjectIdentity{
++		PVCUID:             pvc.UID,
++		PVCResourceVersion: pvc.ResourceVersion,
++	}
++
++	var runtimeInfo base.RuntimeInfoInterface
++	if isDatasetPVC {
++		runtimeInfo, err = buildRuntimeInfoInternalWithPrecheck(reader, pvc, setupLog, skipPrecheck)
++		if err != nil {
++			return nil, false, err
++		}
++
++		datasetName := resolveDatasetName(pvc)
++		dataset, datasetErr := utils.GetDataset(reader, datasetName, pvc.GetNamespace())
++		if datasetErr != nil {
++			return nil, false, errors.Wrapf(datasetErr,
++				"failed to get Dataset %q/%q when building runtime info cache entry",
++				pvc.GetNamespace(), datasetName)
++		}
++		identity.DatasetUID = dataset.UID
++		identity.DatasetResourceVersion = dataset.ResourceVersion
++
++		runtimeObject, runtimeErr := getRuntimeObject(reader,
++			runtimeInfo.GetRuntimeType(), runtimeInfo.GetName(), runtimeInfo.GetNamespace())
++		if runtimeErr != nil {
++			return nil, false, errors.Wrapf(runtimeErr,
++				"failed to get Runtime %q/%q of type %q when building runtime info cache entry",
++				runtimeInfo.GetNamespace(), runtimeInfo.GetName(), runtimeInfo.GetRuntimeType())
++		}
++		identity.RuntimeType = runtimeInfo.GetRuntimeType()
++		identity.RuntimeName = runtimeInfo.GetName()
++		identity.RuntimeNamespace = runtimeInfo.GetNamespace()
++		identity.RuntimeUID = runtimeObject.GetUID()
++		identity.RuntimeResourceVersion = runtimeObject.GetResourceVersion()
++	}
++
++	entry = cache.NewPersistentVolumeClaimInfoCache(runtimeInfo, isDatasetPVC, identity)
++	return entry, isDatasetPVC, nil
++}
++
++// resolveDatasetName returns the Dataset name associated with a dataset PVC. A PVC managed
++// by Fluid may carry the Dataset name in its labels, otherwise the PVC name is used.
++func resolveDatasetName(pvc *corev1.PersistentVolumeClaim) string {
++	datasetName := pvc.GetName()
++	if name, exists := common.GetManagerDatasetFromLabels(pvc.Labels); exists {
++		datasetName = name
++	}
++	return datasetName
++}
++
++// getRuntimeObject fetches the typed Runtime object behind a Dataset and returns it as a
++// metav1.Object so that its UID and ResourceVersion can be read generically.
++func getRuntimeObject(reader client.Reader, runtimeType, name, namespace string) (metav1.Object, error) {
++	switch runtimeType {
++	case common.AlluxioRuntime:
++		return utils.GetAlluxioRuntime(reader, name, namespace)
++	case common.JindoRuntime:
++		return utils.GetJindoRuntime(reader, name, namespace)
++	case common.JuiceFSRuntime:
++		return utils.GetJuiceFSRuntime(reader, name, namespace)
++	case common.ThinRuntime:
++		return utils.GetThinRuntime(reader, name, namespace)
++	case common.EFCRuntime:
++		return utils.GetEFCRuntime(reader, name, namespace)
++	case common.VineyardRuntime:
++		return utils.GetVineyardRuntime(reader, name, namespace)
++	case common.CacheRuntime:
++		return utils.GetCacheRuntime(reader, name, namespace)
++	default:
++		return nil, fmt.Errorf("unknown runtime type %q for runtime %q/%q", runtimeType, namespace, name)
++	}
++}
++
+ func buildRuntimeInfoInternalWithPrecheck(client client.Reader,
+ 	pvc *corev1.PersistentVolumeClaim,
+ 	log logr.Logger, skipPrecheck bool) (runtimeInfo base.RuntimeInfoInterface, err error) {
+diff --git a/pkg/webhook/utils/runtime_info_cache_enabled_test.go b/pkg/webhook/utils/runtime_info_cache_enabled_test.go
+new file mode 100644
+index 0000000..230f4f2
+--- /dev/null
++++ b/pkg/webhook/utils/runtime_info_cache_enabled_test.go
+@@ -0,0 +1,438 @@
++package utils
++
++import (
++	"time"
++
++	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
++	"github.com/fluid-cloudnative/fluid/pkg/webhook/cache"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/log/zap"
++)
++
++const (
++	testNamespace      = "default"
++	testPVCNamespaced  = "ds-pvc"
++	testPVCUID         = types.UID("pvc-uid-1")
++	testPVCResourceVer = "pvc-rv-1"
++
++	testDatasetUID         = types.UID("dataset-uid-1")
++	testDatasetResourceVer = "dataset-rv-1"
++
++	testRuntimeUID         = types.UID("runtime-uid-1")
++	testRuntimeResourceVer = "runtime-rv-1"
++)
++
++func newDatasetPVC(uid types.UID, resourceVersion string, isDataset bool) *corev1.PersistentVolumeClaim {
++	labels := map[string]string{}
++	if isDataset {
++		labels[common.LabelAnnotationStorageCapacityPrefix+"default-ds-pvc"] = common.True
++	}
++	return &corev1.PersistentVolumeClaim{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:            testPVCNamespaced,
++			Namespace:       testNamespace,
++			UID:             uid,
++			ResourceVersion: resourceVersion,
++			Labels:          labels,
++		},
++	}
++}
++
++func newBoundDataset(uid types.UID, resourceVersion string) *v1alpha1.Dataset {
++	return &v1alpha1.Dataset{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:            testPVCNamespaced,
++			Namespace:       testNamespace,
++			UID:             uid,
++			ResourceVersion: resourceVersion,
++		},
++		Status: v1alpha1.DatasetStatus{
++			Phase: v1alpha1.BoundDatasetPhase,
++			Runtimes: []v1alpha1.Runtime{
++				{
++					Name:      testPVCNamespaced,
++					Namespace: testNamespace,
++					Type:      common.AlluxioRuntime,
++				},
++			},
++		},
++	}
++}
++
++func newAlluxioRuntime(uid types.UID, resourceVersion string) *v1alpha1.AlluxioRuntime {
++	return &v1alpha1.AlluxioRuntime{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:            testPVCNamespaced,
++			Namespace:       testNamespace,
++			UID:             uid,
++			ResourceVersion: resourceVersion,
++		},
++	}
++}
++
++func newCacheEnabledFakeClient(objs ...client.Object) client.Client {
++	return fake.NewClientBuilder().
++		WithScheme(setupScheme()).
++		WithObjects(objs...).
++		Build()
++}
++
++func matchingDatasetIdentity() cache.SourceObjectIdentity {
++	return cache.SourceObjectIdentity{
++		PVCUID:                 testPVCUID,
++		PVCResourceVersion:     testPVCResourceVer,
++		DatasetUID:             testDatasetUID,
++		DatasetResourceVersion: testDatasetResourceVer,
++		RuntimeType:            common.AlluxioRuntime,
++		RuntimeName:            testPVCNamespaced,
++		RuntimeNamespace:       testNamespace,
++		RuntimeUID:             testRuntimeUID,
++		RuntimeResourceVersion: testRuntimeResourceVer,
++	}
++}
++
++func seedCachedEntry(pvcName string, isDataset bool, identity cache.SourceObjectIdentity) base.RuntimeInfoInterface {
++	runtimeInfo, err := base.BuildRuntimeInfo(testPVCNamespaced, testNamespace, common.AlluxioRuntime)
++	Expect(err).NotTo(HaveOccurred())
++	cache.SetRuntimeInfoByKey(types.NamespacedName{Name: pvcName, Namespace: testNamespace},
++		cache.NewPersistentVolumeClaimInfoCache(runtimeInfo, isDataset, identity))
++	return runtimeInfo
++}
++
++var _ = Describe("CollectRuntimeInfosFromPVCs with runtime info cache enabled", func() {
++	var (
++		setupLog = zap.New(zap.UseDevMode(true))
++		pvc      *corev1.PersistentVolumeClaim
++		dataset  *v1alpha1.Dataset
++		runtime  *v1alpha1.AlluxioRuntime
++	)
++
++	BeforeEach(func() {
++		cache.EnableRuntimeInfoCacheForTest(64, time.Minute)
++		pvc = newDatasetPVC(testPVCUID, testPVCResourceVer, true)
++		dataset = newBoundDataset(testDatasetUID, testDatasetResourceVer)
++		runtime = newAlluxioRuntime(testRuntimeUID, testRuntimeResourceVer)
++	})
++
++	AfterEach(func() {
++		cache.DisableRuntimeInfoCacheForTest()
++	})
++
++	Context("cache miss and validated hit", func() {
++		It("builds and caches an entry on miss and reuses the exact RuntimeInfo on a validated hit", func() {
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++
++			first, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(first).To(HaveLen(1))
++			Expect(first[testPVCNamespaced]).NotTo(BeNil())
++
++			cached, found := cache.GetRuntimeInfoByKey(types.NamespacedName{Name: testPVCNamespaced, Namespace: testNamespace})
++			Expect(found).To(BeTrue())
++			Expect(cached.IsBelongToDataset()).To(BeTrue())
++			Expect(cached.GetIdentity().PVCUID).To(Equal(testPVCUID))
++			Expect(cached.GetIdentity().DatasetUID).To(Equal(testDatasetUID))
++			Expect(cached.GetIdentity().RuntimeUID).To(Equal(testRuntimeUID))
++
++			// Second admission: identities still match, so the cached RuntimeInfo is reused.
++			second, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(second[testPVCNamespaced]).To(BeIdenticalTo(first[testPVCNamespaced]))
++		})
++
++		It("reuses a pre-seeded entry whose identities all match the current objects", func() {
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			cachedInfo := seedCachedEntry(testPVCNamespaced, true, matchingDatasetIdentity())
++
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(runtimeInfos[testPVCNamespaced]).To(BeIdenticalTo(cachedInfo))
++		})
++
++		It("caches a non-dataset PVC without RuntimeInfo and keeps returning an empty map", func() {
++			regularPVC := newDatasetPVC(testPVCUID, testPVCResourceVer, false)
++			fakeClient := newCacheEnabledFakeClient(regularPVC)
++
++			first, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(first).To(HaveLen(0))
++
++			cached, found := cache.GetRuntimeInfoByKey(types.NamespacedName{Name: testPVCNamespaced, Namespace: testNamespace})
++			Expect(found).To(BeTrue())
++			Expect(cached.IsBelongToDataset()).To(BeFalse())
++
++			second, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(second).To(HaveLen(0))
++		})
++	})
++
++	Context("stale PVC identity", func() {
++		It("detects PVC resourceVersion changes and invalidates the entry", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.PVCResourceVersion = "stale-pvc-rv"
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(runtimeInfos).To(BeNil())
++			Expect(err.Error()).To(ContainSubstring("PVC resourceVersion changed"))
++
++			_, found := cache.GetRuntimeInfoByKey(types.NamespacedName{Name: testPVCNamespaced, Namespace: testNamespace})
++			Expect(found).To(BeFalse())
++		})
++
++		It("detects PVC UID changes after delete-and-recreate with the same name", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.PVCUID = types.UID("deleted-pvc-uid")
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("PVC UID changed"))
++		})
++
++		It("detects a dataset PVC turning into a regular PVC", func() {
++			// Same PVC UID and resourceVersion, only the dataset labels disappear: the
++			// dataset membership mismatch itself must invalidate the entry.
++			regularPVC := newDatasetPVC(testPVCUID, testPVCResourceVer, false)
++			fakeClient := newCacheEnabledFakeClient(regularPVC)
++			seedCachedEntry(testPVCNamespaced, true, matchingDatasetIdentity())
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("dataset membership changed"))
++		})
++
++		It("detects a regular PVC turning into a dataset PVC", func() {
++			fakeClient := newCacheEnabledFakeClient(pvc)
++			regularIdentity := cache.SourceObjectIdentity{
++				PVCUID:             testPVCUID,
++				PVCResourceVersion: testPVCResourceVer,
++			}
++			seedCachedEntry(testPVCNamespaced, false, regularIdentity)
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("dataset membership changed"))
++		})
++	})
++
++	Context("stale Dataset identity", func() {
++		It("detects Dataset resourceVersion changes (e.g. runtime rebinding)", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.DatasetResourceVersion = "stale-dataset-rv"
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("Dataset"))
++			Expect(err.Error()).To(ContainSubstring("resourceVersion changed"))
++		})
++
++		It("detects Dataset UID changes after recreation", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.DatasetUID = types.UID("deleted-dataset-uid")
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("Dataset UID changed"))
++		})
++	})
++
++	Context("stale Runtime identity", func() {
++		It("detects Runtime resourceVersion changes (e.g. FUSE node selector updates)", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.RuntimeResourceVersion = "stale-runtime-rv"
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("Runtime"))
++			Expect(err.Error()).To(ContainSubstring("resourceVersion changed"))
++		})
++
++		It("detects Runtime UID changes after recreation", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.RuntimeUID = types.UID("deleted-runtime-uid")
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			Expect(err.Error()).To(ContainSubstring("Runtime UID changed"))
++		})
++
++		It("returns a non-stale error when the Runtime cannot be read so the caller retries with the API reader", func() {
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset)
++			seedCachedEntry(testPVCNamespaced, true, matchingDatasetIdentity())
++
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeFalse())
++			Expect(err.Error()).To(ContainSubstring("failed to get current Runtime"))
++		})
++	})
++
++	Context("all-or-nothing snapshot across multiple PVCs", func() {
++		It("aborts the whole collection without a partial map when one of multiple PVCs is stale", func() {
++			regularPVC := &corev1.PersistentVolumeClaim{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:            "regular-pvc",
++					Namespace:       testNamespace,
++					UID:             types.UID("regular-pvc-uid"),
++					ResourceVersion: "regular-pvc-rv",
++				},
++			}
++			fakeClient := newCacheEnabledFakeClient(regularPVC, pvc, dataset, runtime)
++
++			// A valid entry for the regular PVC ...
++			cache.SetRuntimeInfoByKey(types.NamespacedName{Name: "regular-pvc", Namespace: testNamespace},
++				cache.NewPersistentVolumeClaimInfoCache(nil, false, cache.SourceObjectIdentity{
++					PVCUID:             types.UID("regular-pvc-uid"),
++					PVCResourceVersion: "regular-pvc-rv",
++				}))
++			// ... and a stale entry for the dataset PVC.
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.PVCResourceVersion = "stale-pvc-rv"
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(fakeClient,
++				[]string{"regular-pvc", testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++			// No partially refreshed snapshot may escape the function.
++			Expect(runtimeInfos).To(BeNil())
++		})
++
++		It("returns an error when a PVC cannot be read instead of mixing readers", func() {
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			_, err := CollectRuntimeInfosFromPVCs(fakeClient,
++				[]string{testPVCNamespaced, "missing-pvc"}, testNamespace, setupLog, false, false)
++			Expect(err).To(HaveOccurred())
++			Expect(err.Error()).To(ContainSubstring("failed to get current PVC"))
++		})
++	})
++
++	Context("forced refresh with the API reader", func() {
++		It("bypasses a stale cache entry, rebuilds from current objects and overwrites the cache", func() {
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.PVCResourceVersion = "stale-pvc-rv"
++			fakeClient := newCacheEnabledFakeClient(pvc, dataset, runtime)
++			staleInfo := seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, true)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(runtimeInfos).To(HaveLen(1))
++			Expect(runtimeInfos[testPVCNamespaced]).NotTo(BeIdenticalTo(staleInfo))
++
++			cached, found := cache.GetRuntimeInfoByKey(types.NamespacedName{Name: testPVCNamespaced, Namespace: testNamespace})
++			Expect(found).To(BeTrue())
++			Expect(cached.GetIdentity().PVCResourceVersion).To(Equal(testPVCResourceVer))
++			Expect(cached.GetIdentity().DatasetResourceVersion).To(Equal(testDatasetResourceVer))
++			Expect(cached.GetIdentity().RuntimeResourceVersion).To(Equal(testRuntimeResourceVer))
++		})
++	})
++
++	Context("cold cache and TTL expiry", func() {
++		It("builds one consistent snapshot for multiple PVCs when the cache is empty (e.g. after a webhook restart)", func() {
++			regularPVC := &corev1.PersistentVolumeClaim{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:            "regular-pvc",
++					Namespace:       testNamespace,
++					UID:             types.UID("regular-pvc-uid"),
++					ResourceVersion: "regular-pvc-rv",
++				},
++			}
++			fakeClient := newCacheEnabledFakeClient(regularPVC, pvc, dataset, runtime)
++
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(fakeClient,
++				[]string{testPVCNamespaced, "regular-pvc"}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			// Only the dataset PVC contributes RuntimeInfo; the regular PVC is recorded as
++			// non-dataset and both entries come from the same reader view.
++			Expect(runtimeInfos).To(HaveLen(1))
++			Expect(runtimeInfos[testPVCNamespaced]).NotTo(BeNil())
++
++			for _, name := range []string{testPVCNamespaced, "regular-pvc"} {
++				cached, found := cache.GetRuntimeInfoByKey(types.NamespacedName{Name: name, Namespace: testNamespace})
++				Expect(found).To(BeTrue())
++				if name == testPVCNamespaced {
++					Expect(cached.IsBelongToDataset()).To(BeTrue())
++				} else {
++					Expect(cached.IsBelongToDataset()).To(BeFalse())
++				}
++			}
++		})
++
++		It("rebuilds from current objects instead of reusing stale data after the TTL expires", func() {
++			// Enable the cache with a very short TTL for this spec.
++			cache.EnableRuntimeInfoCacheForTest(64, 50*time.Millisecond)
++
++			updatedPVC := newDatasetPVC(testPVCUID, "pvc-rv-2", true)
++			fakeClient := newCacheEnabledFakeClient(updatedPVC, dataset, runtime)
++
++			// Seed an expired entry whose identities no longer match the current PVC.
++			staleIdentity := matchingDatasetIdentity()
++			staleIdentity.PVCResourceVersion = "stale-pvc-rv"
++			seedCachedEntry(testPVCNamespaced, true, staleIdentity)
++
++			time.Sleep(80 * time.Millisecond)
++
++			// The expired entry must be treated as a miss and rebuilt from current objects,
++			// rather than failing validation against its stale identities.
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(fakeClient, []string{testPVCNamespaced}, testNamespace, setupLog, false, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(runtimeInfos).To(HaveLen(1))
++
++			cached, found := cache.GetRuntimeInfoByKey(types.NamespacedName{Name: testPVCNamespaced, Namespace: testNamespace})
++			Expect(found).To(BeTrue())
++			Expect(cached.GetIdentity().PVCResourceVersion).To(Equal("pvc-rv-2"))
++		})
++	})
++
++	Context("skipPrecheck semantics", func() {
++		It("only skips the readiness precheck while identity validation stays active", func() {
++			notBoundDataset := newBoundDataset(testDatasetUID, testDatasetResourceVer)
++			notBoundDataset.Status.Phase = v1alpha1.NotBoundDatasetPhase
++			firstClient := newCacheEnabledFakeClient(pvc, notBoundDataset, runtime)
++
++			// skipPrecheck=true: the not-bound dataset does not block building the entry.
++			runtimeInfos, err := CollectRuntimeInfosFromPVCs(firstClient, []string{testPVCNamespaced}, testNamespace, setupLog, true, false)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(runtimeInfos).To(HaveLen(1))
++
++			// Another reader observes the updated PVC: identity validation must still run
++			// regardless of skipPrecheck and detect the stale entry.
++			updatedPVC := newDatasetPVC(testPVCUID, "pvc-rv-2", true)
++			updatedPVC.Labels["extra-label"] = "changed"
++			secondClient := newCacheEnabledFakeClient(updatedPVC, notBoundDataset, runtime)
++
++			_, err = CollectRuntimeInfosFromPVCs(secondClient, []string{testPVCNamespaced}, testNamespace, setupLog, true, false)
++			Expect(err).To(HaveOccurred())
++			Expect(IsStaleRuntimeInfoCacheError(err)).To(BeTrue())
++		})
++	})
++})
+diff --git a/pkg/webhook/utils/runtime_info_test.go b/pkg/webhook/utils/runtime_info_test.go
+index 39df0e6..5518087 100644
+--- a/pkg/webhook/utils/runtime_info_test.go
++++ b/pkg/webhook/utils/runtime_info_test.go
+@@ -3,6 +3,7 @@ package utils
+ import (
+ 	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/webhook/cache"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -27,6 +28,13 @@ var _ = Describe("RuntimeInfo Utilities", func() {
+ 
+ 	BeforeEach(func() {
+ 		scheme = setupScheme()
++		// These specs exercise the historical cache-disabled behavior, so make sure the
++		// global cache is turned off even if another spec enabled it.
++		cache.DisableRuntimeInfoCacheForTest()
++	})
++
++	AfterEach(func() {
++		cache.DisableRuntimeInfoCacheForTest()
+ 	})
+ 
+ 	Describe("CollectRuntimeInfosFromPVCs", func() {
+@@ -52,6 +60,7 @@ var _ = Describe("RuntimeInfo Utilities", func() {
+ 					"default",
+ 					setupLog,
+ 					false,
++					false,
+ 				)
+ 
+ 				Expect(err).NotTo(HaveOccurred())
+@@ -71,6 +80,7 @@ var _ = Describe("RuntimeInfo Utilities", func() {
+ 					"default",
+ 					setupLog,
+ 					false,
++					false,
+ 				)
+ 
+ 				Expect(err).To(HaveOccurred())
+@@ -112,6 +122,7 @@ var _ = Describe("RuntimeInfo Utilities", func() {
+ 					"default",
+ 					setupLog,
+ 					false,
++					false,
+ 				)
+ 
+ 				Expect(err).To(HaveOccurred())
