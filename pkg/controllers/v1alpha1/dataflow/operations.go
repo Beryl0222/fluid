@@ -18,10 +18,12 @@ package dataflow
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
 	"github.com/fluid-cloudnative/fluid/pkg/common"
+	"github.com/fluid-cloudnative/fluid/pkg/dataflow"
 	"github.com/fluid-cloudnative/fluid/pkg/utils"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +42,7 @@ func reconcileDataLoad(ctx reconcileRequestContext) (needRequeue bool, err error
 		return true, errors.Wrap(err, "failed to get dataload")
 	}
 
-	updateStatusFn := func() error {
+	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
 		tmp, err := utils.GetDataLoad(ctx.Client, ctx.Name, ctx.Namespace)
 		if err != nil {
 			if utils.IgnoreNotFound(err) == nil {
@@ -50,7 +52,7 @@ func reconcileDataLoad(ctx reconcileRequestContext) (needRequeue bool, err error
 		}
 
 		toUpdate := tmp.DeepCopy()
-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
+		mutate(&toUpdate.Status)
 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
 		}
@@ -71,7 +73,7 @@ func reconcileDataBackup(ctx reconcileRequestContext) (needRequeue bool, err err
 		return true, errors.Wrap(err, "failed to get databackup")
 	}
 
-	updateStatusFn := func() error {
+	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
 		tmp, err := utils.GetDataBackup(ctx.Client, ctx.Name, ctx.Namespace)
 		if err != nil {
 			if utils.IgnoreNotFound(err) == nil {
@@ -81,7 +83,7 @@ func reconcileDataBackup(ctx reconcileRequestContext) (needRequeue bool, err err
 		}
 
 		toUpdate := tmp.DeepCopy()
-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
+		mutate(&toUpdate.Status)
 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
 		}
@@ -102,7 +104,7 @@ func reconcileDataMigrate(ctx reconcileRequestContext) (needRequeue bool, err er
 		return true, errors.Wrap(err, "failed to get datamigrate")
 	}
 
-	updateStatusFn := func() error {
+	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
 		tmp, err := utils.GetDataMigrate(ctx.Client, ctx.Name, ctx.Namespace)
 		if err != nil {
 			if utils.IgnoreNotFound(err) == nil {
@@ -112,7 +114,7 @@ func reconcileDataMigrate(ctx reconcileRequestContext) (needRequeue bool, err er
 		}
 
 		toUpdate := tmp.DeepCopy()
-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
+		mutate(&toUpdate.Status)
 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
 		}
@@ -133,7 +135,7 @@ func reconcileDataProcess(ctx reconcileRequestContext) (needRequeue bool, err er
 		return true, errors.Wrap(err, "failed to get dataprocess")
 	}
 
-	updateStatusFn := func() error {
+	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
 		tmp, err := utils.GetDataProcess(ctx.Client, ctx.Name, ctx.Namespace)
 		if err != nil {
 			if utils.IgnoreNotFound(err) == nil {
@@ -143,7 +145,7 @@ func reconcileDataProcess(ctx reconcileRequestContext) (needRequeue bool, err er
 		}
 
 		toUpdate := tmp.DeepCopy()
-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
+		mutate(&toUpdate.Status)
 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
 		}
@@ -158,40 +160,90 @@ func reconcileOperationDataFlow(ctx reconcileRequestContext,
 	object client.Object,
 	runAfter *datav1alpha1.OperationRef,
 	opStatus datav1alpha1.OperationStatus,
-	updateStatusFn func() error) (needRequeue bool, err error) {
+	updateStatusFn func(mutate func(status *datav1alpha1.OperationStatus)) error) (needRequeue bool, err error) {
+
+	// Objects without a RunAfter dependency are not governed by the dataflow waiting logic.
+	if runAfter == nil {
+		return false, nil
+	}
 
 	opRefNamespace := ctx.Namespace
 	if len(runAfter.Namespace) != 0 {
 		opRefNamespace = runAfter.Namespace
 	}
 
-	precedingOpStatus, err := utils.GetPrecedingOperationStatus(ctx.Client, &runAfter.ObjectRef, opRefNamespace)
+	cached := opStatus.WaitingFor.PrecedingOperation
+	decision, observed, err := dataflow.ResolvePrecedingOperation(ctx.Client, &runAfter.ObjectRef, opRefNamespace, cached)
 	if err != nil {
-		if utils.IgnoreNotFound(err) == nil {
-			// preceding operation not found
-			ctx.Recorder.Eventf(object, corev1.EventTypeWarning, common.DataOperationNotFound, "Preceding operation %s \"%s/%s\" not found",
-				runAfter.Kind,
-				opRefNamespace,
-				runAfter.Name)
-			return true, nil
+		// API temporarily unreadable: only retry, no persisted state is touched.
+		return true, errors.Wrapf(err, "failed to get preceding operation status (RunAfter: %v)", runAfter)
+	}
+
+	refKey := fmt.Sprintf("%s \"%s/%s\"", runAfter.Kind, opRefNamespace, runAfter.Name)
+
+	switch decision {
+	case dataflow.DependencyRetry:
+		return true, errors.Errorf("temporarily failed to resolve preceding operation %s, retry later", refKey)
+
+	case dataflow.DependencyWaiting, dataflow.DependencyNotFound:
+		// Persist the pinned identity (if newly observed) so that a later same-name
+		// recreation can be detected, while keeping the operation in the waiting state.
+		if !reflect.DeepEqual(observed, cached) {
+			mutate := func(status *datav1alpha1.OperationStatus) {
+				status.WaitingFor.PrecedingOperation = observed
+			}
+			if updateErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+				return updateStatusFn(mutate)
+			}); updateErr != nil {
+				return true, errors.Wrapf(updateErr, "failed to persist preceding operation identity (RunAfter: %v)", runAfter)
+			}
 		}
-		return true, errors.Wrapf(err, "failed to get preceding operation status (DataLoad.Spec.RunAfter: %v)", runAfter)
-	}
 
-	if precedingOpStatus != nil && precedingOpStatus.Phase != common.PhaseComplete {
-		ctx.Recorder.Eventf(object, corev1.EventTypeNormal, common.DataOperationWaiting, "Waiting for operation %s \"%s/%s\" to complete",
-			runAfter.Kind,
-			opRefNamespace,
-			runAfter.Name)
+		if decision == dataflow.DependencyNotFound {
+			// The dependency outcome is unknown because the referenced object is absent and
+			// no terminal state has ever been confirmed.
+			ctx.Recorder.Eventf(object, corev1.EventTypeWarning, common.DataOperationNotFound, "Preceding operation %s not found", refKey)
+		} else {
+			ctx.Recorder.Eventf(object, corev1.EventTypeNormal, common.DataOperationWaiting, "Waiting for operation %s to complete", refKey)
+		}
 		return true, nil
+
+	case dataflow.DependencyComplete:
+		// Confirm success: unblock the successor and persist the terminal observation
+		// (including the node affinity snapshot). A later deletion of the preceding
+		// operation will not push the successor back to waiting.
+		mutate := func(status *datav1alpha1.OperationStatus) {
+			status.WaitingFor.OperationComplete = ptr.To(false)
+			status.WaitingFor.PrecedingOperation = observed
+		}
+		if updateErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			return updateStatusFn(mutate)
+		}); updateErr != nil {
+			return true, errors.Wrapf(updateErr, "failed to update operation status after preceding operation %s completed", refKey)
+		}
+		return false, nil
+
+	case dataflow.DependencyFailed, dataflow.DependencyIdentityConflict:
+		// Persist the stable terminal failure and wake the operation controller, which
+		// transitions the successor itself to Failed with a diagnosable condition.
+		mutate := func(status *datav1alpha1.OperationStatus) {
+			status.WaitingFor.OperationComplete = ptr.To(false)
+			status.WaitingFor.PrecedingOperation = observed
+		}
+		if updateErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			return updateStatusFn(mutate)
+		}); updateErr != nil {
+			return true, errors.Wrapf(updateErr, "failed to update operation status with preceding operation terminal failure (RunAfter: %v)", runAfter)
+		}
+
+		reason := common.DataOperationDependencyFailed
+		if decision == dataflow.DependencyIdentityConflict {
+			reason = common.DataOperationIdentityConflict
+		}
+		ctx.Recorder.Eventf(object, corev1.EventTypeWarning, reason,
+			"Preceding operation %s terminated with failure: %s", refKey, observed.Message)
+		return false, nil
 	}
 
-	// set opStatus.waitingFor.operationComplete back to false
-	err = retry.RetryOnConflict(retry.DefaultBackoff, updateStatusFn)
-
-	if err != nil {
-		return true, errors.Wrapf(err, "failed to update operation status waitingFor.OperationComplete=false")
-	}
-
-	return false, nil
+	return true, nil
 }

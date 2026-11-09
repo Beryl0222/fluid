@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fluid-cloudnative/fluid/pkg/common"
 )
@@ -308,6 +309,52 @@ type OperationRef struct {
 type WaitingStatus struct {
 	// OperationComplete indicates if the preceding operation is complete
 	OperationComplete *bool `json:"operationComplete,omitempty"`
+
+	// PrecedingOperation caches the identity and the last observed terminal state of the
+	// data operation that the current operation is waiting for. The cache makes the waiting
+	// decision stable when the preceding operation is deleted (e.g. cleaned up by TTL after
+	// it reaches a terminal phase), when a same-named object is recreated with a different
+	// UID, or when the controller restarts and can no longer read the referenced object.
+	// It is only populated for operations that specify a RunAfter dependency.
+	// +optional
+	PrecedingOperation *PrecedingOperationStatus `json:"precedingOperation,omitempty"`
+}
+
+// PrecedingOperationStatus records the identity and the observed terminal state of a
+// preceding data operation referenced by RunAfter (or by affinityStrategy.dependOn).
+type PrecedingOperationStatus struct {
+	// ObjectRef identifies the referenced preceding operation.
+	ObjectRef `json:",inline"`
+
+	// UID pins the identity of the originally observed dependency. A same-named object whose
+	// UID differs from the pinned UID is treated as an identity conflict and must never be
+	// treated as the original dependency.
+	UID types.UID `json:"uid"`
+
+	// ObservedPhase is the terminal phase confirmed on the referenced object. It is either
+	// empty (no terminal state has been confirmed yet), common.PhaseComplete or
+	// common.PhaseFailed. Once a terminal phase is confirmed, the decision is stable and
+	// never regresses even if the referenced object is deleted or flips back to a
+	// non-terminal phase (e.g. a cron operation starting a new run) later.
+	// +optional
+	ObservedPhase common.Phase `json:"observedPhase,omitempty"`
+
+	// Reason is a machine-readable reason of the observed terminal state. For a failed
+	// dependency it is common.DataOperationDependencyFailed; for an identity conflict it is
+	// common.DataOperationIdentityConflict.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message is a human-readable diagnostic message of the observed terminal state. For an
+	// identity conflict it includes both the pinned UID and the observed UID.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// NodeAffinity snapshots the node affinity of the referenced operation at the moment its
+	// terminal state was confirmed, so the required/preferred affinity can still be injected
+	// after the referenced object has been deleted.
+	// +optional
+	NodeAffinity *corev1.NodeAffinity `json:"nodeAffinity,omitempty"`
 }
 
 type ClientMetrics struct {

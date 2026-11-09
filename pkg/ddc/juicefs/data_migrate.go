@@ -122,7 +122,7 @@ func (j *JuiceFSEngine) generateDataMigrateValueFile(r cruntime.ReconcileRequest
 	}
 
 	// inject the node affinity by previous operation pod.
-	dataMigrateInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataMigrate.Spec.RunAfter, dataMigrate.Namespace, dataMigrateInfo.Affinity)
+	dataMigrateInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataMigrate.Spec.RunAfter, dataMigrate.Namespace, dataMigrate.Status.WaitingFor.PrecedingOperation, dataMigrateInfo.Affinity)
 	if err != nil {
 		return "", err
 	}

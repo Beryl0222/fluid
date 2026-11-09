@@ -30,6 +30,7 @@ import (
 	"github.com/fluid-cloudnative/fluid/pkg/utils"
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -113,13 +114,20 @@ func (e *EngineOperationReconciler) reconcilePending(ctx cruntime.ReconcileReque
 	operation dataoperation.OperationInterface) (ctrl.Result, error) {
 	log := ctx.Log.WithName("reconcilePending")
 
-	// 1. check preceding operation status
+	// 1. fail stably when the RunAfter dependency reached a confirmed terminal failure
+	// (including an identity conflict with a same-named recreated object). The dataflow
+	// controller has already persisted the terminal observation and woken this operation up.
+	if result, err, done := e.failOnDependencyTerminalFailure(ctx, opStatus, operation); done {
+		return result, err
+	}
+
+	// 2. check preceding operation status
 	if opStatus.WaitingFor.OperationComplete != nil && *opStatus.WaitingFor.OperationComplete {
 		// when operationComplete set back to false, a new reconciliation loop will be triggered, so no requeue here.
 		return utils.NoRequeue()
 	}
 
-	// 2. set current data operation to dataset
+	// 3. set current data operation to dataset
 	err := SetDataOperationInTargetDataset(ctx, operation, e.Engine)
 	if err != nil {
 		return utils.RequeueAfterInterval(20 * time.Second)
@@ -134,6 +142,54 @@ func (e *EngineOperationReconciler) reconcilePending(ctx cruntime.ReconcileReque
 	log.V(1).Info(fmt.Sprintf("update %s status to Executing successfully", operation.GetOperationType()))
 	// update operation status would trigger requeue, no need to requeue here
 	return utils.NoRequeue()
+}
+
+// failOnDependencyTerminalFailure transitions the operation to a stable Failed phase when the
+// dataflow controller has confirmed a terminal failure of its RunAfter dependency (a Failed
+// preceding operation or an identity conflict with a same-named recreated object). It returns
+// done=true when the terminal failure has been handled so that callers skip the normal
+// pending flow.
+func (e *EngineOperationReconciler) failOnDependencyTerminalFailure(ctx cruntime.ReconcileRequestContext,
+	opStatus *datav1alpha1.OperationStatus,
+	operation dataoperation.OperationInterface) (result ctrl.Result, err error, done bool) {
+
+	dependency := opStatus.WaitingFor.PrecedingOperation
+	if dependency == nil || dependency.ObservedPhase != common.PhaseFailed {
+		return ctrl.Result{}, nil, false
+	}
+
+	log := ctx.Log.WithName("reconcilePending")
+	reason := dependency.Reason
+	if len(reason) == 0 {
+		reason = common.DataOperationDependencyFailed
+	}
+
+	now := metav1.NewTime(time.Now())
+	condition := datav1alpha1.Condition{
+		Type:               common.Failed,
+		Status:             v1.ConditionTrue,
+		Reason:             reason,
+		Message:            dependency.Message,
+		LastProbeTime:      now,
+		LastTransitionTime: now,
+	}
+	opStatus.Conditions = append([]datav1alpha1.Condition{condition}, opStatus.Conditions...)
+	opStatus.Phase = common.PhaseFailed
+	// The dependency decision is terminal, so the successor must leave the waiting state.
+	opStatus.WaitingFor.OperationComplete = ptr.To(false)
+
+	object := operation.GetOperationObject()
+	ctx.Recorder.Eventf(object, v1.EventTypeWarning, common.DataOperationFailed,
+		"RunAfter dependency terminated with failure: %s", dependency.Message)
+
+	if err := operation.UpdateOperationApiStatus(opStatus); err != nil {
+		log.Error(err, "failed to update operation status to Failed due to the RunAfter dependency failure")
+		requeueResult, requeueErr := utils.RequeueIfError(err)
+		return requeueResult, requeueErr, true
+	}
+	log.Info("operation failed because its RunAfter dependency reached a terminal failure", "reason", reason, "message", dependency.Message)
+	noRequeueResult, noRequeueErr := utils.NoRequeue()
+	return noRequeueResult, noRequeueErr, true
 }
 
 func (e *EngineOperationReconciler) reconcileExecuting(ctx cruntime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus,

@@ -4844,12 +4844,58 @@
         }
       }
     },
+    ".PrecedingOperationStatus": {
+      "description": "PrecedingOperationStatus records the identity and the observed terminal state of a preceding data operation referenced by RunAfter (or by affinityStrategy.dependOn).",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "uid"
+      ],
+      "properties": {
+        "apiVersion": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "nodeAffinity": {
+          "description": "NodeAffinity snapshots the node affinity of the referenced operation at the moment its terminal state was confirmed.",
+          "$ref": "#/definitions/v1.NodeAffinity"
+        },
+        "observedPhase": {
+          "description": "ObservedPhase is the terminal phase confirmed on the referenced object.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "uid": {
+          "description": "UID pins the identity of the originally observed dependency.",
+          "type": "string"
+        }
+      }
+    },
     ".WaitingStatus": {
       "type": "object",
       "properties": {
         "operationComplete": {
           "description": "OperationComplete indicates if the preceding operation is complete",
           "type": "boolean"
+        },
+        "precedingOperation": {
+          "description": "PrecedingOperation caches the identity and the last observed terminal state of the data operation that the current operation is waiting for.",
+          "default": {},
+          "$ref": "#/definitions/.PrecedingOperationStatus"
         }
       }
     }

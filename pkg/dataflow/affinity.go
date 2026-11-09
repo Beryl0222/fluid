@@ -18,6 +18,8 @@ package dataflow
 
 import (
 	"fmt"
+	"reflect"
+
 	"github.com/pkg/errors"
 
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
@@ -43,8 +45,16 @@ func InjectAffinityAnnotation(opAnnotation map[string]string, podAnnotation map[
 	return copiedMap
 }
 
-// InjectAffinityByRunAfterOp inject the affinity based on preceding operation
-func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.OperationRef, opNamespace string, currentAffinity *v1.Affinity) (*v1.Affinity, error) {
+// InjectAffinityByRunAfterOp inject the affinity based on preceding operation. The cached
+// observation is the PrecedingOperation status persisted on the successor; it allows the
+// affinity to be resolved with the same identity/terminal-state rules as the waiting gate,
+// including when the referenced operation has already been deleted (e.g. TTL cleanup).
+func InjectAffinityByRunAfterOp(c client.Client,
+	runAfter *datav1alpha1.OperationRef,
+	opNamespace string,
+	cached *datav1alpha1.PrecedingOperationStatus,
+	currentAffinity *v1.Affinity) (*v1.Affinity, error) {
+
 	// no previous operation or use default affinity strategy, no need to generate node affinity
 	if runAfter == nil || runAfter.AffinityStrategy.Policy == datav1alpha1.DefaultAffinityStrategy {
 		return currentAffinity, nil
@@ -61,28 +71,44 @@ func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.Operatio
 		precedingOpNamespace = dependOnOp.Namespace
 	}
 
-	precedingOpStatus, err := utils.GetPrecedingOperationStatus(c, dependOnOp, precedingOpNamespace)
+	// When the affinity depends on the same object as RunAfter, reuse the observation cached
+	// on the successor so the decision survives the referenced object's deletion. A standalone
+	// dependOn reference is resolved live with the same rules but without a cache.
+	var cachedDependOn *datav1alpha1.PrecedingOperationStatus
+	if dependOnOp == &runAfter.ObjectRef || reflect.DeepEqual(*dependOnOp, runAfter.ObjectRef) {
+		cachedDependOn = cached
+	}
+
+	decision, observed, err := ResolvePrecedingOperation(c, dependOnOp, precedingOpNamespace, cachedDependOn)
 	if err != nil {
+		// API temporarily unreadable: the outer caller retries without mutating anything.
 		return currentAffinity, err
 	}
 
-	// ensure the dependent operation was completed, the outer caller will record the event.
-	if precedingOpStatus.Phase != common.PhaseComplete {
-		return nil, errors.New(fmt.Sprintf("dependOn operation %s status is %s, not completed.", dependOnOp.Name, precedingOpStatus.Phase))
-	}
-
-	if precedingOpStatus.NodeAffinity == nil {
-		return currentAffinity, nil
+	switch decision {
+	case DependencyComplete:
+		if observed == nil || observed.NodeAffinity == nil {
+			return currentAffinity, nil
+		}
+	case DependencyFailed, DependencyIdentityConflict:
+		// The dependency terminated with a stable failure (including an identity conflict),
+		// the outer caller will record the event and retry.
+		return currentAffinity, errors.New(fmt.Sprintf("dependOn operation %s is unavailable: %s", dependOnOp.Name, observed.Message))
+	case DependencyWaiting, DependencyNotFound:
+		// ensure the dependent operation was completed, the outer caller will record the event.
+		return nil, errors.New(fmt.Sprintf("dependOn operation %s is not completed.", dependOnOp.Name))
+	case DependencyRetry:
+		return currentAffinity, fmt.Errorf("temporarily failed to resolve dependOn operation %s, retry later", dependOnOp.Name)
 	}
 
 	// require policy
 	if runAfter.AffinityStrategy.Policy == datav1alpha1.RequireAffinityStrategy {
-		return injectRequiredAffinity(runAfter, precedingOpStatus.NodeAffinity, currentAffinity)
+		return injectRequiredAffinity(runAfter, observed.NodeAffinity, currentAffinity)
 	}
 
 	// prefer policy
 	if runAfter.AffinityStrategy.Policy == datav1alpha1.PreferAffinityStrategy {
-		return injectPreferredAffinity(runAfter, precedingOpStatus.NodeAffinity, currentAffinity)
+		return injectPreferredAffinity(runAfter, observed.NodeAffinity, currentAffinity)
 	}
 
 	return currentAffinity, fmt.Errorf("unknown policy for affinity strategy: %s", runAfter.AffinityStrategy.Policy)

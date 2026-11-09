@@ -141,7 +141,7 @@ func (e *AlluxioEngine) generateDataBackupValueFile(ctx cruntime.ReconcileReques
 	dataBackup.Path = path
 
 	// inject the node affinity by previous operation pod.
-	dataBackup.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, databackup.Spec.RunAfter, databackup.Namespace, nil)
+	dataBackup.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, databackup.Spec.RunAfter, databackup.Namespace, databackup.Status.WaitingFor.PrecedingOperation, nil)
 	if err != nil {
 		return "", err
 	}

@@ -65,36 +65,24 @@ func GetOperationStatus(obj client.Object) (*datav1alpha1.OperationStatus, error
 	return nil, fmt.Errorf("obj is not of any data operation type")
 }
 
-func GetPrecedingOperationStatus(client client.Client, opRef *datav1alpha1.ObjectRef, opRefNamespace string) (*datav1alpha1.OperationStatus, error) {
+// GetPrecedingOperationObject returns the full data operation object referenced by opRef so
+// that callers can inspect both its identity (UID) and its status. The namespace in opRef is
+// ignored and opRefNamespace is used instead, allowing callers to default to the successor's
+// namespace for cross-namespace references.
+func GetPrecedingOperationObject(client client.Client, opRef *datav1alpha1.ObjectRef, opRefNamespace string) (client.Object, error) {
 	if opRef == nil {
 		return nil, nil
 	}
 
 	switch opRef.Kind {
 	case string(dataoperation.DataBackupType):
-		object, err := GetDataBackup(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataBackup(client, opRef.Name, opRefNamespace)
 	case string(dataoperation.DataLoadType):
-		object, err := GetDataLoad(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataLoad(client, opRef.Name, opRefNamespace)
 	case string(dataoperation.DataMigrateType):
-		object, err := GetDataMigrate(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataMigrate(client, opRef.Name, opRefNamespace)
 	case string(dataoperation.DataProcessType):
-		object, err := GetDataProcess(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataProcess(client, opRef.Name, opRefNamespace)
 	default:
 		// TODO: Support non-builtin Kind
 		return nil, fmt.Errorf("kind %v is currently not supported for runAfter", opRef.Kind)

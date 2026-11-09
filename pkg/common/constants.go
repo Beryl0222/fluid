@@ -77,6 +77,15 @@ const (
 	DataOperationNotFound = "DataOperationNotFound"
 
 	DataOperationWaiting = "DataOperationWaiting"
+
+	// DataOperationDependencyFailed indicates that the preceding operation referenced by
+	// RunAfter reached a Failed terminal phase, so the waiting operation fails as well.
+	DataOperationDependencyFailed = "DataOperationDependencyFailed"
+
+	// DataOperationIdentityConflict indicates that the referenced preceding operation was
+	// recreated behind the same name with a different UID, so it can no longer be trusted as
+	// the original dependency.
+	DataOperationIdentityConflict = "DataOperationIdentityConflict"
 )
 
 // Events related to DataLoad

@@ -17,6 +17,10 @@ limitations under the License.
 package dataflow
 
 import (
+	"reflect"
+	"strings"
+	"testing"
+
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
 	"github.com/fluid-cloudnative/fluid/pkg/common"
 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
@@ -24,8 +28,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"reflect"
-	"testing"
 )
 
 func TestInjectAffinityByRunAfterOp(t *testing.T) {
@@ -521,7 +523,7 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := fake.NewFakeClientWithScheme(testScheme, tt.args.objects...)
 
-			got, err := InjectAffinityByRunAfterOp(c, tt.args.runAfter, tt.args.opNamespace, tt.args.currentAffinity)
+			got, err := InjectAffinityByRunAfterOp(c, tt.args.runAfter, tt.args.opNamespace, nil, tt.args.currentAffinity)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("InjectAffinityByRunAfterOp() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -531,4 +533,99 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInjectAffinityByRunAfterOpCachedSnapshot covers the identity/terminal-state rules that
+// the affinity injection shares with the waiting gate, in particular resolving the affinity
+// from the persisted cache after the referenced operation has been deleted.
+func TestInjectAffinityByRunAfterOpCachedSnapshot(t *testing.T) {
+	snapshotAffinity := &v1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+			NodeSelectorTerms: []v1.NodeSelectorTerm{
+				{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{
+							Key:      common.K8sNodeNameLabelKey,
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{"node01"},
+						},
+					},
+				},
+			},
+		},
+	}
+	wantAffinity := &v1.Affinity{NodeAffinity: snapshotAffinity}
+
+	runAfter := &datav1alpha1.OperationRef{
+		ObjectRef: datav1alpha1.ObjectRef{
+			Kind: "DataLoad",
+			Name: "test-op",
+		},
+		AffinityStrategy: datav1alpha1.AffinityStrategy{
+			Policy: datav1alpha1.RequireAffinityStrategy,
+		},
+	}
+
+	t.Run("cached complete observation keeps affinity after the preceding object is deleted", func(t *testing.T) {
+		s := runtime.NewScheme()
+		_ = datav1alpha1.AddToScheme(s)
+		// No live object: it has already been cleaned up by TTL.
+		c := fake.NewFakeClientWithScheme(s)
+		cached := &datav1alpha1.PrecedingOperationStatus{
+			ObjectRef:     runAfter.ObjectRef,
+			UID:           "uid-1",
+			ObservedPhase: common.PhaseComplete,
+			NodeAffinity:  snapshotAffinity,
+		}
+
+		got, err := InjectAffinityByRunAfterOp(c, runAfter, "default", cached, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !reflect.DeepEqual(got, wantAffinity) {
+			t.Errorf("got = %v, want %v", got, wantAffinity)
+		}
+	})
+
+	t.Run("cached failed observation returns a stable error instead of injecting affinity", func(t *testing.T) {
+		s := runtime.NewScheme()
+		_ = datav1alpha1.AddToScheme(s)
+		c := fake.NewFakeClientWithScheme(s)
+		cached := &datav1alpha1.PrecedingOperationStatus{
+			ObjectRef:     runAfter.ObjectRef,
+			UID:           "uid-1",
+			ObservedPhase: common.PhaseFailed,
+			Reason:        common.DataOperationDependencyFailed,
+			Message:       "preceding operation reached phase Failed",
+		}
+
+		got, err := InjectAffinityByRunAfterOp(c, runAfter, "default", cached, nil)
+		if err == nil {
+			t.Fatalf("expected an error for a failed dependency, got affinity %v", got)
+		}
+		if got != nil {
+			t.Errorf("expected no affinity to be injected on failure, got %v", got)
+		}
+	})
+
+	t.Run("identity conflict observation returns an error mentioning the conflict", func(t *testing.T) {
+		s := runtime.NewScheme()
+		_ = datav1alpha1.AddToScheme(s)
+		c := fake.NewFakeClientWithScheme(s)
+		cached := &datav1alpha1.PrecedingOperationStatus{
+			ObjectRef:     runAfter.ObjectRef,
+			UID:           "uid-1",
+			ObservedPhase: common.PhaseFailed,
+			Reason:        common.DataOperationIdentityConflict,
+			Message:       "observed UID \"uid-2\" does not match the pinned UID \"uid-1\"",
+		}
+
+		_, err := InjectAffinityByRunAfterOp(c, runAfter, "default", cached, nil)
+		if err == nil {
+			t.Fatalf("expected an error for an identity conflict")
+		}
+		if !strings.Contains(err.Error(), "uid-1") || !strings.Contains(err.Error(), "uid-2") {
+			t.Errorf("conflict error must mention both UIDs, got %q", err.Error())
+		}
+	})
 }

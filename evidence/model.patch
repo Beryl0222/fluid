@@ -1,0 +1,3137 @@
+diff --git a/api/v1alpha1/common.go b/api/v1alpha1/common.go
+index 3f6d5ae..d02d4a5 100644
+--- a/api/v1alpha1/common.go
++++ b/api/v1alpha1/common.go
+@@ -20,6 +20,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
+ 
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
+ )
+@@ -308,6 +309,52 @@ type OperationRef struct {
+ type WaitingStatus struct {
+ 	// OperationComplete indicates if the preceding operation is complete
+ 	OperationComplete *bool `json:"operationComplete,omitempty"`
++
++	// PrecedingOperation caches the identity and the last observed terminal state of the
++	// data operation that the current operation is waiting for. The cache makes the waiting
++	// decision stable when the preceding operation is deleted (e.g. cleaned up by TTL after
++	// it reaches a terminal phase), when a same-named object is recreated with a different
++	// UID, or when the controller restarts and can no longer read the referenced object.
++	// It is only populated for operations that specify a RunAfter dependency.
++	// +optional
++	PrecedingOperation *PrecedingOperationStatus `json:"precedingOperation,omitempty"`
++}
++
++// PrecedingOperationStatus records the identity and the observed terminal state of a
++// preceding data operation referenced by RunAfter (or by affinityStrategy.dependOn).
++type PrecedingOperationStatus struct {
++	// ObjectRef identifies the referenced preceding operation.
++	ObjectRef `json:",inline"`
++
++	// UID pins the identity of the originally observed dependency. A same-named object whose
++	// UID differs from the pinned UID is treated as an identity conflict and must never be
++	// treated as the original dependency.
++	UID types.UID `json:"uid"`
++
++	// ObservedPhase is the terminal phase confirmed on the referenced object. It is either
++	// empty (no terminal state has been confirmed yet), common.PhaseComplete or
++	// common.PhaseFailed. Once a terminal phase is confirmed, the decision is stable and
++	// never regresses even if the referenced object is deleted or flips back to a
++	// non-terminal phase (e.g. a cron operation starting a new run) later.
++	// +optional
++	ObservedPhase common.Phase `json:"observedPhase,omitempty"`
++
++	// Reason is a machine-readable reason of the observed terminal state. For a failed
++	// dependency it is common.DataOperationDependencyFailed; for an identity conflict it is
++	// common.DataOperationIdentityConflict.
++	// +optional
++	Reason string `json:"reason,omitempty"`
++
++	// Message is a human-readable diagnostic message of the observed terminal state. For an
++	// identity conflict it includes both the pinned UID and the observed UID.
++	// +optional
++	Message string `json:"message,omitempty"`
++
++	// NodeAffinity snapshots the node affinity of the referenced operation at the moment its
++	// terminal state was confirmed, so the required/preferred affinity can still be injected
++	// after the referenced object has been deleted.
++	// +optional
++	NodeAffinity *corev1.NodeAffinity `json:"nodeAffinity,omitempty"`
+ }
+ 
+ type ClientMetrics struct {
+diff --git a/api/v1alpha1/openapi_generated.go b/api/v1alpha1/openapi_generated.go
+index ee62078..963d577 100644
+--- a/api/v1alpha1/openapi_generated.go
++++ b/api/v1alpha1/openapi_generated.go
+@@ -114,6 +114,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.OperationRef":                      schema_fluid_cloudnative_fluid_api_v1alpha1_OperationRef(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.OperationStatus":                   schema_fluid_cloudnative_fluid_api_v1alpha1_OperationStatus(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.PodMetadata":                       schema_fluid_cloudnative_fluid_api_v1alpha1_PodMetadata(ref),
++		"github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus":          schema_fluid_cloudnative_fluid_api_v1alpha1_PrecedingOperationStatus(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.Prefer":                            schema_fluid_cloudnative_fluid_api_v1alpha1_Prefer(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.ProcessMemoryMediumSource":         schema_fluid_cloudnative_fluid_api_v1alpha1_ProcessMemoryMediumSource(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.Processor":                         schema_fluid_cloudnative_fluid_api_v1alpha1_Processor(ref),
+@@ -5988,7 +5989,8 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_OperationStatus(ref common.Refe
+ 			},
+ 		},
+ 		Dependencies: []string{
+-			"github.com/fluid-cloudnative/fluid/api/v1alpha1.Condition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.WaitingStatus", "k8s.io/api/core/v1.NodeAffinity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
++			"github.com/fluid-cloudnative/fluid/api/v1alpha1.Condition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.WaitingStatus", "k8s.io/api/core/v1.NodeAffinity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time",
++			"github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus"},
+ 	}
+ }
+ 
+@@ -8734,6 +8736,78 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_VolumeSource(ref common.Referen
+ 	}
+ }
+ 
++func schema_fluid_cloudnative_fluid_api_v1alpha1_PrecedingOperationStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
++	return common.OpenAPIDefinition{
++		Schema: spec.Schema{
++			SchemaProps: spec.SchemaProps{
++				Description: "PrecedingOperationStatus records the identity and the observed terminal state of a preceding data operation referenced by RunAfter (or by affinityStrategy.dependOn).",
++				Type:        []string{"object"},
++				Properties: map[string]spec.Schema{
++					"apiVersion": {
++						SchemaProps: spec.SchemaProps{
++							Type:   []string{"string"},
++							Format: "",
++						},
++					},
++					"kind": {
++						SchemaProps: spec.SchemaProps{
++							Type:   []string{"string"},
++							Format: "",
++						},
++					},
++					"name": {
++						SchemaProps: spec.SchemaProps{
++							Type:   []string{"string"},
++							Format: "",
++						},
++					},
++					"namespace": {
++						SchemaProps: spec.SchemaProps{
++							Type:   []string{"string"},
++							Format: "",
++						},
++					},
++					"uid": {
++						SchemaProps: spec.SchemaProps{
++							Description: "UID pins the identity of the originally observed dependency.",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
++					"observedPhase": {
++						SchemaProps: spec.SchemaProps{
++							Description: "ObservedPhase is the terminal phase confirmed on the referenced object.",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
++					"reason": {
++						SchemaProps: spec.SchemaProps{
++							Type:   []string{"string"},
++							Format: "",
++						},
++					},
++					"message": {
++						SchemaProps: spec.SchemaProps{
++							Type:   []string{"string"},
++							Format: "",
++						},
++					},
++					"nodeAffinity": {
++						SchemaProps: spec.SchemaProps{
++							Description: "NodeAffinity snapshots the node affinity of the referenced operation at the moment its terminal state was confirmed.",
++							Ref:         ref("k8s.io/api/core/v1.NodeAffinity"),
++						},
++					},
++				},
++				Required: []string{"kind", "name", "uid"},
++			},
++		},
++		Dependencies: []string{
++			"k8s.io/api/core/v1.NodeAffinity"},
++	}
++}
++
+ func schema_fluid_cloudnative_fluid_api_v1alpha1_WaitingStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+ 	return common.OpenAPIDefinition{
+ 		Schema: spec.Schema{
+@@ -8747,8 +8821,17 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_WaitingStatus(ref common.Refere
+ 							Format:      "",
+ 						},
+ 					},
++					"precedingOperation": {
++						SchemaProps: spec.SchemaProps{
++							Description: "PrecedingOperation caches the identity and the last observed terminal state of the data operation that the current operation is waiting for.",
++							Default:     map[string]interface{}{},
++							Ref:         ref("github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus"),
++						},
++					},
+ 				},
+ 			},
+ 		},
++		Dependencies: []string{
++			"github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus"},
+ 	}
+ }
+diff --git a/api/v1alpha1/swagger.json b/api/v1alpha1/swagger.json
+index dc4460d..2422391 100644
+--- a/api/v1alpha1/swagger.json
++++ b/api/v1alpha1/swagger.json
+@@ -4844,12 +4844,58 @@
+         }
+       }
+     },
++    ".PrecedingOperationStatus": {
++      "description": "PrecedingOperationStatus records the identity and the observed terminal state of a preceding data operation referenced by RunAfter (or by affinityStrategy.dependOn).",
++      "type": "object",
++      "required": [
++        "kind",
++        "name",
++        "uid"
++      ],
++      "properties": {
++        "apiVersion": {
++          "type": "string"
++        },
++        "kind": {
++          "type": "string"
++        },
++        "message": {
++          "type": "string"
++        },
++        "name": {
++          "type": "string"
++        },
++        "namespace": {
++          "type": "string"
++        },
++        "nodeAffinity": {
++          "description": "NodeAffinity snapshots the node affinity of the referenced operation at the moment its terminal state was confirmed.",
++          "$ref": "#/definitions/v1.NodeAffinity"
++        },
++        "observedPhase": {
++          "description": "ObservedPhase is the terminal phase confirmed on the referenced object.",
++          "type": "string"
++        },
++        "reason": {
++          "type": "string"
++        },
++        "uid": {
++          "description": "UID pins the identity of the originally observed dependency.",
++          "type": "string"
++        }
++      }
++    },
+     ".WaitingStatus": {
+       "type": "object",
+       "properties": {
+         "operationComplete": {
+           "description": "OperationComplete indicates if the preceding operation is complete",
+           "type": "boolean"
++        },
++        "precedingOperation": {
++          "description": "PrecedingOperation caches the identity and the last observed terminal state of the data operation that the current operation is waiting for.",
++          "default": {},
++          "$ref": "#/definitions/.PrecedingOperationStatus"
+         }
+       }
+     }
+diff --git a/api/v1alpha1/zz_generated.deepcopy.go b/api/v1alpha1/zz_generated.deepcopy.go
+index 8bc5597..49c4e87 100644
+--- a/api/v1alpha1/zz_generated.deepcopy.go
++++ b/api/v1alpha1/zz_generated.deepcopy.go
+@@ -3665,6 +3665,27 @@ func (in *VolumeSource) DeepCopy() *VolumeSource {
+ 	return out
+ }
+ 
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *PrecedingOperationStatus) DeepCopyInto(out *PrecedingOperationStatus) {
++	*out = *in
++	out.ObjectRef = in.ObjectRef
++	if in.NodeAffinity != nil {
++		in, out := &in.NodeAffinity, &out.NodeAffinity
++		*out = new(v1.NodeAffinity)
++		(*in).DeepCopyInto(*out)
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new PrecedingOperationStatus.
++func (in *PrecedingOperationStatus) DeepCopy() *PrecedingOperationStatus {
++	if in == nil {
++		return nil
++	}
++	out := new(PrecedingOperationStatus)
++	in.DeepCopyInto(out)
++	return out
++}
++
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *WaitingStatus) DeepCopyInto(out *WaitingStatus) {
+ 	*out = *in
+@@ -3673,6 +3694,11 @@ func (in *WaitingStatus) DeepCopyInto(out *WaitingStatus) {
+ 		*out = new(bool)
+ 		**out = **in
+ 	}
++	if in.PrecedingOperation != nil {
++		in, out := &in.PrecedingOperation, &out.PrecedingOperation
++		*out = new(PrecedingOperationStatus)
++		(*in).DeepCopyInto(*out)
++	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new WaitingStatus.
+diff --git a/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml b/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml
+index b9a8f98..014b761 100644
+--- a/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml
++++ b/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml
+@@ -276,6 +276,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/charts/fluid/fluid/crds/data.fluid.io_dataloads.yaml b/charts/fluid/fluid/crds/data.fluid.io_dataloads.yaml
+index f10e5a0..5e6a623 100644
+--- a/charts/fluid/fluid/crds/data.fluid.io_dataloads.yaml
++++ b/charts/fluid/fluid/crds/data.fluid.io_dataloads.yaml
+@@ -753,6 +753,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/charts/fluid/fluid/crds/data.fluid.io_datamigrates.yaml b/charts/fluid/fluid/crds/data.fluid.io_datamigrates.yaml
+index f27283c..9eb40bf 100644
+--- a/charts/fluid/fluid/crds/data.fluid.io_datamigrates.yaml
++++ b/charts/fluid/fluid/crds/data.fluid.io_datamigrates.yaml
+@@ -835,6 +835,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/charts/fluid/fluid/crds/data.fluid.io_dataprocesses.yaml b/charts/fluid/fluid/crds/data.fluid.io_dataprocesses.yaml
+index e0aa56b..b88a0c8 100644
+--- a/charts/fluid/fluid/crds/data.fluid.io_dataprocesses.yaml
++++ b/charts/fluid/fluid/crds/data.fluid.io_dataprocesses.yaml
+@@ -4514,6 +4514,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/config/crd/bases/data.fluid.io_databackups.yaml b/config/crd/bases/data.fluid.io_databackups.yaml
+index b9a8f98..014b761 100644
+--- a/config/crd/bases/data.fluid.io_databackups.yaml
++++ b/config/crd/bases/data.fluid.io_databackups.yaml
+@@ -276,6 +276,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/config/crd/bases/data.fluid.io_dataloads.yaml b/config/crd/bases/data.fluid.io_dataloads.yaml
+index f10e5a0..5e6a623 100644
+--- a/config/crd/bases/data.fluid.io_dataloads.yaml
++++ b/config/crd/bases/data.fluid.io_dataloads.yaml
+@@ -753,6 +753,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/config/crd/bases/data.fluid.io_datamigrates.yaml b/config/crd/bases/data.fluid.io_datamigrates.yaml
+index f27283c..9eb40bf 100644
+--- a/config/crd/bases/data.fluid.io_datamigrates.yaml
++++ b/config/crd/bases/data.fluid.io_datamigrates.yaml
+@@ -835,6 +835,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/config/crd/bases/data.fluid.io_dataprocesses.yaml b/config/crd/bases/data.fluid.io_dataprocesses.yaml
+index e0aa56b..b88a0c8 100644
+--- a/config/crd/bases/data.fluid.io_dataprocesses.yaml
++++ b/config/crd/bases/data.fluid.io_dataprocesses.yaml
+@@ -4514,6 +4514,123 @@ spec:
+                 properties:
+                   operationComplete:
+                     type: boolean
++                  precedingOperation:
++                    properties:
++                      apiVersion:
++                        type: string
++                      kind:
++                        type: string
++                      message:
++                        type: string
++                      name:
++                        type: string
++                      namespace:
++                        type: string
++                      nodeAffinity:
++                        properties:
++                          preferredDuringSchedulingIgnoredDuringExecution:
++                            items:
++                              properties:
++                                preference:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                weight:
++                                  format: int32
++                                  type: integer
++                              required:
++                              - preference
++                              - weight
++                              type: object
++                            type: array
++                          requiredDuringSchedulingIgnoredDuringExecution:
++                            properties:
++                              nodeSelectorTerms:
++                                items:
++                                  properties:
++                                    matchExpressions:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                    matchFields:
++                                      items:
++                                        properties:
++                                          key:
++                                            type: string
++                                          operator:
++                                            type: string
++                                          values:
++                                            items:
++                                              type: string
++                                            type: array
++                                        required:
++                                        - key
++                                        - operator
++                                        type: object
++                                      type: array
++                                  type: object
++                                  x-kubernetes-map-type: atomic
++                                type: array
++                            required:
++                            - nodeSelectorTerms
++                            type: object
++                            x-kubernetes-map-type: atomic
++                        type: object
++                      observedPhase:
++                        type: string
++                      reason:
++                        type: string
++                      uid:
++                        type: string
++                    required:
++                    - kind
++                    - name
++                    - uid
++                    type: object
+                 type: object
+             required:
+             - conditions
+diff --git a/pkg/common/constants.go b/pkg/common/constants.go
+index 66acaf3..09b03ec 100644
+--- a/pkg/common/constants.go
++++ b/pkg/common/constants.go
+@@ -77,6 +77,15 @@ const (
+ 	DataOperationNotFound = "DataOperationNotFound"
+ 
+ 	DataOperationWaiting = "DataOperationWaiting"
++
++	// DataOperationDependencyFailed indicates that the preceding operation referenced by
++	// RunAfter reached a Failed terminal phase, so the waiting operation fails as well.
++	DataOperationDependencyFailed = "DataOperationDependencyFailed"
++
++	// DataOperationIdentityConflict indicates that the referenced preceding operation was
++	// recreated behind the same name with a different UID, so it can no longer be trusted as
++	// the original dependency.
++	DataOperationIdentityConflict = "DataOperationIdentityConflict"
+ )
+ 
+ // Events related to DataLoad
+diff --git a/pkg/controllers/v1alpha1/dataflow/dependency_reconcile_test.go b/pkg/controllers/v1alpha1/dataflow/dependency_reconcile_test.go
+new file mode 100644
+index 0000000..48337f6
+--- /dev/null
++++ b/pkg/controllers/v1alpha1/dataflow/dependency_reconcile_test.go
+@@ -0,0 +1,367 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package dataflow
++
++import (
++	"context"
++	"errors"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++	logf "sigs.k8s.io/controller-runtime/pkg/log"
++)
++
++const (
++	originalUID types.UID = "uid-original"
++	recreatedID types.UID = "uid-recreated"
++)
++
++func waitingDataLoad(name, namespace string, runAfter *datav1alpha1.OperationRef, waiting datav1alpha1.WaitingStatus) *datav1alpha1.DataLoad {
++	return &datav1alpha1.DataLoad{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
++		Spec:       datav1alpha1.DataLoadSpec{RunAfter: runAfter},
++		Status:     datav1alpha1.OperationStatus{WaitingFor: waiting},
++	}
++}
++
++func runAfterRef(kind, name, namespace string) *datav1alpha1.OperationRef {
++	ref := &datav1alpha1.OperationRef{
++		ObjectRef: datav1alpha1.ObjectRef{Kind: kind, Name: name},
++	}
++	if namespace != "" {
++		ref.ObjectRef.Namespace = namespace
++	}
++	return ref
++}
++
++var _ = Describe("reconcileOperationDataFlow dependency identity and terminal state", func() {
++
++	var (
++		s         *runtime.Scheme
++		namespace = "default"
++	)
++
++	BeforeEach(func() {
++		s = runtime.NewScheme()
++		_ = datav1alpha1.AddToScheme(s)
++	})
++
++	Context("when the preceding operation fails", func() {
++		It("fails the successor stably and persists the diagnostic terminal observation", func() {
++			preceding := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "preceding", Namespace: namespace, UID: originalUID},
++				Status: datav1alpha1.OperationStatus{
++					Phase: common.PhaseFailed,
++					Conditions: []datav1alpha1.Condition{
++						{Type: common.Failed, Message: "load job failed"},
++					},
++				},
++			}
++			waiting := waitingDataLoad("waiting", namespace,
++				runAfterRef("DataLoad", "preceding", ""),
++				datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)})
++
++			recorder := record.NewFakeRecorder(32)
++			ctx := reconcileRequestContext{
++				Context:        context.TODO(),
++				NamespacedName: types.NamespacedName{Name: "waiting", Namespace: namespace},
++				Client:         fake.NewFakeClientWithScheme(s, preceding, waiting),
++				Log:            logf.Log.WithName("test"),
++				Recorder:       recorder,
++			}
++
++			needRequeue, err := reconcileDataLoad(ctx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(needRequeue).To(BeFalse())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(ctx.Client.Get(context.TODO(), types.NamespacedName{Name: "waiting", Namespace: namespace}, updated)).To(Succeed())
++			Expect(updated.Status.WaitingFor.OperationComplete).NotTo(BeNil())
++			Expect(*updated.Status.WaitingFor.OperationComplete).To(BeFalse())
++			Expect(updated.Status.WaitingFor.PrecedingOperation).NotTo(BeNil())
++			Expect(updated.Status.WaitingFor.PrecedingOperation.UID).To(Equal(originalUID))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(Equal(common.PhaseFailed))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.Reason).To(Equal(common.DataOperationDependencyFailed))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.Message).To(ContainSubstring("load job failed"))
++
++			Eventually(recorder.Events).Should(Receive(ContainSubstring(common.DataOperationDependencyFailed)))
++		})
++	})
++
++	Context("when the preceding operation is deleted after a confirmed complete", func() {
++		It("keeps the successor unblocked and does not push it back to waiting", func() {
++			cached := &datav1alpha1.PrecedingOperationStatus{
++				ObjectRef:     datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "preceding", Namespace: namespace},
++				UID:           originalUID,
++				ObservedPhase: common.PhaseComplete,
++				NodeAffinity: &v1.NodeAffinity{
++					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
++						NodeSelectorTerms: []v1.NodeSelectorTerm{
++							{MatchExpressions: []v1.NodeSelectorRequirement{
++								{Key: common.K8sNodeNameLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{"node01"}},
++							}},
++						},
++					},
++				},
++			}
++			// The preceding object is absent (e.g. cleaned up by TTL); the cache survives a restart.
++			waiting := waitingDataLoad("waiting", namespace,
++				runAfterRef("DataLoad", "preceding", ""),
++				datav1alpha1.WaitingStatus{
++					OperationComplete:  ptr.To(false),
++					PrecedingOperation: cached,
++				})
++
++			ctx := makeTestCtx(s, "waiting", namespace, waiting)
++			needRequeue, err := reconcileDataLoad(ctx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(needRequeue).To(BeFalse())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(ctx.Client.Get(context.TODO(), types.NamespacedName{Name: "waiting", Namespace: namespace}, updated)).To(Succeed())
++			Expect(*updated.Status.WaitingFor.OperationComplete).To(BeFalse())
++			Expect(updated.Status.WaitingFor.PrecedingOperation).NotTo(BeNil())
++			Expect(updated.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(Equal(common.PhaseComplete))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.NodeAffinity).NotTo(BeNil())
++		})
++	})
++
++	Context("when a same-named object is recreated with a different UID", func() {
++		It("refuses to treat the recreated object as the dependency and records an identity conflict", func() {
++			cached := &datav1alpha1.PrecedingOperationStatus{
++				ObjectRef:     datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "preceding", Namespace: namespace},
++				UID:           originalUID,
++				ObservedPhase: common.PhaseComplete,
++			}
++			recreated := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "preceding", Namespace: namespace, UID: recreatedID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseComplete},
++			}
++			waiting := waitingDataLoad("waiting", namespace,
++				runAfterRef("DataLoad", "preceding", ""),
++				datav1alpha1.WaitingStatus{
++					OperationComplete:  ptr.To(true),
++					PrecedingOperation: cached,
++				})
++
++			recorder := record.NewFakeRecorder(32)
++			ctx := reconcileRequestContext{
++				Context:        context.TODO(),
++				NamespacedName: types.NamespacedName{Name: "waiting", Namespace: namespace},
++				Client:         fake.NewFakeClientWithScheme(s, recreated, waiting),
++				Log:            logf.Log.WithName("test"),
++				Recorder:       recorder,
++			}
++
++			needRequeue, err := reconcileDataLoad(ctx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(needRequeue).To(BeFalse())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(ctx.Client.Get(context.TODO(), types.NamespacedName{Name: "waiting", Namespace: namespace}, updated)).To(Succeed())
++			Expect(*updated.Status.WaitingFor.OperationComplete).To(BeFalse())
++			Expect(updated.Status.WaitingFor.PrecedingOperation.Reason).To(Equal(common.DataOperationIdentityConflict))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.UID).To(Equal(originalUID))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.Message).To(ContainSubstring(string(originalUID)))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.Message).To(ContainSubstring(string(recreatedID)))
++
++			Eventually(recorder.Events).Should(Receive(ContainSubstring(common.DataOperationIdentityConflict)))
++		})
++	})
++
++	Context("when the dependency is first observed in a non-terminal phase", func() {
++		It("pins the dependency identity while keeping the successor waiting", func() {
++			preceding := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "preceding", Namespace: namespace, UID: originalUID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseExecuting},
++			}
++			waiting := waitingDataLoad("waiting", namespace,
++				runAfterRef("DataLoad", "preceding", ""),
++				datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)})
++
++			ctx := makeTestCtx(s, "waiting", namespace, preceding, waiting)
++			needRequeue, err := reconcileDataLoad(ctx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(needRequeue).To(BeTrue())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(ctx.Client.Get(context.TODO(), types.NamespacedName{Name: "waiting", Namespace: namespace}, updated)).To(Succeed())
++			Expect(updated.Status.WaitingFor.PrecedingOperation).NotTo(BeNil())
++			Expect(updated.Status.WaitingFor.PrecedingOperation.UID).To(Equal(originalUID))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(BeEmpty())
++			Expect(*updated.Status.WaitingFor.OperationComplete).To(BeTrue())
++		})
++	})
++
++	Context("when the API server is temporarily unreadable", func() {
++		It("only retries and does not mutate the persisted observation", func() {
++			waiting := waitingDataLoad("waiting", namespace,
++				runAfterRef("DataLoad", "preceding", ""),
++				datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)})
++
++			fakeBase := fakeclient.NewClientBuilder().WithScheme(s).WithRuntimeObjects(waiting).
++				WithStatusSubresource(waiting).Build()
++			apiErr := errors.New("api server unavailable")
++			c := interceptor.NewClient(fakeBase, interceptor.Funcs{
++				Get: func(ctx context.Context, cc client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
++					if key.Name == "preceding" {
++						return apiErr
++					}
++					return cc.Get(ctx, key, obj, opts...)
++				},
++			})
++
++			rctx := reconcileRequestContext{
++				Context:        context.TODO(),
++				NamespacedName: types.NamespacedName{Name: "waiting", Namespace: namespace},
++				Client:         c,
++				Log:            logf.Log.WithName("test"),
++				Recorder:       record.NewFakeRecorder(32),
++			}
++
++			needRequeue, err := reconcileDataLoad(rctx)
++			Expect(err).To(HaveOccurred())
++			Expect(needRequeue).To(BeTrue())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(rctx.Client.Get(context.TODO(), types.NamespacedName{Name: "waiting", Namespace: namespace}, updated)).To(Succeed())
++			Expect(updated.Status.WaitingFor.PrecedingOperation).To(BeNil())
++			Expect(*updated.Status.WaitingFor.OperationComplete).To(BeTrue())
++		})
++	})
++
++	Context("when the operation does not use RunAfter", func() {
++		It("leaves the object untouched and does not requeue", func() {
++			noDependency := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "standalone", Namespace: namespace},
++				Status: datav1alpha1.OperationStatus{
++					WaitingFor: datav1alpha1.WaitingStatus{},
++				},
++			}
++			ctx := makeTestCtx(s, "standalone", namespace, noDependency)
++			needRequeue, err := reconcileDataLoad(ctx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(needRequeue).To(BeFalse())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(ctx.Client.Get(context.TODO(), types.NamespacedName{Name: "standalone", Namespace: namespace}, updated)).To(Succeed())
++			Expect(updated.Status.WaitingFor.PrecedingOperation).To(BeNil())
++			Expect(updated.Status.WaitingFor.OperationComplete).To(BeNil())
++		})
++	})
++
++	Context("when the dependency lives in another namespace", func() {
++		It("resolves the cross-namespace reference and unblocks the successor on complete", func() {
++			preceding := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "preceding", Namespace: "other-ns", UID: originalUID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseComplete},
++			}
++			waiting := waitingDataLoad("waiting", namespace,
++				runAfterRef("DataLoad", "preceding", "other-ns"),
++				datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)})
++
++			ctx := makeTestCtx(s, "waiting", namespace, preceding, waiting)
++			needRequeue, err := reconcileDataLoad(ctx)
++			Expect(err).NotTo(HaveOccurred())
++			Expect(needRequeue).To(BeFalse())
++
++			updated := &datav1alpha1.DataLoad{}
++			Expect(ctx.Client.Get(context.TODO(), types.NamespacedName{Name: "waiting", Namespace: namespace}, updated)).To(Succeed())
++			Expect(*updated.Status.WaitingFor.OperationComplete).To(BeFalse())
++			Expect(updated.Status.WaitingFor.PrecedingOperation.Namespace).To(Equal("other-ns"))
++			Expect(updated.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(Equal(common.PhaseComplete))
++		})
++	})
++
++	Context("across all four data operation kinds", func() {
++		It("fails DataBackup, DataMigrate and DataProcess with the same stable rules", func() {
++			failedLoad := &datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "load-1", Namespace: namespace, UID: originalUID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseFailed},
++			}
++
++			waitingBackup := &datav1alpha1.DataBackup{
++				ObjectMeta: metav1.ObjectMeta{Name: "backup-1", Namespace: namespace},
++				Spec: datav1alpha1.DataBackupSpec{
++					RunAfter: runAfterRef("DataLoad", "load-1", ""),
++				},
++				Status: datav1alpha1.OperationStatus{WaitingFor: datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)}},
++			}
++			waitingMigrate := &datav1alpha1.DataMigrate{
++				ObjectMeta: metav1.ObjectMeta{Name: "migrate-1", Namespace: namespace},
++				Spec: datav1alpha1.DataMigrateSpec{
++					RunAfter: runAfterRef("DataLoad", "load-1", ""),
++				},
++				Status: datav1alpha1.OperationStatus{WaitingFor: datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)}},
++			}
++			waitingProcess := &datav1alpha1.DataProcess{
++				ObjectMeta: metav1.ObjectMeta{Name: "process-1", Namespace: namespace},
++				Spec: datav1alpha1.DataProcessSpec{
++					RunAfter: runAfterRef("DataLoad", "load-1", ""),
++				},
++				Status: datav1alpha1.OperationStatus{WaitingFor: datav1alpha1.WaitingStatus{OperationComplete: ptr.To(true)}},
++			}
++
++			sharedClient := fake.NewFakeClientWithScheme(s, failedLoad, waitingBackup, waitingMigrate, waitingProcess)
++			newCtx := func(name string) reconcileRequestContext {
++				return reconcileRequestContext{
++					Context:        context.TODO(),
++					NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
++					Client:         sharedClient,
++					Log:            logf.Log.WithName("test"),
++					Recorder:       record.NewFakeRecorder(32),
++				}
++			}
++
++			requeueBackup, err := reconcileDataBackup(newCtx("backup-1"))
++			Expect(err).NotTo(HaveOccurred())
++			Expect(requeueBackup).To(BeFalse())
++			requeueMigrate, err := reconcileDataMigrate(newCtx("migrate-1"))
++			Expect(err).NotTo(HaveOccurred())
++			Expect(requeueMigrate).To(BeFalse())
++			requeueProcess, err := reconcileDataProcess(newCtx("process-1"))
++			Expect(err).NotTo(HaveOccurred())
++			Expect(requeueProcess).To(BeFalse())
++
++			backup := &datav1alpha1.DataBackup{}
++			Expect(sharedClient.Get(context.TODO(), types.NamespacedName{Name: "backup-1", Namespace: namespace}, backup)).To(Succeed())
++			Expect(backup.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(Equal(common.PhaseFailed))
++			Expect(*backup.Status.WaitingFor.OperationComplete).To(BeFalse())
++
++			migrate := &datav1alpha1.DataMigrate{}
++			Expect(sharedClient.Get(context.TODO(), types.NamespacedName{Name: "migrate-1", Namespace: namespace}, migrate)).To(Succeed())
++			Expect(migrate.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(Equal(common.PhaseFailed))
++
++			process := &datav1alpha1.DataProcess{}
++			Expect(sharedClient.Get(context.TODO(), types.NamespacedName{Name: "process-1", Namespace: namespace}, process)).To(Succeed())
++			Expect(process.Status.WaitingFor.PrecedingOperation.ObservedPhase).To(Equal(common.PhaseFailed))
++		})
++	})
++})
+diff --git a/pkg/controllers/v1alpha1/dataflow/operations.go b/pkg/controllers/v1alpha1/dataflow/operations.go
+index 47eadbc..98d7f9f 100644
+--- a/pkg/controllers/v1alpha1/dataflow/operations.go
++++ b/pkg/controllers/v1alpha1/dataflow/operations.go
+@@ -18,10 +18,12 @@ package dataflow
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"reflect"
+ 
+ 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/dataflow"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
+ 	"github.com/pkg/errors"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -40,7 +42,7 @@ func reconcileDataLoad(ctx reconcileRequestContext) (needRequeue bool, err error
+ 		return true, errors.Wrap(err, "failed to get dataload")
+ 	}
+ 
+-	updateStatusFn := func() error {
++	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
+ 		tmp, err := utils.GetDataLoad(ctx.Client, ctx.Name, ctx.Namespace)
+ 		if err != nil {
+ 			if utils.IgnoreNotFound(err) == nil {
+@@ -50,7 +52,7 @@ func reconcileDataLoad(ctx reconcileRequestContext) (needRequeue bool, err error
+ 		}
+ 
+ 		toUpdate := tmp.DeepCopy()
+-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
++		mutate(&toUpdate.Status)
+ 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
+ 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
+ 		}
+@@ -71,7 +73,7 @@ func reconcileDataBackup(ctx reconcileRequestContext) (needRequeue bool, err err
+ 		return true, errors.Wrap(err, "failed to get databackup")
+ 	}
+ 
+-	updateStatusFn := func() error {
++	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
+ 		tmp, err := utils.GetDataBackup(ctx.Client, ctx.Name, ctx.Namespace)
+ 		if err != nil {
+ 			if utils.IgnoreNotFound(err) == nil {
+@@ -81,7 +83,7 @@ func reconcileDataBackup(ctx reconcileRequestContext) (needRequeue bool, err err
+ 		}
+ 
+ 		toUpdate := tmp.DeepCopy()
+-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
++		mutate(&toUpdate.Status)
+ 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
+ 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
+ 		}
+@@ -102,7 +104,7 @@ func reconcileDataMigrate(ctx reconcileRequestContext) (needRequeue bool, err er
+ 		return true, errors.Wrap(err, "failed to get datamigrate")
+ 	}
+ 
+-	updateStatusFn := func() error {
++	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
+ 		tmp, err := utils.GetDataMigrate(ctx.Client, ctx.Name, ctx.Namespace)
+ 		if err != nil {
+ 			if utils.IgnoreNotFound(err) == nil {
+@@ -112,7 +114,7 @@ func reconcileDataMigrate(ctx reconcileRequestContext) (needRequeue bool, err er
+ 		}
+ 
+ 		toUpdate := tmp.DeepCopy()
+-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
++		mutate(&toUpdate.Status)
+ 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
+ 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
+ 		}
+@@ -133,7 +135,7 @@ func reconcileDataProcess(ctx reconcileRequestContext) (needRequeue bool, err er
+ 		return true, errors.Wrap(err, "failed to get dataprocess")
+ 	}
+ 
+-	updateStatusFn := func() error {
++	updateStatusFn := func(mutate func(status *datav1alpha1.OperationStatus)) error {
+ 		tmp, err := utils.GetDataProcess(ctx.Client, ctx.Name, ctx.Namespace)
+ 		if err != nil {
+ 			if utils.IgnoreNotFound(err) == nil {
+@@ -143,7 +145,7 @@ func reconcileDataProcess(ctx reconcileRequestContext) (needRequeue bool, err er
+ 		}
+ 
+ 		toUpdate := tmp.DeepCopy()
+-		toUpdate.Status.WaitingFor.OperationComplete = ptr.To(false)
++		mutate(&toUpdate.Status)
+ 		if !reflect.DeepEqual(toUpdate.Status, tmp.Status) {
+ 			return ctx.Client.Status().Update(context.TODO(), toUpdate)
+ 		}
+@@ -158,40 +160,90 @@ func reconcileOperationDataFlow(ctx reconcileRequestContext,
+ 	object client.Object,
+ 	runAfter *datav1alpha1.OperationRef,
+ 	opStatus datav1alpha1.OperationStatus,
+-	updateStatusFn func() error) (needRequeue bool, err error) {
++	updateStatusFn func(mutate func(status *datav1alpha1.OperationStatus)) error) (needRequeue bool, err error) {
++
++	// Objects without a RunAfter dependency are not governed by the dataflow waiting logic.
++	if runAfter == nil {
++		return false, nil
++	}
+ 
+ 	opRefNamespace := ctx.Namespace
+ 	if len(runAfter.Namespace) != 0 {
+ 		opRefNamespace = runAfter.Namespace
+ 	}
+ 
+-	precedingOpStatus, err := utils.GetPrecedingOperationStatus(ctx.Client, &runAfter.ObjectRef, opRefNamespace)
++	cached := opStatus.WaitingFor.PrecedingOperation
++	decision, observed, err := dataflow.ResolvePrecedingOperation(ctx.Client, &runAfter.ObjectRef, opRefNamespace, cached)
+ 	if err != nil {
+-		if utils.IgnoreNotFound(err) == nil {
+-			// preceding operation not found
+-			ctx.Recorder.Eventf(object, corev1.EventTypeWarning, common.DataOperationNotFound, "Preceding operation %s \"%s/%s\" not found",
+-				runAfter.Kind,
+-				opRefNamespace,
+-				runAfter.Name)
+-			return true, nil
+-		}
+-		return true, errors.Wrapf(err, "failed to get preceding operation status (DataLoad.Spec.RunAfter: %v)", runAfter)
++		// API temporarily unreadable: only retry, no persisted state is touched.
++		return true, errors.Wrapf(err, "failed to get preceding operation status (RunAfter: %v)", runAfter)
+ 	}
+ 
+-	if precedingOpStatus != nil && precedingOpStatus.Phase != common.PhaseComplete {
+-		ctx.Recorder.Eventf(object, corev1.EventTypeNormal, common.DataOperationWaiting, "Waiting for operation %s \"%s/%s\" to complete",
+-			runAfter.Kind,
+-			opRefNamespace,
+-			runAfter.Name)
++	refKey := fmt.Sprintf("%s \"%s/%s\"", runAfter.Kind, opRefNamespace, runAfter.Name)
++
++	switch decision {
++	case dataflow.DependencyRetry:
++		return true, errors.Errorf("temporarily failed to resolve preceding operation %s, retry later", refKey)
++
++	case dataflow.DependencyWaiting, dataflow.DependencyNotFound:
++		// Persist the pinned identity (if newly observed) so that a later same-name
++		// recreation can be detected, while keeping the operation in the waiting state.
++		if !reflect.DeepEqual(observed, cached) {
++			mutate := func(status *datav1alpha1.OperationStatus) {
++				status.WaitingFor.PrecedingOperation = observed
++			}
++			if updateErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++				return updateStatusFn(mutate)
++			}); updateErr != nil {
++				return true, errors.Wrapf(updateErr, "failed to persist preceding operation identity (RunAfter: %v)", runAfter)
++			}
++		}
++
++		if decision == dataflow.DependencyNotFound {
++			// The dependency outcome is unknown because the referenced object is absent and
++			// no terminal state has ever been confirmed.
++			ctx.Recorder.Eventf(object, corev1.EventTypeWarning, common.DataOperationNotFound, "Preceding operation %s not found", refKey)
++		} else {
++			ctx.Recorder.Eventf(object, corev1.EventTypeNormal, common.DataOperationWaiting, "Waiting for operation %s to complete", refKey)
++		}
+ 		return true, nil
+-	}
+ 
+-	// set opStatus.waitingFor.operationComplete back to false
+-	err = retry.RetryOnConflict(retry.DefaultBackoff, updateStatusFn)
++	case dataflow.DependencyComplete:
++		// Confirm success: unblock the successor and persist the terminal observation
++		// (including the node affinity snapshot). A later deletion of the preceding
++		// operation will not push the successor back to waiting.
++		mutate := func(status *datav1alpha1.OperationStatus) {
++			status.WaitingFor.OperationComplete = ptr.To(false)
++			status.WaitingFor.PrecedingOperation = observed
++		}
++		if updateErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++			return updateStatusFn(mutate)
++		}); updateErr != nil {
++			return true, errors.Wrapf(updateErr, "failed to update operation status after preceding operation %s completed", refKey)
++		}
++		return false, nil
++
++	case dataflow.DependencyFailed, dataflow.DependencyIdentityConflict:
++		// Persist the stable terminal failure and wake the operation controller, which
++		// transitions the successor itself to Failed with a diagnosable condition.
++		mutate := func(status *datav1alpha1.OperationStatus) {
++			status.WaitingFor.OperationComplete = ptr.To(false)
++			status.WaitingFor.PrecedingOperation = observed
++		}
++		if updateErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++			return updateStatusFn(mutate)
++		}); updateErr != nil {
++			return true, errors.Wrapf(updateErr, "failed to update operation status with preceding operation terminal failure (RunAfter: %v)", runAfter)
++		}
+ 
+-	if err != nil {
+-		return true, errors.Wrapf(err, "failed to update operation status waitingFor.OperationComplete=false")
++		reason := common.DataOperationDependencyFailed
++		if decision == dataflow.DependencyIdentityConflict {
++			reason = common.DataOperationIdentityConflict
++		}
++		ctx.Recorder.Eventf(object, corev1.EventTypeWarning, reason,
++			"Preceding operation %s terminated with failure: %s", refKey, observed.Message)
++		return false, nil
+ 	}
+ 
+-	return false, nil
++	return true, nil
+ }
+diff --git a/pkg/dataflow/affinity.go b/pkg/dataflow/affinity.go
+index 5c3de01..4dc526a 100644
+--- a/pkg/dataflow/affinity.go
++++ b/pkg/dataflow/affinity.go
+@@ -18,6 +18,8 @@ package dataflow
+ 
+ import (
+ 	"fmt"
++	"reflect"
++
+ 	"github.com/pkg/errors"
+ 
+ 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+@@ -43,8 +45,16 @@ func InjectAffinityAnnotation(opAnnotation map[string]string, podAnnotation map[
+ 	return copiedMap
+ }
+ 
+-// InjectAffinityByRunAfterOp inject the affinity based on preceding operation
+-func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.OperationRef, opNamespace string, currentAffinity *v1.Affinity) (*v1.Affinity, error) {
++// InjectAffinityByRunAfterOp inject the affinity based on preceding operation. The cached
++// observation is the PrecedingOperation status persisted on the successor; it allows the
++// affinity to be resolved with the same identity/terminal-state rules as the waiting gate,
++// including when the referenced operation has already been deleted (e.g. TTL cleanup).
++func InjectAffinityByRunAfterOp(c client.Client,
++	runAfter *datav1alpha1.OperationRef,
++	opNamespace string,
++	cached *datav1alpha1.PrecedingOperationStatus,
++	currentAffinity *v1.Affinity) (*v1.Affinity, error) {
++
+ 	// no previous operation or use default affinity strategy, no need to generate node affinity
+ 	if runAfter == nil || runAfter.AffinityStrategy.Policy == datav1alpha1.DefaultAffinityStrategy {
+ 		return currentAffinity, nil
+@@ -61,28 +71,44 @@ func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.Operatio
+ 		precedingOpNamespace = dependOnOp.Namespace
+ 	}
+ 
+-	precedingOpStatus, err := utils.GetPrecedingOperationStatus(c, dependOnOp, precedingOpNamespace)
+-	if err != nil {
+-		return currentAffinity, err
++	// When the affinity depends on the same object as RunAfter, reuse the observation cached
++	// on the successor so the decision survives the referenced object's deletion. A standalone
++	// dependOn reference is resolved live with the same rules but without a cache.
++	var cachedDependOn *datav1alpha1.PrecedingOperationStatus
++	if dependOnOp == &runAfter.ObjectRef || reflect.DeepEqual(*dependOnOp, runAfter.ObjectRef) {
++		cachedDependOn = cached
+ 	}
+ 
+-	// ensure the dependent operation was completed, the outer caller will record the event.
+-	if precedingOpStatus.Phase != common.PhaseComplete {
+-		return nil, errors.New(fmt.Sprintf("dependOn operation %s status is %s, not completed.", dependOnOp.Name, precedingOpStatus.Phase))
++	decision, observed, err := ResolvePrecedingOperation(c, dependOnOp, precedingOpNamespace, cachedDependOn)
++	if err != nil {
++		// API temporarily unreadable: the outer caller retries without mutating anything.
++		return currentAffinity, err
+ 	}
+ 
+-	if precedingOpStatus.NodeAffinity == nil {
+-		return currentAffinity, nil
++	switch decision {
++	case DependencyComplete:
++		if observed == nil || observed.NodeAffinity == nil {
++			return currentAffinity, nil
++		}
++	case DependencyFailed, DependencyIdentityConflict:
++		// The dependency terminated with a stable failure (including an identity conflict),
++		// the outer caller will record the event and retry.
++		return currentAffinity, errors.New(fmt.Sprintf("dependOn operation %s is unavailable: %s", dependOnOp.Name, observed.Message))
++	case DependencyWaiting, DependencyNotFound:
++		// ensure the dependent operation was completed, the outer caller will record the event.
++		return nil, errors.New(fmt.Sprintf("dependOn operation %s is not completed.", dependOnOp.Name))
++	case DependencyRetry:
++		return currentAffinity, fmt.Errorf("temporarily failed to resolve dependOn operation %s, retry later", dependOnOp.Name)
+ 	}
+ 
+ 	// require policy
+ 	if runAfter.AffinityStrategy.Policy == datav1alpha1.RequireAffinityStrategy {
+-		return injectRequiredAffinity(runAfter, precedingOpStatus.NodeAffinity, currentAffinity)
++		return injectRequiredAffinity(runAfter, observed.NodeAffinity, currentAffinity)
+ 	}
+ 
+ 	// prefer policy
+ 	if runAfter.AffinityStrategy.Policy == datav1alpha1.PreferAffinityStrategy {
+-		return injectPreferredAffinity(runAfter, precedingOpStatus.NodeAffinity, currentAffinity)
++		return injectPreferredAffinity(runAfter, observed.NodeAffinity, currentAffinity)
+ 	}
+ 
+ 	return currentAffinity, fmt.Errorf("unknown policy for affinity strategy: %s", runAfter.AffinityStrategy.Policy)
+diff --git a/pkg/dataflow/affinity_test.go b/pkg/dataflow/affinity_test.go
+index 6ee7cc0..0dfa210 100644
+--- a/pkg/dataflow/affinity_test.go
++++ b/pkg/dataflow/affinity_test.go
+@@ -17,6 +17,10 @@ limitations under the License.
+ package dataflow
+ 
+ import (
++	"reflect"
++	"strings"
++	"testing"
++
+ 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
+@@ -24,8 +28,6 @@ import (
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+-	"reflect"
+-	"testing"
+ )
+ 
+ func TestInjectAffinityByRunAfterOp(t *testing.T) {
+@@ -521,7 +523,7 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			c := fake.NewFakeClientWithScheme(testScheme, tt.args.objects...)
+ 
+-			got, err := InjectAffinityByRunAfterOp(c, tt.args.runAfter, tt.args.opNamespace, tt.args.currentAffinity)
++			got, err := InjectAffinityByRunAfterOp(c, tt.args.runAfter, tt.args.opNamespace, nil, tt.args.currentAffinity)
+ 			if (err != nil) != tt.wantErr {
+ 				t.Errorf("InjectAffinityByRunAfterOp() error = %v, wantErr %v", err, tt.wantErr)
+ 				return
+@@ -532,3 +534,98 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestInjectAffinityByRunAfterOpCachedSnapshot covers the identity/terminal-state rules that
++// the affinity injection shares with the waiting gate, in particular resolving the affinity
++// from the persisted cache after the referenced operation has been deleted.
++func TestInjectAffinityByRunAfterOpCachedSnapshot(t *testing.T) {
++	snapshotAffinity := &v1.NodeAffinity{
++		RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
++			NodeSelectorTerms: []v1.NodeSelectorTerm{
++				{
++					MatchExpressions: []v1.NodeSelectorRequirement{
++						{
++							Key:      common.K8sNodeNameLabelKey,
++							Operator: v1.NodeSelectorOpIn,
++							Values:   []string{"node01"},
++						},
++					},
++				},
++			},
++		},
++	}
++	wantAffinity := &v1.Affinity{NodeAffinity: snapshotAffinity}
++
++	runAfter := &datav1alpha1.OperationRef{
++		ObjectRef: datav1alpha1.ObjectRef{
++			Kind: "DataLoad",
++			Name: "test-op",
++		},
++		AffinityStrategy: datav1alpha1.AffinityStrategy{
++			Policy: datav1alpha1.RequireAffinityStrategy,
++		},
++	}
++
++	t.Run("cached complete observation keeps affinity after the preceding object is deleted", func(t *testing.T) {
++		s := runtime.NewScheme()
++		_ = datav1alpha1.AddToScheme(s)
++		// No live object: it has already been cleaned up by TTL.
++		c := fake.NewFakeClientWithScheme(s)
++		cached := &datav1alpha1.PrecedingOperationStatus{
++			ObjectRef:     runAfter.ObjectRef,
++			UID:           "uid-1",
++			ObservedPhase: common.PhaseComplete,
++			NodeAffinity:  snapshotAffinity,
++		}
++
++		got, err := InjectAffinityByRunAfterOp(c, runAfter, "default", cached, nil)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++		if !reflect.DeepEqual(got, wantAffinity) {
++			t.Errorf("got = %v, want %v", got, wantAffinity)
++		}
++	})
++
++	t.Run("cached failed observation returns a stable error instead of injecting affinity", func(t *testing.T) {
++		s := runtime.NewScheme()
++		_ = datav1alpha1.AddToScheme(s)
++		c := fake.NewFakeClientWithScheme(s)
++		cached := &datav1alpha1.PrecedingOperationStatus{
++			ObjectRef:     runAfter.ObjectRef,
++			UID:           "uid-1",
++			ObservedPhase: common.PhaseFailed,
++			Reason:        common.DataOperationDependencyFailed,
++			Message:       "preceding operation reached phase Failed",
++		}
++
++		got, err := InjectAffinityByRunAfterOp(c, runAfter, "default", cached, nil)
++		if err == nil {
++			t.Fatalf("expected an error for a failed dependency, got affinity %v", got)
++		}
++		if got != nil {
++			t.Errorf("expected no affinity to be injected on failure, got %v", got)
++		}
++	})
++
++	t.Run("identity conflict observation returns an error mentioning the conflict", func(t *testing.T) {
++		s := runtime.NewScheme()
++		_ = datav1alpha1.AddToScheme(s)
++		c := fake.NewFakeClientWithScheme(s)
++		cached := &datav1alpha1.PrecedingOperationStatus{
++			ObjectRef:     runAfter.ObjectRef,
++			UID:           "uid-1",
++			ObservedPhase: common.PhaseFailed,
++			Reason:        common.DataOperationIdentityConflict,
++			Message:       "observed UID \"uid-2\" does not match the pinned UID \"uid-1\"",
++		}
++
++		_, err := InjectAffinityByRunAfterOp(c, runAfter, "default", cached, nil)
++		if err == nil {
++			t.Fatalf("expected an error for an identity conflict")
++		}
++		if !strings.Contains(err.Error(), "uid-1") || !strings.Contains(err.Error(), "uid-2") {
++			t.Errorf("conflict error must mention both UIDs, got %q", err.Error())
++		}
++	})
++}
+diff --git a/pkg/dataflow/dependency.go b/pkg/dataflow/dependency.go
+new file mode 100644
+index 0000000..c42460d
+--- /dev/null
++++ b/pkg/dataflow/dependency.go
+@@ -0,0 +1,215 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package dataflow
++
++import (
++	"fmt"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/utils"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++// DependencyDecision is the verdict of evaluating a referenced preceding data operation
++// against the live API object and the observation cached on the successor.
++type DependencyDecision int
++
++const (
++	// DependencyWaiting means the referenced operation exists but has not reached a
++	// confirmed terminal phase. The successor must keep waiting and retry later.
++	DependencyWaiting DependencyDecision = iota
++	// DependencyNotFound means the referenced operation is absent and no terminal state has
++	// been confirmed yet, so the outcome is unknown. The successor must keep waiting and
++	// retry later (the dependency may still be created or may already have been cleaned up).
++	DependencyNotFound
++	// DependencyComplete means the referenced operation's Complete terminal state has been
++	// confirmed, either from the live object or from the persisted cache. The successor may
++	// proceed and the cached node affinity snapshot must be used for affinity injection.
++	DependencyComplete
++	// DependencyFailed means the referenced operation's Failed terminal state has been
++	// confirmed. The successor must fail with a stable, diagnosable result.
++	DependencyFailed
++	// DependencyIdentityConflict means a same-named object with a different UID was found for
++	// a reference whose original UID was already pinned. The recreated object must never
++	// impersonate the original dependency, so the successor fails with a stable, diagnosable
++	// conflict result.
++	DependencyIdentityConflict
++	// DependencyRetry means the API server was temporarily unreadable. Callers must only
++	// retry and must not mutate any persisted observation.
++	DependencyRetry
++)
++
++// ResolvePrecedingOperation evaluates the referenced preceding data operation against the
++// live API object and the observation cached on the successor. It returns the decision and
++// the observation that the caller should persist (nil when there is nothing to persist).
++//
++// The same rules apply to all four data operation kinds, cross-namespace references and the
++// affinityStrategy.dependOn reference:
++//   - A confirmed terminal state cached on the successor is authoritative and never
++//     regresses, so deleting the referenced object after completion (e.g. TTL cleanup) does
++//     not push the successor back to waiting.
++//   - The first observed UID pins the dependency identity. A same-named object with a
++//     different UID is an identity conflict rather than the original dependency.
++//   - A non-NotFound API error means the state is currently unknown: the decision is
++//     DependencyRetry and the caller must keep every persisted state untouched.
++func ResolvePrecedingOperation(c client.Client,
++	ref *datav1alpha1.ObjectRef,
++	defaultNamespace string,
++	cached *datav1alpha1.PrecedingOperationStatus) (decision DependencyDecision,
++	observed *datav1alpha1.PrecedingOperationStatus,
++	err error) {
++
++	if ref == nil {
++		return DependencyComplete, nil, nil
++	}
++
++	namespace := defaultNamespace
++	if len(ref.Namespace) != 0 {
++		namespace = ref.Namespace
++	}
++
++	liveObject, getErr := utils.GetPrecedingOperationObject(c, ref, namespace)
++
++	// A confirmed terminal state is authoritative and must never regress. It allows the
++	// successor to make stable decisions even when the referenced object is unreadable.
++	if cached != nil && cached.ObservedPhase != "" {
++		if getErr != nil {
++			if utils.IgnoreNotFound(getErr) == nil {
++				// The referenced object is gone (e.g. TTL cleanup after a terminal phase).
++				// The confirmed terminal state stays valid, so deletion never pushes the
++				// successor back to waiting.
++				return terminalDecision(cached), cached, nil
++			}
++			// API temporarily unreadable: only retry, keep every persisted state untouched.
++			return DependencyRetry, nil, getErr
++		}
++
++		if cached.UID == liveObject.GetUID() {
++			// Same object as the one whose terminal state was confirmed. The cached decision
++			// wins even if the live phase flipped back to a non-terminal phase (e.g. a cron
++			// operation starting a new run with the same UID).
++			return terminalDecision(cached), cached, nil
++		}
++
++		// A same-named object with a different UID exists. It must never impersonate the
++		// original dependency: surface a stable identity conflict while preserving the
++		// originally pinned identity.
++		conflict := cached.DeepCopy()
++		conflict.ObservedPhase = common.PhaseFailed
++		conflict.Reason = common.DataOperationIdentityConflict
++		conflict.Message = buildIdentityConflictMessage(ref, namespace, cached.UID, liveObject.GetUID())
++		return DependencyIdentityConflict, conflict, nil
++	}
++
++	// No confirmed terminal state has been observed yet.
++	if getErr != nil {
++		if utils.IgnoreNotFound(getErr) == nil {
++			// Unknown state: the dependency has never been observed in a terminal phase and
++			// is currently absent. Keep waiting; an identity-only cache (if any) is preserved.
++			return DependencyNotFound, cached, nil
++		}
++		// API temporarily unreadable: only retry.
++		return DependencyRetry, nil, getErr
++	}
++
++	liveStatus, err := utils.GetOperationStatus(liveObject)
++	if err != nil {
++		return DependencyRetry, nil, err
++	}
++
++	// Pin the identity on first sight so a later same-name recreation can be detected.
++	observed = &datav1alpha1.PrecedingOperationStatus{
++		ObjectRef: datav1alpha1.ObjectRef{
++			APIVersion: ref.APIVersion,
++			Kind:       ref.Kind,
++			Name:       ref.Name,
++			Namespace:  namespace,
++		},
++		UID: liveObject.GetUID(),
++	}
++	if cached != nil {
++		if cached.UID != "" && cached.UID != liveObject.GetUID() {
++			// The original dependency disappeared before reaching a terminal phase and a
++			// same-named object with a different UID took its place.
++			conflict := cached.DeepCopy()
++			conflict.ObservedPhase = common.PhaseFailed
++			conflict.Reason = common.DataOperationIdentityConflict
++			conflict.Message = buildIdentityConflictMessage(ref, namespace, cached.UID, liveObject.GetUID())
++			return DependencyIdentityConflict, conflict, nil
++		}
++		observed = cached.DeepCopy()
++		// Re-resolve the namespace in case the successor's namespace resolution changed.
++		observed.ObjectRef.Namespace = namespace
++		observed.UID = liveObject.GetUID()
++	}
++
++	switch liveStatus.Phase {
++	case common.PhaseComplete:
++		observed.ObservedPhase = common.PhaseComplete
++		observed.Reason = ""
++		observed.Message = ""
++		if liveStatus.NodeAffinity != nil {
++			observed.NodeAffinity = liveStatus.NodeAffinity.DeepCopy()
++		}
++		return DependencyComplete, observed, nil
++	case common.PhaseFailed:
++		observed.ObservedPhase = common.PhaseFailed
++		observed.Reason = common.DataOperationDependencyFailed
++		observed.Message = buildDependencyFailedMessage(ref, namespace, liveStatus)
++		return DependencyFailed, observed, nil
++	default:
++		// Non-terminal phase: remember the identity only and keep waiting.
++		return DependencyWaiting, observed, nil
++	}
++}
++
++// terminalDecision maps a cached confirmed terminal phase to its decision.
++func terminalDecision(cached *datav1alpha1.PrecedingOperationStatus) DependencyDecision {
++	if cached.ObservedPhase == common.PhaseFailed {
++		if cached.Reason == common.DataOperationIdentityConflict {
++			return DependencyIdentityConflict
++		}
++		return DependencyFailed
++	}
++	return DependencyComplete
++}
++
++// dependencyKey returns a human-readable reference of the preceding operation.
++func dependencyKey(ref *datav1alpha1.ObjectRef, namespace string) string {
++	return fmt.Sprintf("%s \"%s/%s\"", ref.Kind, namespace, ref.Name)
++}
++
++func buildDependencyFailedMessage(ref *datav1alpha1.ObjectRef, namespace string,
++	liveStatus *datav1alpha1.OperationStatus) string {
++
++	message := fmt.Sprintf("preceding operation %s reached phase Failed", dependencyKey(ref, namespace))
++	for _, condition := range liveStatus.Conditions {
++		if condition.Type == common.Failed && len(condition.Message) != 0 {
++			return fmt.Sprintf("%s: %s", message, condition.Message)
++		}
++	}
++	return message
++}
++
++func buildIdentityConflictMessage(ref *datav1alpha1.ObjectRef, namespace string,
++	pinnedUID, observedUID types.UID) string {
++
++	return fmt.Sprintf("a different object was found behind preceding operation %s: observed UID %q does not match the pinned UID %q of the original dependency, refusing to treat the recreated object as the dependency",
++		dependencyKey(ref, namespace), observedUID, pinnedUID)
++}
+diff --git a/pkg/dataflow/dependency_test.go b/pkg/dataflow/dependency_test.go
+new file mode 100644
+index 0000000..8e5b476
+--- /dev/null
++++ b/pkg/dataflow/dependency_test.go
+@@ -0,0 +1,371 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package dataflow
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++)
++
++const (
++	testUID        types.UID = "uid-original"
++	recreatedUID   types.UID = "uid-recreated"
++	testNamespace            = "default"
++	otherNamespace           = "other-ns"
++)
++
++func testScheme(t *testing.T) *runtime.Scheme {
++	s := runtime.NewScheme()
++	if err := datav1alpha1.AddToScheme(s); err != nil {
++		t.Fatalf("failed to add scheme: %v", err)
++	}
++	return s
++}
++
++func newPrecedingLoad(uid types.UID, name, namespace string, phase common.Phase, nodeAffinity *v1.NodeAffinity) *datav1alpha1.DataLoad {
++	return &datav1alpha1.DataLoad{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			UID:       uid,
++		},
++		Status: datav1alpha1.OperationStatus{
++			Phase:        phase,
++			NodeAffinity: nodeAffinity,
++		},
++	}
++}
++
++func testRef(kind, name, namespace string) *datav1alpha1.ObjectRef {
++	return &datav1alpha1.ObjectRef{
++		Kind:      kind,
++		Name:      name,
++		Namespace: namespace,
++	}
++}
++
++func cachedObservation(ref *datav1alpha1.ObjectRef, uid types.UID, phase common.Phase, affinity *v1.NodeAffinity) *datav1alpha1.PrecedingOperationStatus {
++	return &datav1alpha1.PrecedingOperationStatus{
++		ObjectRef: datav1alpha1.ObjectRef{
++			Kind:      ref.Kind,
++			Name:      ref.Name,
++			Namespace: ref.Namespace,
++		},
++		UID:           uid,
++		ObservedPhase: phase,
++		NodeAffinity:  affinity,
++	}
++}
++
++func TestResolvePrecedingOperation(t *testing.T) {
++	nodeAffinity := &v1.NodeAffinity{
++		RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
++			NodeSelectorTerms: []v1.NodeSelectorTerm{
++				{
++					MatchExpressions: []v1.NodeSelectorRequirement{
++						{
++							Key:      common.K8sNodeNameLabelKey,
++							Operator: v1.NodeSelectorOpIn,
++							Values:   []string{"node01"},
++						},
++					},
++				},
++			},
++		},
++	}
++
++	tests := []struct {
++		name           string
++		ref            *datav1alpha1.ObjectRef
++		defaultNS      string
++		cached         *datav1alpha1.PrecedingOperationStatus
++		objects        []runtime.Object
++		apiErr         bool
++		wantDecision   DependencyDecision
++		wantObserved   bool
++		wantUID        types.UID
++		wantPhase      common.Phase
++		wantReason     string
++		wantAffinity   bool
++		wantErr        bool
++		wantResolvedNS string
++	}{
++		{
++			name:         "nil reference is treated as complete",
++			ref:          nil,
++			wantDecision: DependencyComplete,
++			wantObserved: false,
++		},
++		{
++			name:         "live object in non-terminal phase pins identity and waits",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			objects:      []runtime.Object{newPrecedingLoad(testUID, "preceding", testNamespace, common.PhaseExecuting, nil)},
++			wantDecision: DependencyWaiting,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    "",
++		},
++		{
++			name:         "live object complete confirms success and snapshots affinity",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			objects:      []runtime.Object{newPrecedingLoad(testUID, "preceding", testNamespace, common.PhaseComplete, nodeAffinity)},
++			wantDecision: DependencyComplete,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseComplete,
++			wantAffinity: true,
++		},
++		{
++			name: "live object failed gives a stable failure with diagnostic reason",
++			ref:  testRef("DataLoad", "preceding", ""),
++			objects: []runtime.Object{&datav1alpha1.DataLoad{
++				ObjectMeta: metav1.ObjectMeta{Name: "preceding", Namespace: testNamespace, UID: testUID},
++				Status: datav1alpha1.OperationStatus{
++					Phase: common.PhaseFailed,
++					Conditions: []datav1alpha1.Condition{
++						{Type: common.Failed, Message: "job pod failed"},
++					},
++				},
++			}},
++			defaultNS:    testNamespace,
++			wantDecision: DependencyFailed,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseFailed,
++			wantReason:   common.DataOperationDependencyFailed,
++		},
++		{
++			name:           "referenced object absent with no cache is unknown and waits",
++			ref:            testRef("DataLoad", "nonexistent", ""),
++			defaultNS:      testNamespace,
++			wantDecision:   DependencyNotFound,
++			wantObserved:   false,
++			wantResolvedNS: testNamespace,
++		},
++		{
++			name:         "deletion after confirmed complete does not regress the successor",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, common.PhaseComplete, nodeAffinity),
++			wantDecision: DependencyComplete,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseComplete,
++			wantAffinity: true,
++		},
++		{
++			name:         "deletion after confirmed failed keeps the stable failure",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, common.PhaseFailed, nil),
++			wantDecision: DependencyFailed,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseFailed,
++		},
++		{
++			name:         "same UID flipping back to a non-terminal phase does not override the cached complete state",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, common.PhaseComplete, nodeAffinity),
++			objects:      []runtime.Object{newPrecedingLoad(testUID, "preceding", testNamespace, common.PhasePending, nil)},
++			wantDecision: DependencyComplete,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseComplete,
++			wantAffinity: true,
++		},
++		{
++			name:         "same-named object with a different UID after a terminal state is an identity conflict",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, common.PhaseComplete, nodeAffinity),
++			objects:      []runtime.Object{newPrecedingLoad(recreatedUID, "preceding", testNamespace, common.PhaseComplete, nil)},
++			wantDecision: DependencyIdentityConflict,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseFailed,
++			wantReason:   common.DataOperationIdentityConflict,
++			// the originally confirmed affinity snapshot is preserved alongside the conflict
++			wantAffinity: true,
++		},
++		{
++			name:         "same-named object with a different UID before any terminal state is also an identity conflict",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, "", nil),
++			objects:      []runtime.Object{newPrecedingLoad(recreatedUID, "preceding", testNamespace, common.PhasePending, nil)},
++			wantDecision: DependencyIdentityConflict,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseFailed,
++			wantReason:   common.DataOperationIdentityConflict,
++		},
++		{
++			name:         "identity-only cache preserved when the referenced object is temporarily absent",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, "", nil),
++			wantDecision: DependencyNotFound,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    "",
++		},
++		{
++			name:           "cross-namespace reference is resolved in the referenced namespace",
++			ref:            testRef("DataLoad", "preceding", otherNamespace),
++			defaultNS:      testNamespace,
++			objects:        []runtime.Object{newPrecedingLoad(testUID, "preceding", otherNamespace, common.PhaseComplete, nodeAffinity)},
++			wantDecision:   DependencyComplete,
++			wantObserved:   true,
++			wantUID:        testUID,
++			wantPhase:      common.PhaseComplete,
++			wantResolvedNS: otherNamespace,
++			wantAffinity:   true,
++		},
++		{
++			name: "DataBackup kind follows the same resolution rules",
++			ref:  testRef("DataBackup", "backup", ""),
++			objects: []runtime.Object{&datav1alpha1.DataBackup{
++				ObjectMeta: metav1.ObjectMeta{Name: "backup", Namespace: testNamespace, UID: testUID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseComplete},
++			}},
++			defaultNS:    testNamespace,
++			wantDecision: DependencyComplete,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseComplete,
++		},
++		{
++			name: "DataMigrate kind follows the same resolution rules",
++			ref:  testRef("DataMigrate", "migrate", ""),
++			objects: []runtime.Object{&datav1alpha1.DataMigrate{
++				ObjectMeta: metav1.ObjectMeta{Name: "migrate", Namespace: testNamespace, UID: testUID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseFailed},
++			}},
++			defaultNS:    testNamespace,
++			wantDecision: DependencyFailed,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    common.PhaseFailed,
++			wantReason:   common.DataOperationDependencyFailed,
++		},
++		{
++			name: "DataProcess kind follows the same resolution rules",
++			ref:  testRef("DataProcess", "process", ""),
++			objects: []runtime.Object{&datav1alpha1.DataProcess{
++				ObjectMeta: metav1.ObjectMeta{Name: "process", Namespace: testNamespace, UID: testUID},
++				Status:     datav1alpha1.OperationStatus{Phase: common.PhaseExecuting},
++			}},
++			defaultNS:    testNamespace,
++			wantDecision: DependencyWaiting,
++			wantObserved: true,
++			wantUID:      testUID,
++			wantPhase:    "",
++		},
++		{
++			name:         "API temporarily unreadable only retries and returns no observation",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			apiErr:       true,
++			wantDecision: DependencyRetry,
++			wantObserved: false,
++			wantErr:      true,
++		},
++		{
++			name:         "API unreadable with a cached terminal state still only retries",
++			ref:          testRef("DataLoad", "preceding", ""),
++			defaultNS:    testNamespace,
++			cached:       cachedObservation(testRef("DataLoad", "preceding", testNamespace), testUID, "", nil),
++			apiErr:       true,
++			wantDecision: DependencyRetry,
++			wantObserved: false,
++			wantErr:      true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			s := testScheme(t)
++			var c client.Client
++			if tt.apiErr {
++				fakeBase := fakeclient.NewClientBuilder().WithScheme(s).
++					WithRuntimeObjects(tt.objects...).Build()
++				c = interceptor.NewClient(fakeBase, interceptor.Funcs{
++					Get: func(ctx context.Context, cc client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
++						return errors.New("api server unavailable")
++					},
++				})
++			} else {
++				c = fake.NewFakeClientWithScheme(s, tt.objects...)
++			}
++
++			decision, observed, err := ResolvePrecedingOperation(c, tt.ref, tt.defaultNS, tt.cached)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("ResolvePrecedingOperation() err = %v, wantErr %v", err, tt.wantErr)
++			}
++			if decision != tt.wantDecision {
++				t.Fatalf("ResolvePrecedingOperation() decision = %v, want %v", decision, tt.wantDecision)
++			}
++			if tt.wantObserved && observed == nil {
++				t.Fatalf("expected a persisted observation, got nil")
++			}
++			if !tt.wantObserved && observed != nil {
++				t.Fatalf("expected no observation, got %+v", observed)
++			}
++			if observed == nil {
++				return
++			}
++			if observed.UID != tt.wantUID {
++				t.Errorf("observed UID = %q, want %q", observed.UID, tt.wantUID)
++			}
++			if observed.ObservedPhase != tt.wantPhase {
++				t.Errorf("observed phase = %q, want %q", observed.ObservedPhase, tt.wantPhase)
++			}
++			if tt.wantReason != "" && observed.Reason != tt.wantReason {
++				t.Errorf("observed reason = %q, want %q", observed.Reason, tt.wantReason)
++			}
++			if (observed.NodeAffinity != nil) != tt.wantAffinity {
++				t.Errorf("observed nodeAffinity presence = %v, want %v", observed.NodeAffinity != nil, tt.wantAffinity)
++			}
++			if tt.wantResolvedNS != "" && observed.Namespace != tt.wantResolvedNS {
++				t.Errorf("observed namespace = %q, want %q", observed.Namespace, tt.wantResolvedNS)
++			}
++			if tt.wantReason == common.DataOperationIdentityConflict &&
++				(observed.Message == "" ||
++					!strings.Contains(observed.Message, string(testUID)) ||
++					!strings.Contains(observed.Message, string(recreatedUID))) {
++				t.Errorf("identity conflict message must mention both UIDs, got %q", observed.Message)
++			}
++		})
++	}
++}
+diff --git a/pkg/dataprocess/generate_values.go b/pkg/dataprocess/generate_values.go
+index d2fc295..88e818f 100644
+--- a/pkg/dataprocess/generate_values.go
++++ b/pkg/dataprocess/generate_values.go
+@@ -35,13 +35,13 @@ func GenDataProcessValueFile(client client.Client, dataset *datav1alpha1.Dataset
+ 
+ 	// generate the node affinity by previous operation pod.
+ 	if dataProcess.Spec.Processor.Job != nil {
+-		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, dataProcess.Spec.Processor.Job.PodSpec.Affinity)
++		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, dataProcess.Status.WaitingFor.PrecedingOperation, dataProcess.Spec.Processor.Job.PodSpec.Affinity)
+ 		if err != nil {
+ 			return "", errors.Wrapf(err, "failed to inject affinity by runAfterOp")
+ 		}
+ 		dataProcessValue.DataProcessInfo.JobProcessor.PodSpec.Affinity = affinity
+ 	} else {
+-		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, nil)
++		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, dataProcess.Status.WaitingFor.PrecedingOperation, nil)
+ 		if err != nil {
+ 			return "", errors.Wrapf(err, "failed to inject affinity by runAfterOp")
+ 		}
+diff --git a/pkg/ddc/alluxio/backup_data.go b/pkg/ddc/alluxio/backup_data.go
+index ce198fb..aa4cc95 100644
+--- a/pkg/ddc/alluxio/backup_data.go
++++ b/pkg/ddc/alluxio/backup_data.go
+@@ -141,7 +141,7 @@ func (e *AlluxioEngine) generateDataBackupValueFile(ctx cruntime.ReconcileReques
+ 	dataBackup.Path = path
+ 
+ 	// inject the node affinity by previous operation pod.
+-	dataBackup.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, databackup.Spec.RunAfter, databackup.Namespace, nil)
++	dataBackup.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, databackup.Spec.RunAfter, databackup.Namespace, databackup.Status.WaitingFor.PrecedingOperation, nil)
+ 	if err != nil {
+ 		return "", err
+ 	}
+diff --git a/pkg/ddc/alluxio/load_data.go b/pkg/ddc/alluxio/load_data.go
+index 2fd3383..da5c954 100644
+--- a/pkg/ddc/alluxio/load_data.go
++++ b/pkg/ddc/alluxio/load_data.go
+@@ -129,7 +129,7 @@ func (e *AlluxioEngine) genDataLoadValue(image string, targetDataset *datav1alph
+ 
+ 	// inject the node affinity by previous operation pod.
+ 	var err error
+-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
++	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataload.Status.WaitingFor.PrecedingOperation, dataloadInfo.Affinity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/ddc/base/operation.go b/pkg/ddc/base/operation.go
+index 563b309..153a977 100644
+--- a/pkg/ddc/base/operation.go
++++ b/pkg/ddc/base/operation.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
+ 	"github.com/go-logr/logr"
+ 	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/utils/ptr"
+ 	ctrl "sigs.k8s.io/controller-runtime"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+@@ -113,13 +114,20 @@ func (e *EngineOperationReconciler) reconcilePending(ctx cruntime.ReconcileReque
+ 	operation dataoperation.OperationInterface) (ctrl.Result, error) {
+ 	log := ctx.Log.WithName("reconcilePending")
+ 
+-	// 1. check preceding operation status
++	// 1. fail stably when the RunAfter dependency reached a confirmed terminal failure
++	// (including an identity conflict with a same-named recreated object). The dataflow
++	// controller has already persisted the terminal observation and woken this operation up.
++	if result, err, done := e.failOnDependencyTerminalFailure(ctx, opStatus, operation); done {
++		return result, err
++	}
++
++	// 2. check preceding operation status
+ 	if opStatus.WaitingFor.OperationComplete != nil && *opStatus.WaitingFor.OperationComplete {
+ 		// when operationComplete set back to false, a new reconciliation loop will be triggered, so no requeue here.
+ 		return utils.NoRequeue()
+ 	}
+ 
+-	// 2. set current data operation to dataset
++	// 3. set current data operation to dataset
+ 	err := SetDataOperationInTargetDataset(ctx, operation, e.Engine)
+ 	if err != nil {
+ 		return utils.RequeueAfterInterval(20 * time.Second)
+@@ -136,6 +144,54 @@ func (e *EngineOperationReconciler) reconcilePending(ctx cruntime.ReconcileReque
+ 	return utils.NoRequeue()
+ }
+ 
++// failOnDependencyTerminalFailure transitions the operation to a stable Failed phase when the
++// dataflow controller has confirmed a terminal failure of its RunAfter dependency (a Failed
++// preceding operation or an identity conflict with a same-named recreated object). It returns
++// done=true when the terminal failure has been handled so that callers skip the normal
++// pending flow.
++func (e *EngineOperationReconciler) failOnDependencyTerminalFailure(ctx cruntime.ReconcileRequestContext,
++	opStatus *datav1alpha1.OperationStatus,
++	operation dataoperation.OperationInterface) (result ctrl.Result, err error, done bool) {
++
++	dependency := opStatus.WaitingFor.PrecedingOperation
++	if dependency == nil || dependency.ObservedPhase != common.PhaseFailed {
++		return ctrl.Result{}, nil, false
++	}
++
++	log := ctx.Log.WithName("reconcilePending")
++	reason := dependency.Reason
++	if len(reason) == 0 {
++		reason = common.DataOperationDependencyFailed
++	}
++
++	now := metav1.NewTime(time.Now())
++	condition := datav1alpha1.Condition{
++		Type:               common.Failed,
++		Status:             v1.ConditionTrue,
++		Reason:             reason,
++		Message:            dependency.Message,
++		LastProbeTime:      now,
++		LastTransitionTime: now,
++	}
++	opStatus.Conditions = append([]datav1alpha1.Condition{condition}, opStatus.Conditions...)
++	opStatus.Phase = common.PhaseFailed
++	// The dependency decision is terminal, so the successor must leave the waiting state.
++	opStatus.WaitingFor.OperationComplete = ptr.To(false)
++
++	object := operation.GetOperationObject()
++	ctx.Recorder.Eventf(object, v1.EventTypeWarning, common.DataOperationFailed,
++		"RunAfter dependency terminated with failure: %s", dependency.Message)
++
++	if err := operation.UpdateOperationApiStatus(opStatus); err != nil {
++		log.Error(err, "failed to update operation status to Failed due to the RunAfter dependency failure")
++		requeueResult, requeueErr := utils.RequeueIfError(err)
++		return requeueResult, requeueErr, true
++	}
++	log.Info("operation failed because its RunAfter dependency reached a terminal failure", "reason", reason, "message", dependency.Message)
++	noRequeueResult, noRequeueErr := utils.NoRequeue()
++	return noRequeueResult, noRequeueErr, true
++}
++
+ func (e *EngineOperationReconciler) reconcileExecuting(ctx cruntime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus,
+ 	operation dataoperation.OperationInterface) (ctrl.Result, error) {
+ 	log := ctx.Log.WithName("reconcileExecuting")
+diff --git a/pkg/ddc/base/operation_dependency_test.go b/pkg/ddc/base/operation_dependency_test.go
+new file mode 100644
+index 0000000..791d3a9
+--- /dev/null
++++ b/pkg/ddc/base/operation_dependency_test.go
+@@ -0,0 +1,140 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package base_test
++
++import (
++	"os"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
++	"github.com/fluid-cloudnative/fluid/pkg/runtime"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	apimachineryRuntime "k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++	"k8s.io/utils/ptr"
++)
++
++var _ = Describe("reconcilePending with a terminal RunAfter dependency failure", func() {
++
++	var (
++		fakeCtx   runtime.ReconcileRequestContext
++		t         *base.TemplateEngine
++		operation *mockOperation
++		opStatus  *datav1alpha1.OperationStatus
++		recorder  *record.FakeRecorder
++	)
++
++	BeforeEach(func() {
++		fakeDataset := &datav1alpha1.Dataset{
++			ObjectMeta: metav1.ObjectMeta{Name: mockDatasetName, Namespace: mockNamespace},
++		}
++		s := apimachineryRuntime.NewScheme()
++		s.AddKnownTypes(datav1alpha1.GroupVersion, fakeDataset)
++		recorder = record.NewFakeRecorder(10)
++		fakeClient := fake.NewFakeClientWithScheme(s, fakeDataset)
++
++		fakeCtx = runtime.ReconcileRequestContext{
++			NamespacedName: types.NamespacedName{Namespace: mockNamespace, Name: mockDatasetName},
++			Client:         fakeClient,
++			Log:            fake.NullLogger(),
++			RuntimeType:    "test-runtime",
++			Recorder:       recorder,
++		}
++
++		_ = os.Setenv("FLUID_SYNC_RETRY_DURATION", "0s")
++		t = base.NewTemplateEngine(nil, "test-engine", fakeCtx)
++		operation = newMockOperation()
++		opStatus = &datav1alpha1.OperationStatus{}
++	})
++
++	AfterEach(func() {
++		_ = os.Unsetenv("FLUID_SYNC_RETRY_DURATION")
++	})
++
++	It("transitions the operation to Failed with a diagnosable condition when the dependency failed", func() {
++		opStatus.Phase = common.PhasePending
++		opStatus.WaitingFor = datav1alpha1.WaitingStatus{
++			OperationComplete: ptr.To(false),
++			PrecedingOperation: &datav1alpha1.PrecedingOperationStatus{
++				ObjectRef:     datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "preceding", Namespace: mockNamespace},
++				UID:           "uid-1",
++				ObservedPhase: common.PhaseFailed,
++				Reason:        common.DataOperationDependencyFailed,
++				Message:       "preceding operation DataLoad \"default/preceding\" reached phase Failed",
++			},
++		}
++
++		result, err := t.Operate(fakeCtx, opStatus, operation)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Requeue).To(BeFalse())
++
++		Expect(opStatus.Phase).To(Equal(common.PhaseFailed))
++		Expect(opStatus.Conditions).NotTo(BeEmpty())
++		Expect(opStatus.Conditions[0].Type).To(Equal(common.Failed))
++		Expect(opStatus.Conditions[0].Status).To(Equal(v1.ConditionTrue))
++		Expect(opStatus.Conditions[0].Reason).To(Equal(common.DataOperationDependencyFailed))
++		Expect(opStatus.Conditions[0].Message).To(ContainSubstring("reached phase Failed"))
++		Expect(*opStatus.WaitingFor.OperationComplete).To(BeFalse())
++
++		Eventually(recorder.Events).Should(Receive(ContainSubstring(common.DataOperationFailed)))
++	})
++
++	It("uses the identity conflict reason when a same-named object recreated the dependency", func() {
++		opStatus.Phase = common.PhasePending
++		opStatus.WaitingFor = datav1alpha1.WaitingStatus{
++			OperationComplete: ptr.To(false),
++			PrecedingOperation: &datav1alpha1.PrecedingOperationStatus{
++				ObjectRef:     datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "preceding", Namespace: mockNamespace},
++				UID:           "uid-1",
++				ObservedPhase: common.PhaseFailed,
++				Reason:        common.DataOperationIdentityConflict,
++				Message:       "observed UID \"uid-2\" does not match the pinned UID \"uid-1\"",
++			},
++		}
++
++		result, err := t.Operate(fakeCtx, opStatus, operation)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Requeue).To(BeFalse())
++		Expect(opStatus.Phase).To(Equal(common.PhaseFailed))
++		Expect(opStatus.Conditions[0].Reason).To(Equal(common.DataOperationIdentityConflict))
++		Expect(opStatus.Conditions[0].Message).To(ContainSubstring("uid-1"))
++	})
++
++	It("does not fail when no terminal dependency failure has been observed", func() {
++		opStatus.Phase = common.PhasePending
++		opStatus.WaitingFor = datav1alpha1.WaitingStatus{
++			OperationComplete: ptr.To(true),
++			PrecedingOperation: &datav1alpha1.PrecedingOperationStatus{
++				ObjectRef: datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "preceding", Namespace: mockNamespace},
++				UID:       "uid-1",
++			},
++		}
++
++		result, err := t.Operate(fakeCtx, opStatus, operation)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Requeue).To(BeFalse())
++		// Still waiting: the phase must not transition to Failed.
++		Expect(opStatus.Phase).To(Equal(common.PhasePending))
++		Expect(opStatus.Conditions).To(BeEmpty())
++	})
++})
+diff --git a/pkg/ddc/cache/engine/dataload.go b/pkg/ddc/cache/engine/dataload.go
+index 9d82492..951f0d2 100644
+--- a/pkg/ddc/cache/engine/dataload.go
++++ b/pkg/ddc/cache/engine/dataload.go
+@@ -132,7 +132,7 @@ func (e *CacheEngine) genDataLoadValue(ctx cruntime.ReconcileRequestContext, tar
+ 	}
+ 
+ 	// inject the node affinity by previous operation pod.
+-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
++	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataload.Status.WaitingFor.PrecedingOperation, dataloadInfo.Affinity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/ddc/jindo/load_data.go b/pkg/ddc/jindo/load_data.go
+index 60caa54..0c569f7 100644
+--- a/pkg/ddc/jindo/load_data.go
++++ b/pkg/ddc/jindo/load_data.go
+@@ -133,7 +133,7 @@ func (e *JindoEngine) genDataLoadValue(image string, runtime *datav1alpha1.Jindo
+ 
+ 	// inject the node affinity by previous operation pod.
+ 	var err error
+-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
++	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataload.Status.WaitingFor.PrecedingOperation, dataloadInfo.Affinity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/ddc/jindocache/load_data.go b/pkg/ddc/jindocache/load_data.go
+index 2a5b5da..ae71b9e 100644
+--- a/pkg/ddc/jindocache/load_data.go
++++ b/pkg/ddc/jindocache/load_data.go
+@@ -132,7 +132,7 @@ func (e *JindoCacheEngine) genDataLoadValue(image string, runtime *datav1alpha1.
+ 
+ 	// inject the node affinity by previous operation pod.
+ 	var err error
+-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
++	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataload.Status.WaitingFor.PrecedingOperation, dataloadInfo.Affinity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/ddc/jindofsx/load_data.go b/pkg/ddc/jindofsx/load_data.go
+index 45cc2cd..ba99047 100644
+--- a/pkg/ddc/jindofsx/load_data.go
++++ b/pkg/ddc/jindofsx/load_data.go
+@@ -132,7 +132,7 @@ func (e *JindoFSxEngine) genDataLoadValue(image string, runtime *datav1alpha1.Ji
+ 
+ 	// inject the node affinity by previous operation pod.
+ 	var err error
+-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
++	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataload.Status.WaitingFor.PrecedingOperation, dataloadInfo.Affinity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/ddc/juicefs/data_load.go b/pkg/ddc/juicefs/data_load.go
+index d131b04..ddb1292 100644
+--- a/pkg/ddc/juicefs/data_load.go
++++ b/pkg/ddc/juicefs/data_load.go
+@@ -140,7 +140,7 @@ func (j *JuiceFSEngine) genDataLoadValue(image string, cacheinfo map[string]stri
+ 
+ 	// generate the node affinity by previous operation pod.
+ 	var err error
+-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
++	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataload.Spec.RunAfter, dataload.Namespace, dataload.Status.WaitingFor.PrecedingOperation, dataloadInfo.Affinity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/ddc/juicefs/data_migrate.go b/pkg/ddc/juicefs/data_migrate.go
+index df9ffca..c8f0ca8 100644
+--- a/pkg/ddc/juicefs/data_migrate.go
++++ b/pkg/ddc/juicefs/data_migrate.go
+@@ -122,7 +122,7 @@ func (j *JuiceFSEngine) generateDataMigrateValueFile(r cruntime.ReconcileRequest
+ 	}
+ 
+ 	// inject the node affinity by previous operation pod.
+-	dataMigrateInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataMigrate.Spec.RunAfter, dataMigrate.Namespace, dataMigrateInfo.Affinity)
++	dataMigrateInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataMigrate.Spec.RunAfter, dataMigrate.Namespace, dataMigrate.Status.WaitingFor.PrecedingOperation, dataMigrateInfo.Affinity)
+ 	if err != nil {
+ 		return "", err
+ 	}
+diff --git a/pkg/utils/dataoperation.go b/pkg/utils/dataoperation.go
+index 0fe2d59..d22abd0 100644
+--- a/pkg/utils/dataoperation.go
++++ b/pkg/utils/dataoperation.go
+@@ -65,36 +65,24 @@ func GetOperationStatus(obj client.Object) (*datav1alpha1.OperationStatus, error
+ 	return nil, fmt.Errorf("obj is not of any data operation type")
+ }
+ 
+-func GetPrecedingOperationStatus(client client.Client, opRef *datav1alpha1.ObjectRef, opRefNamespace string) (*datav1alpha1.OperationStatus, error) {
++// GetPrecedingOperationObject returns the full data operation object referenced by opRef so
++// that callers can inspect both its identity (UID) and its status. The namespace in opRef is
++// ignored and opRefNamespace is used instead, allowing callers to default to the successor's
++// namespace for cross-namespace references.
++func GetPrecedingOperationObject(client client.Client, opRef *datav1alpha1.ObjectRef, opRefNamespace string) (client.Object, error) {
+ 	if opRef == nil {
+ 		return nil, nil
+ 	}
+ 
+ 	switch opRef.Kind {
+ 	case string(dataoperation.DataBackupType):
+-		object, err := GetDataBackup(client, opRef.Name, opRefNamespace)
+-		if err != nil {
+-			return nil, err
+-		}
+-		return &object.Status, nil
++		return GetDataBackup(client, opRef.Name, opRefNamespace)
+ 	case string(dataoperation.DataLoadType):
+-		object, err := GetDataLoad(client, opRef.Name, opRefNamespace)
+-		if err != nil {
+-			return nil, err
+-		}
+-		return &object.Status, nil
++		return GetDataLoad(client, opRef.Name, opRefNamespace)
+ 	case string(dataoperation.DataMigrateType):
+-		object, err := GetDataMigrate(client, opRef.Name, opRefNamespace)
+-		if err != nil {
+-			return nil, err
+-		}
+-		return &object.Status, nil
++		return GetDataMigrate(client, opRef.Name, opRefNamespace)
+ 	case string(dataoperation.DataProcessType):
+-		object, err := GetDataProcess(client, opRef.Name, opRefNamespace)
+-		if err != nil {
+-			return nil, err
+-		}
+-		return &object.Status, nil
++		return GetDataProcess(client, opRef.Name, opRefNamespace)
+ 	default:
+ 		// TODO: Support non-builtin Kind
+ 		return nil, fmt.Errorf("kind %v is currently not supported for runAfter", opRef.Kind)

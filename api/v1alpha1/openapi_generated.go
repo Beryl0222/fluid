@@ -114,6 +114,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.OperationRef":                      schema_fluid_cloudnative_fluid_api_v1alpha1_OperationRef(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.OperationStatus":                   schema_fluid_cloudnative_fluid_api_v1alpha1_OperationStatus(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.PodMetadata":                       schema_fluid_cloudnative_fluid_api_v1alpha1_PodMetadata(ref),
+		"github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus":          schema_fluid_cloudnative_fluid_api_v1alpha1_PrecedingOperationStatus(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.Prefer":                            schema_fluid_cloudnative_fluid_api_v1alpha1_Prefer(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.ProcessMemoryMediumSource":         schema_fluid_cloudnative_fluid_api_v1alpha1_ProcessMemoryMediumSource(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.Processor":                         schema_fluid_cloudnative_fluid_api_v1alpha1_Processor(ref),
@@ -5988,7 +5989,8 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_OperationStatus(ref common.Refe
 			},
 		},
 		Dependencies: []string{
-			"github.com/fluid-cloudnative/fluid/api/v1alpha1.Condition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.WaitingStatus", "k8s.io/api/core/v1.NodeAffinity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+			"github.com/fluid-cloudnative/fluid/api/v1alpha1.Condition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.WaitingStatus", "k8s.io/api/core/v1.NodeAffinity", "k8s.io/apimachinery/pkg/apis/meta/v1.Time",
+			"github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus"},
 	}
 }
 
@@ -8734,6 +8736,78 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_VolumeSource(ref common.Referen
 	}
 }
 
+func schema_fluid_cloudnative_fluid_api_v1alpha1_PrecedingOperationStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "PrecedingOperationStatus records the identity and the observed terminal state of a preceding data operation referenced by RunAfter (or by affinityStrategy.dependOn).",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"namespace": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"uid": {
+						SchemaProps: spec.SchemaProps{
+							Description: "UID pins the identity of the originally observed dependency.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"observedPhase": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservedPhase is the terminal phase confirmed on the referenced object.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"reason": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"message": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"nodeAffinity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeAffinity snapshots the node affinity of the referenced operation at the moment its terminal state was confirmed.",
+							Ref:         ref("k8s.io/api/core/v1.NodeAffinity"),
+						},
+					},
+				},
+				Required: []string{"kind", "name", "uid"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/api/core/v1.NodeAffinity"},
+	}
+}
+
 func schema_fluid_cloudnative_fluid_api_v1alpha1_WaitingStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -8747,8 +8821,17 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_WaitingStatus(ref common.Refere
 							Format:      "",
 						},
 					},
+					"precedingOperation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PrecedingOperation caches the identity and the last observed terminal state of the data operation that the current operation is waiting for.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus"),
+						},
+					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"github.com/fluid-cloudnative/fluid/api/v1alpha1.PrecedingOperationStatus"},
 	}
 }
