@@ -61,7 +61,11 @@ type nodeServer struct {
 	apiReader            client.Reader
 	nodeAuthorizedClient *kubernetes.Clientset
 	locks                *utils.VolumeLocks
-	node                 *corev1.Node
+	// runtimeLocks serializes Stage/Unstage label reconciliations that target the same runtime
+	// fuse selector, so interleaved operations of multiple volumes of one runtime never compute
+	// label diffs against a concurrently changing node.
+	runtimeLocks *utils.VolumeLocks
+	node         *corev1.Node
 }
 
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -375,23 +379,27 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		fuseLabelKey = runtimeInfo.GetFuseLabelName()
 	}
 
-	var labelsToModify common.LabelsToModify
-	labelsToModify.Add(fuseLabelKey, "true")
-
-	node, err := ns.getNode()
+	// 5. Resolve the FUSE generation this volume is created against. A volume without the
+	// generation label keeps the legacy behavior that only publishes the runtime-level selector.
+	generation, err := ns.getVolumeFuseGeneration(namespace, name)
 	if err != nil {
-		glog.Errorf("NodeStageVolume: can't get node %s: %v", ns.nodeId, err)
-		return nil, errors.Wrapf(err, "NodeStageVolume: can't get node %s", ns.nodeId)
+		glog.Errorf("NodeStageVolume: failed to resolve fuse generation for runtime %s/%s: %v", namespace, name, err)
+		return nil, errors.Wrapf(err, "NodeStageVolume: failed to resolve fuse generation for runtime %s/%s", namespace, name)
 	}
 
-	// _, err = utils.ChangeNodeLabelWithPatchMode(ns.client, node, labelsToModify)
-	err = ns.patchNodeWithLabel(node, labelsToModify)
-	if err != nil {
-		glog.Errorf("NodeStageVolume: error when patching labels on node %s: %v", ns.nodeId, err)
-		return nil, errors.Wrapf(err, "NodeStageVolume: error when patching labels on node %s", ns.nodeId)
+	// Publish both the runtime selector and the generation-scoped selector. The operation is
+	// idempotent and conflict-retrying, so concurrent Stage/Unstage calls converge safely.
+	ref := fuseVolumeReference{
+		volumeID:     volumeId,
+		fuseLabelKey: fuseLabelKey,
+		generation:   generation,
+	}
+	if err = ns.publishFuseGenerationReferences(ref); err != nil {
+		glog.Errorf("NodeStageVolume: error when publishing fuse references on node %s: %v", ns.nodeId, err)
+		return nil, errors.Wrapf(err, "NodeStageVolume: error when publishing fuse references on node %s", ns.nodeId)
 	}
 
-	glog.Infof("NodeStageVolume: NodeStage succeeded with VolumeId: %s, and added NodeLabel: %s", volumeId, fuseLabelKey)
+	glog.Infof("NodeStageVolume: NodeStage succeeded with VolumeId: %s, and added NodeLabel: %s, generation: %q", volumeId, fuseLabelKey, generation)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -757,20 +765,17 @@ func (ns *nodeServer) getCleanFuseFunc(volumeId string) (func() error, error) {
 			fuseLabelKey = runtimeInfo.GetFuseLabelName()
 		}
 
-		// remove label on node
-		// Once the label is removed, fuse pod on corresponding node will be terminated because node selector in the fuse daemonSet no longer matches.
-		var labelsToModify common.LabelsToModify
-		labelsToModify.Delete(fuseLabelKey)
-
-		node, err := ns.getNode()
-		if err != nil {
-			glog.Errorf("NodeUnstageVolume: can't get node %s: %v", ns.nodeId, err)
-			return errors.Wrapf(err, "NodeUnstageVolume: can't get node %s", ns.nodeId)
+		// Converge the node's fuse selector labels to the actual mount set instead of deleting the
+		// runtime selector unconditionally. A generation selector is removed only when no staged
+		// volume on the node still references that generation, so volumes of the same runtime on
+		// other generations keep their FUSE and stale generations are reclaimed once idle.
+		ref := fuseVolumeReference{
+			volumeID:     volumeId,
+			fuseLabelKey: fuseLabelKey,
+			generation:   latestFuseGeneration,
 		}
-
-		if err := ns.patchNodeWithLabel(node, labelsToModify); err != nil {
-			glog.Errorf("NodeUnstageVolume: error when patching labels on node %s: %v", ns.nodeId, err)
-			return errors.Wrapf(err, "NodeUnstageVolume: error when patching labels on node %s", ns.nodeId)
+		if err := ns.reconcileFuseGenerationReferences(ref); err != nil {
+			return errors.Wrapf(err, "NodeUnstageVolume: failed to reconcile fuse references for volume %s", volumeId)
 		}
 
 		return nil

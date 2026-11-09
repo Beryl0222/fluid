@@ -199,3 +199,86 @@ func TestGetFullNamespacedNameWithPrefixValue(t *testing.T) {
 		}
 	}
 }
+
+func TestGetFuseGenerationLabelName(t *testing.T) {
+	tests := []struct {
+		name         string
+		fuseLabelKey string
+		generation   string
+		expected     string
+		expectErr    bool
+	}{
+		{
+			name:         "prefixed fuse label key with numeric generation",
+			fuseLabelKey: "fluid.io/f-default-test-dataset",
+			generation:   "2",
+			expected:     "fluid.io/f-default-test-dataset-gen-2",
+		},
+		{
+			name:         "prefixed fuse label key with letter generation",
+			fuseLabelKey: "fluid.io/f-default-test-dataset",
+			generation:   "v1",
+			expected:     "fluid.io/f-default-test-dataset-gen-v1",
+		},
+		{
+			name:         "fuse label key without prefix",
+			fuseLabelKey: "f-default-test-dataset",
+			generation:   "1",
+			expected:     "f-default-test-dataset-gen-1",
+		},
+		{
+			name:         "empty fuse label key returns error",
+			fuseLabelKey: "",
+			generation:   "1",
+			expectErr:    true,
+		},
+		{
+			name:         "empty generation returns error",
+			fuseLabelKey: "fluid.io/f-default-test-dataset",
+			generation:   "",
+			expectErr:    true,
+		},
+		{
+			name:         "generation with illegal label characters returns error",
+			fuseLabelKey: "fluid.io/f-default-test-dataset",
+			generation:   "1_2",
+			expectErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetFuseGenerationLabelName(tt.fuseLabelKey, tt.generation)
+			if tt.expectErr && err == nil {
+				t.Fatalf("expected an error, got label %q", got)
+			}
+			if !tt.expectErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !tt.expectErr && got != tt.expected {
+				t.Errorf("GetFuseGenerationLabelName(%q, %q) = %q, want %q", tt.fuseLabelKey, tt.generation, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetFuseGenerationLabelPrefix(t *testing.T) {
+	tests := []struct {
+		fuseLabelKey string
+		generation   string
+	}{
+		{"fluid.io/f-default-test-dataset", "2"},
+		{"f-default-test-dataset", "1"},
+	}
+
+	for _, tt := range tests {
+		prefix := GetFuseGenerationLabelPrefix(tt.fuseLabelKey)
+		generationLabel, err := GetFuseGenerationLabelName(tt.fuseLabelKey, tt.generation)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if prefix+tt.generation != generationLabel {
+			t.Errorf("generation label %q cannot be reconstructed from prefix %q and generation %q", generationLabel, prefix, tt.generation)
+		}
+	}
+}

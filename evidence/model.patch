@@ -1,0 +1,1109 @@
+diff --git a/pkg/csi/plugins/driver.go b/pkg/csi/plugins/driver.go
+index 2f15267..28f27ae 100644
+--- a/pkg/csi/plugins/driver.go
++++ b/pkg/csi/plugins/driver.go
+@@ -96,6 +96,7 @@ func (d *driver) newNodeServer() *nodeServer {
+ 		apiReader:            d.apiReader,
+ 		nodeAuthorizedClient: d.nodeAuthorizedClient,
+ 		locks:                d.locks,
++		runtimeLocks:         utils.NewVolumeLocks(),
+ 	}
+ }
+ 
+diff --git a/pkg/csi/plugins/fuse_generation.go b/pkg/csi/plugins/fuse_generation.go
+new file mode 100644
+index 0000000..59d77c0
+--- /dev/null
++++ b/pkg/csi/plugins/fuse_generation.go
+@@ -0,0 +1,292 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package plugins
++
++import (
++	"strings"
++
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
++	"github.com/fluid-cloudnative/fluid/pkg/utils"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
++	"github.com/golang/glog"
++	"github.com/pkg/errors"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	corev1 "k8s.io/api/core/v1"
++	apierrs "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/client-go/util/retry"
++)
++
++// fuseVolumeReference captures the fuse selector information a single staged volume requires on
++// the node. The fuseLabelKey selects the runtime FUSE, while generation selects the exact FUSE
++// template generation the volume was created against. An empty generation marks a legacy volume
++// that predates FUSE generation tracking.
++type fuseVolumeReference struct {
++	volumeID     string
++	fuseLabelKey string
++	generation   string
++}
++
++// publishFuseGenerationReferences publishes the runtime fuse selector and the generation-scoped
++// selector required by the given volume onto the node. Adding labels is idempotent, so the
++// operation is safe to retry after a node patch conflict or a CSI plugin restart.
++func (ns *nodeServer) publishFuseGenerationReferences(ref fuseVolumeReference) error {
++	if len(ref.fuseLabelKey) == 0 {
++		return status.Errorf(codes.InvalidArgument, "fuse label key is empty for volume %s", ref.volumeID)
++	}
++
++	release, err := ns.acquireRuntimeFuseLock(ref.fuseLabelKey)
++	if err != nil {
++		return err
++	}
++	defer release()
++
++	buildLabels := func(_ *corev1.Node) (common.LabelsToModify, error) {
++		var labelsToModify common.LabelsToModify
++		// The runtime-level selector always stays while any generation of this runtime is in use.
++		// It is also the selector existing FUSE DaemonSets match on, so it preserves backward
++		// compatibility for volumes without a generation label.
++		labelsToModify.Add(ref.fuseLabelKey, "true")
++
++		if len(ref.generation) > 0 {
++			generationLabelKey, err := utils.GetFuseGenerationLabelName(ref.fuseLabelKey, ref.generation)
++			if err != nil {
++				return labelsToModify, err
++			}
++			labelsToModify.Add(generationLabelKey, "true")
++		}
++		return labelsToModify, nil
++	}
++
++	if err := ns.patchNodeLabelsWithRetry(buildLabels); err != nil {
++		return errors.Wrapf(err, "failed to publish fuse generation references for volume %s", ref.volumeID)
++	}
++	glog.Infof("Published fuse selector labels for volume %s (fuseLabelKey: %s, generation: %q)", ref.volumeID, ref.fuseLabelKey, ref.generation)
++	return nil
++}
++
++// reconcileFuseGenerationReferences converges the node's fuse selector labels for the runtime of
++// currentRef to the node's actual mount set. A generation-scoped selector is removed only when no
++// staged volume on the node still references that generation, and the runtime-level selector is
++// removed only when no volume of the runtime remains. Any undeterminable state (mount info read
++// failure, transient API error, unresolvable volume ownership) aborts the whole reconciliation
++// before the node is touched, so unknown occupancy can never be treated as safe to clean.
++func (ns *nodeServer) reconcileFuseGenerationReferences(currentRef fuseVolumeReference) error {
++	if len(currentRef.fuseLabelKey) == 0 {
++		return status.Errorf(codes.InvalidArgument, "fuse label key is empty for volume %s", currentRef.volumeID)
++	}
++
++	release, err := ns.acquireRuntimeFuseLock(currentRef.fuseLabelKey)
++	if err != nil {
++		return err
++	}
++	defer release()
++
++	// Reconstruct the reference set from the actual mount set instead of any in-memory counter,
++	// so the result stays correct after concurrent interleavings and CSI plugin restarts.
++	mountedVolumeIDs, err := listStagedCSIVolumeIDs()
++	if err != nil {
++		return status.Errorf(codes.Internal, "NodeUnstageVolume: failed to discover staged volumes on node %s: %v", ns.nodeId, err)
++	}
++
++	inUseGenerations := sets.New[string]()
++	hasLegacyUser := false
++	for _, volumeID := range sets.List(mountedVolumeIDs) {
++		ref, err := ns.resolveFuseVolumeReference(volumeID)
++		if err != nil {
++			// Fail closed: an unresolvable mount might still need the selector, so do not remove
++			// any label until the state can be determined (the RPC is retried later).
++			return status.Errorf(codes.Internal, "NodeUnstageVolume: failed to resolve staged volume %s on node %s: %v", volumeID, ns.nodeId, err)
++		}
++		if ref == nil {
++			continue
++		}
++		if ref.fuseLabelKey != currentRef.fuseLabelKey {
++			// Volumes of another runtime do not participate in this runtime's reference counting.
++			continue
++		}
++
++		if len(ref.generation) == 0 {
++			hasLegacyUser = true
++			continue
++		}
++		inUseGenerations.Insert(ref.generation)
++	}
++
++	runtimeInUse := hasLegacyUser || inUseGenerations.Len() > 0
++	glog.Infof("NodeUnstageVolume: reconciled fuse references for runtime selector %s on node %s, in-use generations: %v, legacy user: %v",
++		currentRef.fuseLabelKey, ns.nodeId, sets.List(inUseGenerations), hasLegacyUser)
++
++	buildLabels := func(node *corev1.Node) (common.LabelsToModify, error) {
++		return buildFuseSelectorCleanupLabels(node, currentRef.fuseLabelKey, inUseGenerations, runtimeInUse), nil
++	}
++
++	if err := ns.patchNodeLabelsWithRetry(buildLabels); err != nil {
++		return errors.Wrapf(err, "failed to reconcile fuse generation references for volume %s", currentRef.volumeID)
++	}
++	return nil
++}
++
++// buildFuseSelectorCleanupLabels computes the label deletions that converge a node to the actual
++// mount set. Every generation-scoped label without a remaining user is deleted, including stale
++// labels left by older generations or interrupted reconciliations, and the runtime-level label is
++// deleted only when the runtime has no user at all. Labels still referenced are never touched.
++func buildFuseSelectorCleanupLabels(node *corev1.Node, fuseLabelKey string, inUseGenerations sets.Set[string], runtimeInUse bool) common.LabelsToModify {
++	var labelsToModify common.LabelsToModify
++
++	generationLabelPrefix := utils.GetFuseGenerationLabelPrefix(fuseLabelKey)
++	for labelKey := range node.Labels {
++		if !strings.HasPrefix(labelKey, generationLabelPrefix) {
++			continue
++		}
++		generation := strings.TrimPrefix(labelKey, generationLabelPrefix)
++		if inUseGenerations.Has(generation) {
++			continue
++		}
++		glog.Infof("Removing unused fuse generation selector %s (generation %q has no remaining user on the node)", labelKey, generation)
++		labelsToModify.Delete(labelKey)
++	}
++
++	if !runtimeInUse {
++		glog.Infof("Removing runtime fuse selector %s because no volume of the runtime remains mounted on the node", fuseLabelKey)
++		labelsToModify.Delete(fuseLabelKey)
++	}
++
++	return labelsToModify
++}
++
++// resolveFuseVolumeReference maps a staged CSI volume ID to the fuse selector reference it
++// requires. A nil reference with nil error means the volume does not belong to Fluid (or its
++// PV/PVC is definitively gone) and must be ignored. Every other lookup error is surfaced so the
++// caller can fail closed instead of cleaning selectors based on unknown occupancy.
++func (ns *nodeServer) resolveFuseVolumeReference(volumeID string) (*fuseVolumeReference, error) {
++	pv, err := kubeclient.GetPersistentVolume(ns.apiReader, volumeID)
++	if err != nil {
++		if apierrs.IsNotFound(err) {
++			glog.Warningf("Staged volume %s has no PersistentVolume anymore, skip it while reconciling fuse references", volumeID)
++			return nil, nil
++		}
++		return nil, errors.Wrapf(err, "failed to get PersistentVolume %s", volumeID)
++	}
++
++	if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != common.CSIDriver {
++		return nil, nil
++	}
++
++	if pv.Spec.ClaimRef == nil {
++		return nil, errors.Errorf("PersistentVolume %s has an unexpected nil claimRef", volumeID)
++	}
++
++	pvc, err := kubeclient.GetPersistentVolumeClaim(ns.apiReader, pv.Spec.ClaimRef.Name, pv.Spec.ClaimRef.Namespace)
++	if err != nil {
++		if apierrs.IsNotFound(err) {
++			glog.Warningf("Staged volume %s has no PersistentVolumeClaim anymore, skip it while reconciling fuse references", volumeID)
++			return nil, nil
++		}
++		return nil, errors.Wrapf(err, "failed to get PersistentVolumeClaim %s/%s", pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name)
++	}
++
++	fuseLabelKey := ""
++	if pv.Spec.CSI.VolumeAttributes != nil {
++		fuseLabelKey = pv.Spec.CSI.VolumeAttributes[common.VolumeAttrMountPodNodeSelectorKey]
++	}
++	if len(fuseLabelKey) == 0 {
++		// Backward compatibility for PVs created before the node selector key was carried in the
++		// PV's volume attributes: derive the key from the runtime info.
++		runtimeInfo, runtimeErr := base.GetRuntimeInfo(ns.client, pvc.Name, pvc.Namespace)
++		if runtimeErr != nil {
++			if utils.IgnoreNotFound(runtimeErr) == nil {
++				glog.Warningf("Runtime of staged volume %s (%s/%s) is not found, skip it while reconciling fuse references", volumeID, pvc.Namespace, pvc.Name)
++				return nil, nil
++			}
++			return nil, errors.Wrapf(runtimeErr, "failed to resolve fuse label key for volume %s", volumeID)
++		}
++		fuseLabelKey = runtimeInfo.GetFuseLabelName()
++	}
++
++	generation := ""
++	if pvc.Labels != nil {
++		generation = pvc.Labels[common.LabelRuntimeFuseGeneration]
++	}
++
++	return &fuseVolumeReference{
++		volumeID:     volumeID,
++		fuseLabelKey: fuseLabelKey,
++		generation:   generation,
++	}, nil
++}
++
++// getVolumeFuseGeneration returns the FUSE generation the given runtime's volume is currently
++// associated with. An empty generation means the volume predates FUSE generation tracking and
++// must keep the legacy, generation-agnostic behavior.
++func (ns *nodeServer) getVolumeFuseGeneration(namespace, name string) (string, error) {
++	pvc, err := kubeclient.GetPersistentVolumeClaim(ns.apiReader, name, namespace)
++	if err != nil {
++		return "", errors.Wrapf(err, "failed to get PersistentVolumeClaim %s/%s to resolve fuse generation", namespace, name)
++	}
++	if pvc.Labels == nil {
++		return "", nil
++	}
++	return pvc.Labels[common.LabelRuntimeFuseGeneration], nil
++}
++
++// acquireRuntimeFuseLock serializes all Stage/Unstage reconciliations targeting the same runtime
++// fuse selector on the node, so interleaved operations of multiple volumes of one runtime cannot
++// compute label diffs against a concurrently changing node. The returned function releases the
++// lock.
++func (ns *nodeServer) acquireRuntimeFuseLock(fuseLabelKey string) (func(), error) {
++	if ns.runtimeLocks == nil {
++		// Defensive fallback for constructions outside the driver wiring; the per-volume lock is
++		// still held by the callers.
++		glog.Warningf("Runtime fuse lock set is not initialized, proceed without runtime-level locking for selector %s", fuseLabelKey)
++		return func() {}, nil
++	}
++	if !ns.runtimeLocks.TryAcquire(fuseLabelKey) {
++		return nil, status.Errorf(codes.Aborted, "another Stage/Unstage operation on runtime fuse selector %s is in progress", fuseLabelKey)
++	}
++	return func() { ns.runtimeLocks.Release(fuseLabelKey) }, nil
++}
++
++// patchNodeLabelsWithRetry applies a label mutation to the node with conflict retries. The node is
++// re-fetched and the mutation is re-evaluated on every attempt, which makes both patch conflicts
++// and retries after transient failures converge to the state implied by the latest node object.
++func (ns *nodeServer) patchNodeLabelsWithRetry(buildLabels func(node *corev1.Node) (common.LabelsToModify, error)) error {
++	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++		// Invalidate the cached node so every attempt observes the latest label set.
++		ns.node = nil
++		node, err := ns.getNode()
++		if err != nil {
++			return errors.Wrapf(err, "can't get node %s", ns.nodeId)
++		}
++
++		labelsToModify, err := buildLabels(node)
++		if err != nil {
++			return err
++		}
++		if len(labelsToModify.GetLabels()) == 0 {
++			glog.V(3).Infof("No node label change is needed on node %s, skip patching", ns.nodeId)
++			return nil
++		}
++
++		if err := ns.patchNodeWithLabel(node, labelsToModify); err != nil {
++			return errors.Wrapf(err, "error when patching labels on node %s", ns.nodeId)
++		}
++		return nil
++	})
++}
+diff --git a/pkg/csi/plugins/nodeserver.go b/pkg/csi/plugins/nodeserver.go
+index dab6ddd..91b66fe 100644
+--- a/pkg/csi/plugins/nodeserver.go
++++ b/pkg/csi/plugins/nodeserver.go
+@@ -61,7 +61,11 @@ type nodeServer struct {
+ 	apiReader            client.Reader
+ 	nodeAuthorizedClient *kubernetes.Clientset
+ 	locks                *utils.VolumeLocks
+-	node                 *corev1.Node
++	// runtimeLocks serializes Stage/Unstage label reconciliations that target the same runtime
++	// fuse selector, so interleaved operations of multiple volumes of one runtime never compute
++	// label diffs against a concurrently changing node.
++	runtimeLocks *utils.VolumeLocks
++	node         *corev1.Node
+ }
+ 
+ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+@@ -375,23 +379,27 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
+ 		fuseLabelKey = runtimeInfo.GetFuseLabelName()
+ 	}
+ 
+-	var labelsToModify common.LabelsToModify
+-	labelsToModify.Add(fuseLabelKey, "true")
+-
+-	node, err := ns.getNode()
++	// 5. Resolve the FUSE generation this volume is created against. A volume without the
++	// generation label keeps the legacy behavior that only publishes the runtime-level selector.
++	generation, err := ns.getVolumeFuseGeneration(namespace, name)
+ 	if err != nil {
+-		glog.Errorf("NodeStageVolume: can't get node %s: %v", ns.nodeId, err)
+-		return nil, errors.Wrapf(err, "NodeStageVolume: can't get node %s", ns.nodeId)
++		glog.Errorf("NodeStageVolume: failed to resolve fuse generation for runtime %s/%s: %v", namespace, name, err)
++		return nil, errors.Wrapf(err, "NodeStageVolume: failed to resolve fuse generation for runtime %s/%s", namespace, name)
+ 	}
+ 
+-	// _, err = utils.ChangeNodeLabelWithPatchMode(ns.client, node, labelsToModify)
+-	err = ns.patchNodeWithLabel(node, labelsToModify)
+-	if err != nil {
+-		glog.Errorf("NodeStageVolume: error when patching labels on node %s: %v", ns.nodeId, err)
+-		return nil, errors.Wrapf(err, "NodeStageVolume: error when patching labels on node %s", ns.nodeId)
++	// Publish both the runtime selector and the generation-scoped selector. The operation is
++	// idempotent and conflict-retrying, so concurrent Stage/Unstage calls converge safely.
++	ref := fuseVolumeReference{
++		volumeID:     volumeId,
++		fuseLabelKey: fuseLabelKey,
++		generation:   generation,
++	}
++	if err = ns.publishFuseGenerationReferences(ref); err != nil {
++		glog.Errorf("NodeStageVolume: error when publishing fuse references on node %s: %v", ns.nodeId, err)
++		return nil, errors.Wrapf(err, "NodeStageVolume: error when publishing fuse references on node %s", ns.nodeId)
+ 	}
+ 
+-	glog.Infof("NodeStageVolume: NodeStage succeeded with VolumeId: %s, and added NodeLabel: %s", volumeId, fuseLabelKey)
++	glog.Infof("NodeStageVolume: NodeStage succeeded with VolumeId: %s, and added NodeLabel: %s, generation: %q", volumeId, fuseLabelKey, generation)
+ 	return &csi.NodeStageVolumeResponse{}, nil
+ }
+ 
+@@ -757,20 +765,17 @@ func (ns *nodeServer) getCleanFuseFunc(volumeId string) (func() error, error) {
+ 			fuseLabelKey = runtimeInfo.GetFuseLabelName()
+ 		}
+ 
+-		// remove label on node
+-		// Once the label is removed, fuse pod on corresponding node will be terminated because node selector in the fuse daemonSet no longer matches.
+-		var labelsToModify common.LabelsToModify
+-		labelsToModify.Delete(fuseLabelKey)
+-
+-		node, err := ns.getNode()
+-		if err != nil {
+-			glog.Errorf("NodeUnstageVolume: can't get node %s: %v", ns.nodeId, err)
+-			return errors.Wrapf(err, "NodeUnstageVolume: can't get node %s", ns.nodeId)
++		// Converge the node's fuse selector labels to the actual mount set instead of deleting the
++		// runtime selector unconditionally. A generation selector is removed only when no staged
++		// volume on the node still references that generation, so volumes of the same runtime on
++		// other generations keep their FUSE and stale generations are reclaimed once idle.
++		ref := fuseVolumeReference{
++			volumeID:     volumeId,
++			fuseLabelKey: fuseLabelKey,
++			generation:   latestFuseGeneration,
+ 		}
+-
+-		if err := ns.patchNodeWithLabel(node, labelsToModify); err != nil {
+-			glog.Errorf("NodeUnstageVolume: error when patching labels on node %s: %v", ns.nodeId, err)
+-			return errors.Wrapf(err, "NodeUnstageVolume: error when patching labels on node %s", ns.nodeId)
++		if err := ns.reconcileFuseGenerationReferences(ref); err != nil {
++			return errors.Wrapf(err, "NodeUnstageVolume: failed to reconcile fuse references for volume %s", volumeId)
+ 		}
+ 
+ 		return nil
+diff --git a/pkg/csi/plugins/nodeserver_test.go b/pkg/csi/plugins/nodeserver_test.go
+index 1fce98b..7d30e87 100644
+--- a/pkg/csi/plugins/nodeserver_test.go
++++ b/pkg/csi/plugins/nodeserver_test.go
+@@ -38,12 +38,16 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
+ 	corev1 "k8s.io/api/core/v1"
++	apierrs "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/utils/mount"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++
++	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
+ )
+ 
+ var _ = Describe("NodeServer", func() {
+@@ -89,6 +93,7 @@ var _ = Describe("NodeServer", func() {
+ 			apiReader:            mockAPIReader,
+ 			nodeAuthorizedClient: nil,
+ 			locks:                utils.NewVolumeLocks(),
++			runtimeLocks:         utils.NewVolumeLocks(),
+ 			node:                 nil,
+ 		}
+ 
+@@ -661,6 +666,7 @@ var _ = Describe("NodeServer", func() {
+ 		var (
+ 			testDataset *v1alpha1.Dataset
+ 			testRuntime *v1alpha1.AlluxioRuntime
++			testPVC     *corev1.PersistentVolumeClaim
+ 		)
+ 
+ 		BeforeEach(func() {
+@@ -678,9 +684,18 @@ var _ = Describe("NodeServer", func() {
+ 				},
+ 			}
+ 
++			// A legacy PVC without the fuse generation label, so NodeStage keeps the legacy
++			// behavior of publishing only the runtime-level fuse selector.
++			testPVC = &corev1.PersistentVolumeClaim{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      testName,
++					Namespace: testNamespace,
++				},
++			}
++
+ 			mockClient = fake.NewClientBuilder().
+ 				WithScheme(scheme).
+-				WithObjects(testNode, testDataset, testRuntime).
++				WithObjects(testNode, testDataset, testRuntime, testPVC).
+ 				Build()
+ 
+ 			ns.client = mockClient
+@@ -750,6 +765,47 @@ var _ = Describe("NodeServer", func() {
+ 			})
+ 		})
+ 
++		Context("when the volume requires a specific fuse generation", func() {
++			It("should publish both the runtime selector and the generation-scoped selector", func() {
++				fuseLabelKey := "fluid.io/f-default-test-dataset"
++				generation := "2"
++				generationLabelKey, err := utils.GetFuseGenerationLabelName(fuseLabelKey, generation)
++				Expect(err).NotTo(HaveOccurred())
++
++				generationPVC := &corev1.PersistentVolumeClaim{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      testName,
++						Namespace: testNamespace,
++						Labels: map[string]string{
++							common.LabelRuntimeFuseGeneration: generation,
++						},
++					},
++				}
++				Expect(mockClient.Update(context.Background(), generationPVC)).To(Succeed())
++
++				req := &csi.NodeStageVolumeRequest{
++					VolumeId: testVolumeID,
++					VolumeContext: map[string]string{
++						common.VolumeAttrName:                    testName,
++						common.VolumeAttrNamespace:               testNamespace,
++						common.VolumeAttrFluidPath:               testFluidPath,
++						common.VolumeAttrMountPodNodeSelectorKey: fuseLabelKey,
++					},
++				}
++
++				resp, err := ns.NodeStageVolume(context.Background(), req)
++
++				Expect(err).NotTo(HaveOccurred())
++				Expect(resp).NotTo(BeNil())
++
++				updatedNode := &corev1.Node{}
++				err = mockClient.Get(context.Background(), types.NamespacedName{Name: "test-node"}, updatedNode)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(updatedNode.Labels).To(HaveKeyWithValue(fuseLabelKey, "true"))
++				Expect(updatedNode.Labels).To(HaveKeyWithValue(generationLabelKey, "true"))
++			})
++		})
++
+ 		Context("when fuse label key is not provided", func() {
+ 			It("should fall back to runtime info to label the node", func() {
+ 				tempDir, err := os.MkdirTemp("", "node-stage-fallback-*")
+@@ -1617,6 +1673,12 @@ var _ = Describe("NodeServer", func() {
+ 				})
+ 				defer commandPatch.Reset()
+ 
++				// No staged CSI volume remains on the node, so the runtime selector is safe to remove.
++				mountSetPatch := gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
++					return sets.New[string](), nil
++				})
++				defer mountSetPatch.Reset()
++
+ 				cleanFunc, err := ns.getCleanFuseFunc(testVolumeID)
+ 				Expect(err).NotTo(HaveOccurred())
+ 				Expect(cleanFunc).NotTo(BeNil())
+@@ -1628,6 +1690,63 @@ var _ = Describe("NodeServer", func() {
+ 				Expect(err).NotTo(HaveOccurred())
+ 				Expect(nodeAfterCleanup.Labels).NotTo(HaveKey("test-fuse-label"))
+ 			})
++
++			It("should keep the fuse selector when another volume of the same runtime is still mounted", func() {
++				// A second volume of the same runtime and generation remains staged on the node.
++				secondVolumeID := "test-volume-id-2"
++				secondPVC := &corev1.PersistentVolumeClaim{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test-dataset-2",
++						Namespace: testNamespace,
++						Labels: map[string]string{
++							common.LabelRuntimeFuseGeneration: "v1",
++						},
++					},
++				}
++				secondPV := &corev1.PersistentVolume{
++					ObjectMeta: metav1.ObjectMeta{Name: secondVolumeID},
++					Spec: corev1.PersistentVolumeSpec{
++						ClaimRef: &corev1.ObjectReference{Namespace: testNamespace, Name: "test-dataset-2"},
++						PersistentVolumeSource: corev1.PersistentVolumeSource{
++							CSI: &corev1.CSIPersistentVolumeSource{
++								Driver:       common.CSIDriver,
++								VolumeHandle: secondVolumeID,
++								VolumeAttributes: map[string]string{
++									common.VolumeAttrMountPodNodeSelectorKey: "test-fuse-label",
++								},
++							},
++						},
++					},
++				}
++				Expect(mockClient.Create(context.Background(), secondPVC)).To(Succeed())
++				Expect(mockClient.Create(context.Background(), secondPV)).To(Succeed())
++
++				updatedNode := testNode.DeepCopy()
++				updatedNode.Labels["test-fuse-label"] = "true"
++				Expect(mockClient.Update(context.Background(), updatedNode)).To(Succeed())
++
++				// The volume being unstaged itself is no longer mounted, but the second volume is.
++				commandPatch := gomonkey.ApplyFunc(cmdguard.Command, func(name string, arg ...string) (*exec.Cmd, error) {
++					return exec.Command("sh", "-c", "exit 1"), nil
++				})
++				defer commandPatch.Reset()
++				mountSetPatch := gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
++					return sets.New[string](secondVolumeID), nil
++				})
++				defer mountSetPatch.Reset()
++
++				cleanFunc, err := ns.getCleanFuseFunc(testVolumeID)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(cleanFunc).NotTo(BeNil())
++
++				Expect(cleanFunc()).To(Succeed())
++
++				nodeAfterCleanup := &corev1.Node{}
++				err = mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, nodeAfterCleanup)
++				Expect(err).NotTo(HaveOccurred())
++				// The other volume still needs the runtime FUSE, so the selector must survive.
++				Expect(nodeAfterCleanup.Labels).To(HaveKeyWithValue("test-fuse-label", "true"))
++			})
+ 		})
+ 
+ 		Context("when clean policy is OnRuntimeDeleted", func() {
+@@ -1709,4 +1828,294 @@ var _ = Describe("NodeServer", func() {
+ 			})
+ 		})
+ 	})
++
++	Describe("fuse generation reference reconciliation", func() {
++		const (
++			fuseLabelKeyA = "fluid.io/f-default-runtime-a"
++			fuseLabelKeyB = "fluid.io/f-default-runtime-b"
++		)
++
++		var (
++			gen1LabelA string
++			gen2LabelA string
++			gen1LabelB string
++		)
++
++		BeforeEach(func() {
++			var err error
++			gen1LabelA, err = utils.GetFuseGenerationLabelName(fuseLabelKeyA, "1")
++			Expect(err).NotTo(HaveOccurred())
++			gen2LabelA, err = utils.GetFuseGenerationLabelName(fuseLabelKeyA, "2")
++			Expect(err).NotTo(HaveOccurred())
++			gen1LabelB, err = utils.GetFuseGenerationLabelName(fuseLabelKeyB, "1")
++			Expect(err).NotTo(HaveOccurred())
++		})
++
++		// addFluidVolume creates a Fluid PV/PVC pair with the given fuse selector and generation.
++		// An empty generation models a legacy volume that predates fuse generation tracking.
++		addFluidVolume := func(volumeID, pvcName, selectorKey, generation string) {
++			pv := &corev1.PersistentVolume{
++				ObjectMeta: metav1.ObjectMeta{Name: volumeID},
++				Spec: corev1.PersistentVolumeSpec{
++					ClaimRef: &corev1.ObjectReference{Namespace: testNamespace, Name: pvcName},
++					PersistentVolumeSource: corev1.PersistentVolumeSource{
++						CSI: &corev1.CSIPersistentVolumeSource{
++							Driver:       common.CSIDriver,
++							VolumeHandle: volumeID,
++							VolumeAttributes: map[string]string{
++								common.VolumeAttrMountPodNodeSelectorKey: selectorKey,
++							},
++						},
++					},
++				},
++			}
++
++			pvcLabels := map[string]string{}
++			if len(generation) > 0 {
++				pvcLabels[common.LabelRuntimeFuseGeneration] = generation
++			}
++			pvc := &corev1.PersistentVolumeClaim{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:      pvcName,
++					Namespace: testNamespace,
++					Labels:    pvcLabels,
++				},
++			}
++
++			Expect(mockClient.Create(context.Background(), pv)).To(Succeed())
++			Expect(mockClient.Create(context.Background(), pvc)).To(Succeed())
++		}
++
++		patchMountedVolumes := func(ids ...string) *gomonkey.Patches {
++			return gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
++				return sets.New[string](ids...), nil
++			})
++		}
++
++		setNodeLabels := func(labels map[string]string) {
++			node := &corev1.Node{}
++			Expect(mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, node)).To(Succeed())
++			node.Labels = labels
++			Expect(mockClient.Update(context.Background(), node)).To(Succeed())
++			ns.node = nil
++		}
++
++		getNodeLabels := func() map[string]string {
++			node := &corev1.Node{}
++			Expect(mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, node)).To(Succeed())
++			return node.Labels
++		}
++
++		It("publishes only the runtime selector for a legacy volume", func() {
++			err := ns.publishFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-legacy",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "",
++			})
++			Expect(err).NotTo(HaveOccurred())
++
++			labels := getNodeLabels()
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++			Expect(labels).NotTo(HaveKey(gen1LabelA))
++		})
++
++		It("publishes runtime and generation selectors and stays idempotent", func() {
++			ref := fuseVolumeReference{volumeID: "vol-a1", fuseLabelKey: fuseLabelKeyA, generation: "1"}
++
++			Expect(ns.publishFuseGenerationReferences(ref)).To(Succeed())
++			Expect(ns.publishFuseGenerationReferences(ref)).To(Succeed())
++
++			labels := getNodeLabels()
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
++		})
++
++		It("removes every selector of the runtime when no staged volume remains", func() {
++			setNodeLabels(map[string]string{
++				"test-label":  "test-value",
++				fuseLabelKeyA: "true",
++				gen1LabelA:    "true",
++			})
++			mountPatch := patchMountedVolumes()
++			defer mountPatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).NotTo(HaveOccurred())
++
++			labels := getNodeLabels()
++			Expect(labels).NotTo(HaveKey(fuseLabelKeyA))
++			Expect(labels).NotTo(HaveKey(gen1LabelA))
++			Expect(labels).To(HaveKey("test-label"))
++		})
++
++		It("keeps a generation selector while another volume of the same generation remains mounted", func() {
++			addFluidVolume("vol-a2", "pvc-a2", fuseLabelKeyA, "1")
++			setNodeLabels(map[string]string{fuseLabelKeyA: "true", gen1LabelA: "true"})
++			mountPatch := patchMountedVolumes("vol-a2")
++			defer mountPatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).NotTo(HaveOccurred())
++
++			labels := getNodeLabels()
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
++		})
++
++		It("removes an idle old generation selector without interrupting the new generation", func() {
++			addFluidVolume("vol-a-new", "pvc-a-new", fuseLabelKeyA, "2")
++			setNodeLabels(map[string]string{
++				fuseLabelKeyA: "true",
++				gen1LabelA:    "true",
++				gen2LabelA:    "true",
++			})
++			mountPatch := patchMountedVolumes("vol-a-new")
++			defer mountPatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a-old",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).NotTo(HaveOccurred())
++
++			labels := getNodeLabels()
++			Expect(labels).NotTo(HaveKey(gen1LabelA))
++			Expect(labels).To(HaveKeyWithValue(gen2LabelA, "true"))
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++		})
++
++		It("keeps the runtime selector when a legacy volume of the runtime remains mounted", func() {
++			addFluidVolume("vol-legacy", "pvc-legacy", fuseLabelKeyA, "")
++			setNodeLabels(map[string]string{
++				fuseLabelKeyA: "true",
++				gen1LabelA:    "true",
++			})
++			mountPatch := patchMountedVolumes("vol-legacy")
++			defer mountPatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).NotTo(HaveOccurred())
++
++			labels := getNodeLabels()
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++			Expect(labels).NotTo(HaveKey(gen1LabelA))
++		})
++
++		It("only touches selectors of the targeted runtime", func() {
++			addFluidVolume("vol-b1", "pvc-b1", fuseLabelKeyB, "1")
++			setNodeLabels(map[string]string{
++				fuseLabelKeyA: "true",
++				gen1LabelA:    "true",
++				fuseLabelKeyB: "true",
++				gen1LabelB:    "true",
++			})
++			mountPatch := patchMountedVolumes("vol-b1")
++			defer mountPatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).NotTo(HaveOccurred())
++
++			labels := getNodeLabels()
++			// Runtime A has no user left and must be fully reclaimed.
++			Expect(labels).NotTo(HaveKey(fuseLabelKeyA))
++			Expect(labels).NotTo(HaveKey(gen1LabelA))
++			// Runtime B still has a mounted volume and must stay untouched.
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyB, "true"))
++			Expect(labels).To(HaveKeyWithValue(gen1LabelB, "true"))
++		})
++
++		It("aborts without node changes when mount set discovery fails", func() {
++			originalLabels := map[string]string{fuseLabelKeyA: "true", gen1LabelA: "true"}
++			setNodeLabels(originalLabels)
++			failurePatch := gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
++				return nil, errors.New("mountinfo temporarily unavailable")
++			})
++			defer failurePatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).To(HaveOccurred())
++			Expect(status.Code(err)).To(Equal(codes.Internal))
++			Expect(getNodeLabels()).To(Equal(originalLabels))
++		})
++
++		It("aborts without node changes when a staged volume's ownership cannot be resolved", func() {
++			setNodeLabels(map[string]string{fuseLabelKeyA: "true", gen1LabelA: "true"})
++			mountPatch := patchMountedVolumes("vol-unknown")
++			defer mountPatch.Reset()
++			apiFailurePatch := gomonkey.ApplyFunc(kubeclient.GetPersistentVolume, func(client.Reader, string) (*corev1.PersistentVolume, error) {
++				return nil, apierrs.NewInternalError(errors.New("api server unavailable"))
++			})
++			defer apiFailurePatch.Reset()
++
++			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).To(HaveOccurred())
++			// Unknown occupancy must never be treated as safe to clean.
++			labels := getNodeLabels()
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
++		})
++
++		It("cleans stale generation labels and converges idempotently when retried", func() {
++			addFluidVolume("vol-a1", "pvc-a1", fuseLabelKeyA, "1")
++			setNodeLabels(map[string]string{
++				fuseLabelKeyA: "true",
++				gen1LabelA:    "true",
++				gen2LabelA:    "true",
++			})
++			mountPatch := patchMountedVolumes("vol-a1")
++			defer mountPatch.Reset()
++
++			ref := fuseVolumeReference{volumeID: "vol-a2", fuseLabelKey: fuseLabelKeyA, generation: "2"}
++			Expect(ns.reconcileFuseGenerationReferences(ref)).To(Succeed())
++			// Re-running after a CSI restart or a transient failure must not change anything.
++			Expect(ns.reconcileFuseGenerationReferences(ref)).To(Succeed())
++
++			labels := getNodeLabels()
++			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
++			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
++			Expect(labels).NotTo(HaveKey(gen2LabelA))
++		})
++
++		It("returns Aborted when another reconciliation holds the runtime fuse lock", func() {
++			mountPatch := patchMountedVolumes()
++			defer mountPatch.Reset()
++
++			release, err := ns.acquireRuntimeFuseLock(fuseLabelKeyA)
++			Expect(err).NotTo(HaveOccurred())
++			defer release()
++
++			err = ns.reconcileFuseGenerationReferences(fuseVolumeReference{
++				volumeID:     "vol-a1",
++				fuseLabelKey: fuseLabelKeyA,
++				generation:   "1",
++			})
++			Expect(err).To(HaveOccurred())
++			Expect(status.Code(err)).To(Equal(codes.Aborted))
++		})
++	})
+ })
+diff --git a/pkg/csi/plugins/subpath_linux.go b/pkg/csi/plugins/subpath_linux.go
+index 6b90c1b..480b9a1 100644
+--- a/pkg/csi/plugins/subpath_linux.go
++++ b/pkg/csi/plugins/subpath_linux.go
+@@ -20,13 +20,43 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ 	"strings"
+ 	"syscall"
+ 
+ 	"github.com/pkg/errors"
+ 	"golang.org/x/sys/unix"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/utils/mount"
+ )
+ 
++// csiStageMountPointRegex matches the kubelet CSI publish mount point
++// "<kubeletRoot>/pods/<podUID>/volumes/kubernetes.io~csi/<volumeID>/mount" and captures the
++// CSI volume ID, which is the PV name in Fluid.
++var csiStageMountPointRegex = regexp.MustCompile(`kubernetes\.io~csi/([^/]+)/mount(?:/|$)`)
++
++// listStagedCSIVolumeIDs inspects /proc/self/mountinfo and returns the distinct set of CSI volume
++// IDs whose kubelet publish mount point is still present on the node. The result is the node's
++// actual mount set, which is reconstructable at any time (including after a CSI plugin restart)
++// and is therefore the ground truth for generation reference counting. Any failure to read the
++// mount info is returned as an error so callers never mistake an unknown state for "no users".
++func listStagedCSIVolumeIDs() (sets.Set[string], error) {
++	mountInfos, err := mount.ParseMountInfo("/proc/self/mountinfo")
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to parse /proc/self/mountinfo to list staged CSI volumes")
++	}
++
++	volumeIDs := sets.New[string]()
++	for i := range mountInfos {
++		matches := csiStageMountPointRegex.FindStringSubmatch(mountInfos[i].MountPoint)
++		if len(matches) != 2 {
++			continue
++		}
++		volumeIDs.Insert(matches[1])
++	}
++	return volumeIDs, nil
++}
++
+ // openFDFlags names a path component without following it if it turns out to be a symlink.
+ // O_PATH keeps the open cheap and side effect free: the descriptor only names the inode and is
+ // never read from. Note that O_PATH|O_NOFOLLOW does not fail on a symlink, it returns a descriptor
+diff --git a/pkg/csi/plugins/subpath_other.go b/pkg/csi/plugins/subpath_other.go
+index 95b61c9..b486cc9 100644
+--- a/pkg/csi/plugins/subpath_other.go
++++ b/pkg/csi/plugins/subpath_other.go
+@@ -25,9 +25,17 @@ import (
+ 	"strings"
+ 
+ 	"github.com/pkg/errors"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/utils/mount"
+ )
+ 
++// listStagedCSIVolumeIDs is only available on Linux where the CSI plugin runs. Returning an error
++// instead of an empty set keeps non-Linux builds from treating an unknowable mount state as safe
++// for cleaning up fuse selectors.
++func listStagedCSIVolumeIDs() (sets.Set[string], error) {
++	return nil, fmt.Errorf("listing staged CSI volumes from /proc/self/mountinfo is only supported on Linux")
++}
++
+ // resolveMountSource resolves subPath below base and returns the bind mount source.
+ //
+ // The CSI plugin only runs on Linux; this build exists so the package stays buildable and testable
+diff --git a/pkg/utils/label.go b/pkg/utils/label.go
+index 1c6a89d..2aac047 100644
+--- a/pkg/utils/label.go
++++ b/pkg/utils/label.go
+@@ -20,6 +20,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"strings"
++
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
+ 	"github.com/pkg/errors"
+ 	v1 "k8s.io/api/core/v1"
+@@ -155,6 +157,59 @@ func GetFuseLabelName(namespace, name, ownerDatasetUID string) string {
+ 	return GetNamespacedNameValueWithPrefix(common.LabelAnnotationFusePrefix, namespace, name, ownerDatasetUID)
+ }
+ 
++// FuseGenerationLabelSeparator is inserted between a runtime's fuse node selector label name and
++// its fuse generation to build the generation-scoped selector label.
++const FuseGenerationLabelSeparator = "-gen-"
++
++// GetFuseGenerationLabelName builds the generation-scoped node selector label for a fuse runtime.
++// For example, GetFuseGenerationLabelName("fluid.io/f-default-test", "2") results in
++// "fluid.io/f-default-test-gen-2". The generation-scoped label allows the old and new generations
++// of a runtime FUSE to be referenced independently on the same node during a rolling template
++// switch. An error is returned when the resulting label key is not a qualified Kubernetes label
++// key, so an unexpected generation value can never produce an invalid node patch.
++func GetFuseGenerationLabelName(fuseLabelKey, generation string) (string, error) {
++	if len(fuseLabelKey) == 0 || len(generation) == 0 {
++		return "", errors.Errorf("fuseLabelKey and generation must not be empty, got fuseLabelKey=%q generation=%q", fuseLabelKey, generation)
++	}
++
++	prefix, name := "", fuseLabelKey
++	if parts := strings.SplitN(fuseLabelKey, "/", 2); len(parts) == 2 {
++		prefix, name = parts[0], parts[1]
++	}
++
++	generationLabelName := name + FuseGenerationLabelSeparator + generation
++	if len(prefix) > 0 {
++		if errs := validation.IsDNS1123Subdomain(prefix); len(errs) > 0 {
++			return "", errors.Errorf("invalid label prefix %q derived from fuse label key %q: %v", prefix, fuseLabelKey, errs)
++		}
++	}
++	if errs := validation.IsDNS1123Label(generationLabelName); len(errs) > 0 {
++		return "", errors.Errorf("invalid generation label name %q derived from fuse label key %q: %v", generationLabelName, fuseLabelKey, errs)
++	}
++
++	if len(prefix) > 0 {
++		return prefix + "/" + generationLabelName, nil
++	}
++	return generationLabelName, nil
++}
++
++// GetFuseGenerationLabelPrefix returns the key prefix shared by every generation-scoped selector
++// label of the given runtime fuse label key. It is used to recognize the generation labels a node
++// already carries, e.g. "fluid.io/f-default-test-gen-" for the fuse label key
++// "fluid.io/f-default-test". The generation is the suffix of a matching label key.
++func GetFuseGenerationLabelPrefix(fuseLabelKey string) string {
++	prefix, name := "", fuseLabelKey
++	if parts := strings.SplitN(fuseLabelKey, "/", 2); len(parts) == 2 {
++		prefix, name = parts[0], parts[1]
++	}
++
++	generationLabelNamePrefix := name + FuseGenerationLabelSeparator
++	if len(prefix) > 0 {
++		return prefix + "/" + generationLabelNamePrefix
++	}
++	return generationLabelNamePrefix
++}
++
+ func GetExclusiveKey() string {
+ 	return common.FluidExclusiveKey
+ }
+diff --git a/pkg/utils/label_test.go b/pkg/utils/label_test.go
+index 6166a1e..f2ef9df 100644
+--- a/pkg/utils/label_test.go
++++ b/pkg/utils/label_test.go
+@@ -199,3 +199,86 @@ func TestGetFullNamespacedNameWithPrefixValue(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestGetFuseGenerationLabelName(t *testing.T) {
++	tests := []struct {
++		name         string
++		fuseLabelKey string
++		generation   string
++		expected     string
++		expectErr    bool
++	}{
++		{
++			name:         "prefixed fuse label key with numeric generation",
++			fuseLabelKey: "fluid.io/f-default-test-dataset",
++			generation:   "2",
++			expected:     "fluid.io/f-default-test-dataset-gen-2",
++		},
++		{
++			name:         "prefixed fuse label key with letter generation",
++			fuseLabelKey: "fluid.io/f-default-test-dataset",
++			generation:   "v1",
++			expected:     "fluid.io/f-default-test-dataset-gen-v1",
++		},
++		{
++			name:         "fuse label key without prefix",
++			fuseLabelKey: "f-default-test-dataset",
++			generation:   "1",
++			expected:     "f-default-test-dataset-gen-1",
++		},
++		{
++			name:         "empty fuse label key returns error",
++			fuseLabelKey: "",
++			generation:   "1",
++			expectErr:    true,
++		},
++		{
++			name:         "empty generation returns error",
++			fuseLabelKey: "fluid.io/f-default-test-dataset",
++			generation:   "",
++			expectErr:    true,
++		},
++		{
++			name:         "generation with illegal label characters returns error",
++			fuseLabelKey: "fluid.io/f-default-test-dataset",
++			generation:   "1_2",
++			expectErr:    true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := GetFuseGenerationLabelName(tt.fuseLabelKey, tt.generation)
++			if tt.expectErr && err == nil {
++				t.Fatalf("expected an error, got label %q", got)
++			}
++			if !tt.expectErr && err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if !tt.expectErr && got != tt.expected {
++				t.Errorf("GetFuseGenerationLabelName(%q, %q) = %q, want %q", tt.fuseLabelKey, tt.generation, got, tt.expected)
++			}
++		})
++	}
++}
++
++func TestGetFuseGenerationLabelPrefix(t *testing.T) {
++	tests := []struct {
++		fuseLabelKey string
++		generation   string
++	}{
++		{"fluid.io/f-default-test-dataset", "2"},
++		{"f-default-test-dataset", "1"},
++	}
++
++	for _, tt := range tests {
++		prefix := GetFuseGenerationLabelPrefix(tt.fuseLabelKey)
++		generationLabel, err := GetFuseGenerationLabelName(tt.fuseLabelKey, tt.generation)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++		if prefix+tt.generation != generationLabel {
++			t.Errorf("generation label %q cannot be reconstructed from prefix %q and generation %q", generationLabel, prefix, tt.generation)
++		}
++	}
++}

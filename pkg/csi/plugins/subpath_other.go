@@ -25,8 +25,16 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/mount"
 )
+
+// listStagedCSIVolumeIDs is only available on Linux where the CSI plugin runs. Returning an error
+// instead of an empty set keeps non-Linux builds from treating an unknowable mount state as safe
+// for cleaning up fuse selectors.
+func listStagedCSIVolumeIDs() (sets.Set[string], error) {
+	return nil, fmt.Errorf("listing staged CSI volumes from /proc/self/mountinfo is only supported on Linux")
+}
 
 // resolveMountSource resolves subPath below base and returns the bind mount source.
 //

@@ -38,12 +38,16 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/mount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
 )
 
 var _ = Describe("NodeServer", func() {
@@ -89,6 +93,7 @@ var _ = Describe("NodeServer", func() {
 			apiReader:            mockAPIReader,
 			nodeAuthorizedClient: nil,
 			locks:                utils.NewVolumeLocks(),
+			runtimeLocks:         utils.NewVolumeLocks(),
 			node:                 nil,
 		}
 
@@ -661,6 +666,7 @@ var _ = Describe("NodeServer", func() {
 		var (
 			testDataset *v1alpha1.Dataset
 			testRuntime *v1alpha1.AlluxioRuntime
+			testPVC     *corev1.PersistentVolumeClaim
 		)
 
 		BeforeEach(func() {
@@ -678,9 +684,18 @@ var _ = Describe("NodeServer", func() {
 				},
 			}
 
+			// A legacy PVC without the fuse generation label, so NodeStage keeps the legacy
+			// behavior of publishing only the runtime-level fuse selector.
+			testPVC = &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testName,
+					Namespace: testNamespace,
+				},
+			}
+
 			mockClient = fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(testNode, testDataset, testRuntime).
+				WithObjects(testNode, testDataset, testRuntime, testPVC).
 				Build()
 
 			ns.client = mockClient
@@ -747,6 +762,47 @@ var _ = Describe("NodeServer", func() {
 				err = mockClient.Get(context.Background(), types.NamespacedName{Name: "test-node"}, updatedNode)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(updatedNode.Labels).To(HaveKeyWithValue(fuseLabelKey, "true"))
+			})
+		})
+
+		Context("when the volume requires a specific fuse generation", func() {
+			It("should publish both the runtime selector and the generation-scoped selector", func() {
+				fuseLabelKey := "fluid.io/f-default-test-dataset"
+				generation := "2"
+				generationLabelKey, err := utils.GetFuseGenerationLabelName(fuseLabelKey, generation)
+				Expect(err).NotTo(HaveOccurred())
+
+				generationPVC := &corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      testName,
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							common.LabelRuntimeFuseGeneration: generation,
+						},
+					},
+				}
+				Expect(mockClient.Update(context.Background(), generationPVC)).To(Succeed())
+
+				req := &csi.NodeStageVolumeRequest{
+					VolumeId: testVolumeID,
+					VolumeContext: map[string]string{
+						common.VolumeAttrName:                    testName,
+						common.VolumeAttrNamespace:               testNamespace,
+						common.VolumeAttrFluidPath:               testFluidPath,
+						common.VolumeAttrMountPodNodeSelectorKey: fuseLabelKey,
+					},
+				}
+
+				resp, err := ns.NodeStageVolume(context.Background(), req)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+
+				updatedNode := &corev1.Node{}
+				err = mockClient.Get(context.Background(), types.NamespacedName{Name: "test-node"}, updatedNode)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(updatedNode.Labels).To(HaveKeyWithValue(fuseLabelKey, "true"))
+				Expect(updatedNode.Labels).To(HaveKeyWithValue(generationLabelKey, "true"))
 			})
 		})
 
@@ -1617,6 +1673,12 @@ var _ = Describe("NodeServer", func() {
 				})
 				defer commandPatch.Reset()
 
+				// No staged CSI volume remains on the node, so the runtime selector is safe to remove.
+				mountSetPatch := gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
+					return sets.New[string](), nil
+				})
+				defer mountSetPatch.Reset()
+
 				cleanFunc, err := ns.getCleanFuseFunc(testVolumeID)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(cleanFunc).NotTo(BeNil())
@@ -1627,6 +1689,63 @@ var _ = Describe("NodeServer", func() {
 				err = mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, nodeAfterCleanup)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(nodeAfterCleanup.Labels).NotTo(HaveKey("test-fuse-label"))
+			})
+
+			It("should keep the fuse selector when another volume of the same runtime is still mounted", func() {
+				// A second volume of the same runtime and generation remains staged on the node.
+				secondVolumeID := "test-volume-id-2"
+				secondPVC := &corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-dataset-2",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							common.LabelRuntimeFuseGeneration: "v1",
+						},
+					},
+				}
+				secondPV := &corev1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{Name: secondVolumeID},
+					Spec: corev1.PersistentVolumeSpec{
+						ClaimRef: &corev1.ObjectReference{Namespace: testNamespace, Name: "test-dataset-2"},
+						PersistentVolumeSource: corev1.PersistentVolumeSource{
+							CSI: &corev1.CSIPersistentVolumeSource{
+								Driver:       common.CSIDriver,
+								VolumeHandle: secondVolumeID,
+								VolumeAttributes: map[string]string{
+									common.VolumeAttrMountPodNodeSelectorKey: "test-fuse-label",
+								},
+							},
+						},
+					},
+				}
+				Expect(mockClient.Create(context.Background(), secondPVC)).To(Succeed())
+				Expect(mockClient.Create(context.Background(), secondPV)).To(Succeed())
+
+				updatedNode := testNode.DeepCopy()
+				updatedNode.Labels["test-fuse-label"] = "true"
+				Expect(mockClient.Update(context.Background(), updatedNode)).To(Succeed())
+
+				// The volume being unstaged itself is no longer mounted, but the second volume is.
+				commandPatch := gomonkey.ApplyFunc(cmdguard.Command, func(name string, arg ...string) (*exec.Cmd, error) {
+					return exec.Command("sh", "-c", "exit 1"), nil
+				})
+				defer commandPatch.Reset()
+				mountSetPatch := gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
+					return sets.New[string](secondVolumeID), nil
+				})
+				defer mountSetPatch.Reset()
+
+				cleanFunc, err := ns.getCleanFuseFunc(testVolumeID)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(cleanFunc).NotTo(BeNil())
+
+				Expect(cleanFunc()).To(Succeed())
+
+				nodeAfterCleanup := &corev1.Node{}
+				err = mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, nodeAfterCleanup)
+				Expect(err).NotTo(HaveOccurred())
+				// The other volume still needs the runtime FUSE, so the selector must survive.
+				Expect(nodeAfterCleanup.Labels).To(HaveKeyWithValue("test-fuse-label", "true"))
 			})
 		})
 
@@ -1707,6 +1826,296 @@ var _ = Describe("NodeServer", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(inUse).To(BeFalse())
 			})
+		})
+	})
+
+	Describe("fuse generation reference reconciliation", func() {
+		const (
+			fuseLabelKeyA = "fluid.io/f-default-runtime-a"
+			fuseLabelKeyB = "fluid.io/f-default-runtime-b"
+		)
+
+		var (
+			gen1LabelA string
+			gen2LabelA string
+			gen1LabelB string
+		)
+
+		BeforeEach(func() {
+			var err error
+			gen1LabelA, err = utils.GetFuseGenerationLabelName(fuseLabelKeyA, "1")
+			Expect(err).NotTo(HaveOccurred())
+			gen2LabelA, err = utils.GetFuseGenerationLabelName(fuseLabelKeyA, "2")
+			Expect(err).NotTo(HaveOccurred())
+			gen1LabelB, err = utils.GetFuseGenerationLabelName(fuseLabelKeyB, "1")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		// addFluidVolume creates a Fluid PV/PVC pair with the given fuse selector and generation.
+		// An empty generation models a legacy volume that predates fuse generation tracking.
+		addFluidVolume := func(volumeID, pvcName, selectorKey, generation string) {
+			pv := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: volumeID},
+				Spec: corev1.PersistentVolumeSpec{
+					ClaimRef: &corev1.ObjectReference{Namespace: testNamespace, Name: pvcName},
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:       common.CSIDriver,
+							VolumeHandle: volumeID,
+							VolumeAttributes: map[string]string{
+								common.VolumeAttrMountPodNodeSelectorKey: selectorKey,
+							},
+						},
+					},
+				},
+			}
+
+			pvcLabels := map[string]string{}
+			if len(generation) > 0 {
+				pvcLabels[common.LabelRuntimeFuseGeneration] = generation
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      pvcName,
+					Namespace: testNamespace,
+					Labels:    pvcLabels,
+				},
+			}
+
+			Expect(mockClient.Create(context.Background(), pv)).To(Succeed())
+			Expect(mockClient.Create(context.Background(), pvc)).To(Succeed())
+		}
+
+		patchMountedVolumes := func(ids ...string) *gomonkey.Patches {
+			return gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
+				return sets.New[string](ids...), nil
+			})
+		}
+
+		setNodeLabels := func(labels map[string]string) {
+			node := &corev1.Node{}
+			Expect(mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, node)).To(Succeed())
+			node.Labels = labels
+			Expect(mockClient.Update(context.Background(), node)).To(Succeed())
+			ns.node = nil
+		}
+
+		getNodeLabels := func() map[string]string {
+			node := &corev1.Node{}
+			Expect(mockClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, node)).To(Succeed())
+			return node.Labels
+		}
+
+		It("publishes only the runtime selector for a legacy volume", func() {
+			err := ns.publishFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-legacy",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := getNodeLabels()
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+			Expect(labels).NotTo(HaveKey(gen1LabelA))
+		})
+
+		It("publishes runtime and generation selectors and stays idempotent", func() {
+			ref := fuseVolumeReference{volumeID: "vol-a1", fuseLabelKey: fuseLabelKeyA, generation: "1"}
+
+			Expect(ns.publishFuseGenerationReferences(ref)).To(Succeed())
+			Expect(ns.publishFuseGenerationReferences(ref)).To(Succeed())
+
+			labels := getNodeLabels()
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
+		})
+
+		It("removes every selector of the runtime when no staged volume remains", func() {
+			setNodeLabels(map[string]string{
+				"test-label":  "test-value",
+				fuseLabelKeyA: "true",
+				gen1LabelA:    "true",
+			})
+			mountPatch := patchMountedVolumes()
+			defer mountPatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := getNodeLabels()
+			Expect(labels).NotTo(HaveKey(fuseLabelKeyA))
+			Expect(labels).NotTo(HaveKey(gen1LabelA))
+			Expect(labels).To(HaveKey("test-label"))
+		})
+
+		It("keeps a generation selector while another volume of the same generation remains mounted", func() {
+			addFluidVolume("vol-a2", "pvc-a2", fuseLabelKeyA, "1")
+			setNodeLabels(map[string]string{fuseLabelKeyA: "true", gen1LabelA: "true"})
+			mountPatch := patchMountedVolumes("vol-a2")
+			defer mountPatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := getNodeLabels()
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
+		})
+
+		It("removes an idle old generation selector without interrupting the new generation", func() {
+			addFluidVolume("vol-a-new", "pvc-a-new", fuseLabelKeyA, "2")
+			setNodeLabels(map[string]string{
+				fuseLabelKeyA: "true",
+				gen1LabelA:    "true",
+				gen2LabelA:    "true",
+			})
+			mountPatch := patchMountedVolumes("vol-a-new")
+			defer mountPatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a-old",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := getNodeLabels()
+			Expect(labels).NotTo(HaveKey(gen1LabelA))
+			Expect(labels).To(HaveKeyWithValue(gen2LabelA, "true"))
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+		})
+
+		It("keeps the runtime selector when a legacy volume of the runtime remains mounted", func() {
+			addFluidVolume("vol-legacy", "pvc-legacy", fuseLabelKeyA, "")
+			setNodeLabels(map[string]string{
+				fuseLabelKeyA: "true",
+				gen1LabelA:    "true",
+			})
+			mountPatch := patchMountedVolumes("vol-legacy")
+			defer mountPatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := getNodeLabels()
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+			Expect(labels).NotTo(HaveKey(gen1LabelA))
+		})
+
+		It("only touches selectors of the targeted runtime", func() {
+			addFluidVolume("vol-b1", "pvc-b1", fuseLabelKeyB, "1")
+			setNodeLabels(map[string]string{
+				fuseLabelKeyA: "true",
+				gen1LabelA:    "true",
+				fuseLabelKeyB: "true",
+				gen1LabelB:    "true",
+			})
+			mountPatch := patchMountedVolumes("vol-b1")
+			defer mountPatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := getNodeLabels()
+			// Runtime A has no user left and must be fully reclaimed.
+			Expect(labels).NotTo(HaveKey(fuseLabelKeyA))
+			Expect(labels).NotTo(HaveKey(gen1LabelA))
+			// Runtime B still has a mounted volume and must stay untouched.
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyB, "true"))
+			Expect(labels).To(HaveKeyWithValue(gen1LabelB, "true"))
+		})
+
+		It("aborts without node changes when mount set discovery fails", func() {
+			originalLabels := map[string]string{fuseLabelKeyA: "true", gen1LabelA: "true"}
+			setNodeLabels(originalLabels)
+			failurePatch := gomonkey.ApplyFunc(listStagedCSIVolumeIDs, func() (sets.Set[string], error) {
+				return nil, errors.New("mountinfo temporarily unavailable")
+			})
+			defer failurePatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(status.Code(err)).To(Equal(codes.Internal))
+			Expect(getNodeLabels()).To(Equal(originalLabels))
+		})
+
+		It("aborts without node changes when a staged volume's ownership cannot be resolved", func() {
+			setNodeLabels(map[string]string{fuseLabelKeyA: "true", gen1LabelA: "true"})
+			mountPatch := patchMountedVolumes("vol-unknown")
+			defer mountPatch.Reset()
+			apiFailurePatch := gomonkey.ApplyFunc(kubeclient.GetPersistentVolume, func(client.Reader, string) (*corev1.PersistentVolume, error) {
+				return nil, apierrs.NewInternalError(errors.New("api server unavailable"))
+			})
+			defer apiFailurePatch.Reset()
+
+			err := ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).To(HaveOccurred())
+			// Unknown occupancy must never be treated as safe to clean.
+			labels := getNodeLabels()
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
+		})
+
+		It("cleans stale generation labels and converges idempotently when retried", func() {
+			addFluidVolume("vol-a1", "pvc-a1", fuseLabelKeyA, "1")
+			setNodeLabels(map[string]string{
+				fuseLabelKeyA: "true",
+				gen1LabelA:    "true",
+				gen2LabelA:    "true",
+			})
+			mountPatch := patchMountedVolumes("vol-a1")
+			defer mountPatch.Reset()
+
+			ref := fuseVolumeReference{volumeID: "vol-a2", fuseLabelKey: fuseLabelKeyA, generation: "2"}
+			Expect(ns.reconcileFuseGenerationReferences(ref)).To(Succeed())
+			// Re-running after a CSI restart or a transient failure must not change anything.
+			Expect(ns.reconcileFuseGenerationReferences(ref)).To(Succeed())
+
+			labels := getNodeLabels()
+			Expect(labels).To(HaveKeyWithValue(fuseLabelKeyA, "true"))
+			Expect(labels).To(HaveKeyWithValue(gen1LabelA, "true"))
+			Expect(labels).NotTo(HaveKey(gen2LabelA))
+		})
+
+		It("returns Aborted when another reconciliation holds the runtime fuse lock", func() {
+			mountPatch := patchMountedVolumes()
+			defer mountPatch.Reset()
+
+			release, err := ns.acquireRuntimeFuseLock(fuseLabelKeyA)
+			Expect(err).NotTo(HaveOccurred())
+			defer release()
+
+			err = ns.reconcileFuseGenerationReferences(fuseVolumeReference{
+				volumeID:     "vol-a1",
+				fuseLabelKey: fuseLabelKeyA,
+				generation:   "1",
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(status.Code(err)).To(Equal(codes.Aborted))
 		})
 	})
 })

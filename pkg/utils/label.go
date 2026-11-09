@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+
 	"github.com/fluid-cloudnative/fluid/pkg/common"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
@@ -153,6 +155,59 @@ func GetRuntimeLabelName(runtimeType string, namespace, name, ownerDatasetUID st
 
 func GetFuseLabelName(namespace, name, ownerDatasetUID string) string {
 	return GetNamespacedNameValueWithPrefix(common.LabelAnnotationFusePrefix, namespace, name, ownerDatasetUID)
+}
+
+// FuseGenerationLabelSeparator is inserted between a runtime's fuse node selector label name and
+// its fuse generation to build the generation-scoped selector label.
+const FuseGenerationLabelSeparator = "-gen-"
+
+// GetFuseGenerationLabelName builds the generation-scoped node selector label for a fuse runtime.
+// For example, GetFuseGenerationLabelName("fluid.io/f-default-test", "2") results in
+// "fluid.io/f-default-test-gen-2". The generation-scoped label allows the old and new generations
+// of a runtime FUSE to be referenced independently on the same node during a rolling template
+// switch. An error is returned when the resulting label key is not a qualified Kubernetes label
+// key, so an unexpected generation value can never produce an invalid node patch.
+func GetFuseGenerationLabelName(fuseLabelKey, generation string) (string, error) {
+	if len(fuseLabelKey) == 0 || len(generation) == 0 {
+		return "", errors.Errorf("fuseLabelKey and generation must not be empty, got fuseLabelKey=%q generation=%q", fuseLabelKey, generation)
+	}
+
+	prefix, name := "", fuseLabelKey
+	if parts := strings.SplitN(fuseLabelKey, "/", 2); len(parts) == 2 {
+		prefix, name = parts[0], parts[1]
+	}
+
+	generationLabelName := name + FuseGenerationLabelSeparator + generation
+	if len(prefix) > 0 {
+		if errs := validation.IsDNS1123Subdomain(prefix); len(errs) > 0 {
+			return "", errors.Errorf("invalid label prefix %q derived from fuse label key %q: %v", prefix, fuseLabelKey, errs)
+		}
+	}
+	if errs := validation.IsDNS1123Label(generationLabelName); len(errs) > 0 {
+		return "", errors.Errorf("invalid generation label name %q derived from fuse label key %q: %v", generationLabelName, fuseLabelKey, errs)
+	}
+
+	if len(prefix) > 0 {
+		return prefix + "/" + generationLabelName, nil
+	}
+	return generationLabelName, nil
+}
+
+// GetFuseGenerationLabelPrefix returns the key prefix shared by every generation-scoped selector
+// label of the given runtime fuse label key. It is used to recognize the generation labels a node
+// already carries, e.g. "fluid.io/f-default-test-gen-" for the fuse label key
+// "fluid.io/f-default-test". The generation is the suffix of a matching label key.
+func GetFuseGenerationLabelPrefix(fuseLabelKey string) string {
+	prefix, name := "", fuseLabelKey
+	if parts := strings.SplitN(fuseLabelKey, "/", 2); len(parts) == 2 {
+		prefix, name = parts[0], parts[1]
+	}
+
+	generationLabelNamePrefix := name + FuseGenerationLabelSeparator
+	if len(prefix) > 0 {
+		return prefix + "/" + generationLabelNamePrefix
+	}
+	return generationLabelNamePrefix
 }
 
 func GetExclusiveKey() string {

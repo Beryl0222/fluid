@@ -20,12 +20,42 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/mount"
 )
+
+// csiStageMountPointRegex matches the kubelet CSI publish mount point
+// "<kubeletRoot>/pods/<podUID>/volumes/kubernetes.io~csi/<volumeID>/mount" and captures the
+// CSI volume ID, which is the PV name in Fluid.
+var csiStageMountPointRegex = regexp.MustCompile(`kubernetes\.io~csi/([^/]+)/mount(?:/|$)`)
+
+// listStagedCSIVolumeIDs inspects /proc/self/mountinfo and returns the distinct set of CSI volume
+// IDs whose kubelet publish mount point is still present on the node. The result is the node's
+// actual mount set, which is reconstructable at any time (including after a CSI plugin restart)
+// and is therefore the ground truth for generation reference counting. Any failure to read the
+// mount info is returned as an error so callers never mistake an unknown state for "no users".
+func listStagedCSIVolumeIDs() (sets.Set[string], error) {
+	mountInfos, err := mount.ParseMountInfo("/proc/self/mountinfo")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse /proc/self/mountinfo to list staged CSI volumes")
+	}
+
+	volumeIDs := sets.New[string]()
+	for i := range mountInfos {
+		matches := csiStageMountPointRegex.FindStringSubmatch(mountInfos[i].MountPoint)
+		if len(matches) != 2 {
+			continue
+		}
+		volumeIDs.Insert(matches[1])
+	}
+	return volumeIDs, nil
+}
 
 // openFDFlags names a path component without following it if it turns out to be a symlink.
 // O_PATH keeps the open cheap and side effect free: the descriptor only names the inode and is
