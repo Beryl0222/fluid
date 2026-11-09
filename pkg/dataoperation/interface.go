@@ -81,3 +81,17 @@ type StatusHandler interface {
 	// GetOperationStatus get operation status according to helm chart status
 	GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus) (result *datav1alpha1.OperationStatus, err error)
 }
+
+// MultiDatasetLockOperation is an optional extension of OperationInterface implemented by data
+// operations which may occupy more than one Dataset before their workload can start. A
+// Dataset-to-Dataset DataMigrate, for example, must occupy both its source and destination
+// Datasets with the same operation identity. Operations not implementing this interface keep
+// occupying their single target Dataset only.
+type MultiDatasetLockOperation interface {
+	// GetLockTargetDatasetNamespacedNames returns the deduplicated namespaced names of all
+	// Datasets that must carry the operation's occupancy (Dataset.Status.OperationRef) before
+	// the workload starts. The names are resolved from the operation spec instead of API
+	// fetches, so a Dataset that has been deleted is still returned and its missing occupancy
+	// can be treated as released when the operation cleans up.
+	GetLockTargetDatasetNamespacedNames() []types.NamespacedName
+}

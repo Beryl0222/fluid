@@ -194,6 +194,96 @@ var _ = Describe("dataMigrateOperation", func() {
 		})
 	})
 
+	Describe("GetLockTargetDatasetNamespacedNames", func() {
+		It("should occupy both source and destination datasets for dataset-to-dataset migrate", func() {
+			op := &dataMigrateOperation{
+				dataMigrate: &datav1alpha1.DataMigrate{
+					ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+					Spec: datav1alpha1.DataMigrateSpec{
+						From: datav1alpha1.DataToMigrate{
+							DataSet: &datav1alpha1.DatasetToMigrate{Name: "src-dataset", Namespace: "default"},
+						},
+						To: datav1alpha1.DataToMigrate{
+							DataSet: &datav1alpha1.DatasetToMigrate{Name: "dest-dataset", Namespace: "default"},
+						},
+					},
+				},
+			}
+
+			result := op.GetLockTargetDatasetNamespacedNames()
+
+			Expect(result).To(Equal([]types.NamespacedName{
+				{Namespace: "default", Name: "dest-dataset"},
+				{Namespace: "default", Name: "src-dataset"},
+			}))
+		})
+
+		It("should deduplicate when from and to point to the same dataset", func() {
+			op := &dataMigrateOperation{
+				dataMigrate: &datav1alpha1.DataMigrate{
+					ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+					Spec: datav1alpha1.DataMigrateSpec{
+						From: datav1alpha1.DataToMigrate{
+							DataSet: &datav1alpha1.DatasetToMigrate{Name: "same-dataset", Namespace: "default"},
+						},
+						To: datav1alpha1.DataToMigrate{
+							DataSet: &datav1alpha1.DatasetToMigrate{Name: "same-dataset", Namespace: "default"},
+						},
+					},
+				},
+			}
+
+			result := op.GetLockTargetDatasetNamespacedNames()
+
+			Expect(result).To(HaveLen(1))
+			Expect(result[0]).To(Equal(types.NamespacedName{Namespace: "default", Name: "same-dataset"}))
+		})
+
+		It("should skip externalStorage endpoints and only occupy the dataset endpoint", func() {
+			op := &dataMigrateOperation{
+				dataMigrate: &datav1alpha1.DataMigrate{
+					ObjectMeta: v1.ObjectMeta{Namespace: "default"},
+					Spec: datav1alpha1.DataMigrateSpec{
+						From: datav1alpha1.DataToMigrate{
+							ExternalStorage: &datav1alpha1.ExternalStorage{URI: "s3://bucket/path"},
+						},
+						To: datav1alpha1.DataToMigrate{
+							DataSet: &datav1alpha1.DatasetToMigrate{Name: "dest-dataset", Namespace: "default"},
+						},
+					},
+				},
+			}
+
+			result := op.GetLockTargetDatasetNamespacedNames()
+
+			Expect(result).To(Equal([]types.NamespacedName{
+				{Namespace: "default", Name: "dest-dataset"},
+			}))
+		})
+
+		It("should fall back to the datamigrate namespace when dataset namespace is empty", func() {
+			op := &dataMigrateOperation{
+				dataMigrate: &datav1alpha1.DataMigrate{
+					ObjectMeta: v1.ObjectMeta{Namespace: "migrate-ns"},
+					Spec: datav1alpha1.DataMigrateSpec{
+						From: datav1alpha1.DataToMigrate{
+							DataSet: &datav1alpha1.DatasetToMigrate{Name: "src-dataset"},
+						},
+						To: datav1alpha1.DataToMigrate{
+							ExternalStorage: &datav1alpha1.ExternalStorage{URI: "oss://bucket/path"},
+						},
+					},
+				},
+			}
+
+			result := op.GetLockTargetDatasetNamespacedNames()
+
+			Expect(result).To(Equal([]types.NamespacedName{
+				{Namespace: "migrate-ns", Name: "src-dataset"},
+			}))
+		})
+	})
+
 	Describe("GetReleaseNameSpacedName", func() {
 		It("should return correct namespaced name for release", func() {
 			op := &dataMigrateOperation{

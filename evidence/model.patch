@@ -1,0 +1,840 @@
+diff --git a/pkg/controllers/v1alpha1/datamigrate/implement.go b/pkg/controllers/v1alpha1/datamigrate/implement.go
+index b866e23..39ae676 100644
+--- a/pkg/controllers/v1alpha1/datamigrate/implement.go
++++ b/pkg/controllers/v1alpha1/datamigrate/implement.go
+@@ -47,6 +47,7 @@ type dataMigrateOperation struct {
+ }
+ 
+ var _ dataoperation.OperationInterface = &dataMigrateOperation{}
++var _ dataoperation.MultiDatasetLockOperation = &dataMigrateOperation{}
+ 
+ func (r *dataMigrateOperation) GetOperationObject() client.Object {
+ 	return r.dataMigrate
+@@ -72,6 +73,27 @@ func (r *dataMigrateOperation) GetPossibleTargetDatasetNamespacedNames() []types
+ 	return ret
+ }
+ 
++// GetLockTargetDatasetNamespacedNames implements dataoperation.MultiDatasetLockOperation.
++// A Dataset-to-Dataset DataMigrate must occupy both the source ("from") and the destination
++// ("to") Datasets with the same operation identity before its workload starts. externalStorage
++// endpoints are not Datasets and therefore skipped, and a Dataset referenced by both ends
++// (from and to point to the same Dataset) is deduplicated so that it is occupied only once.
++// Names are resolved from the DataMigrate spec, so an endpoint Dataset which has been deleted
++// is still returned and its missing occupancy can be treated as released during cleanup.
++func (r *dataMigrateOperation) GetLockTargetDatasetNamespacedNames() []types.NamespacedName {
++	candidates := r.GetPossibleTargetDatasetNamespacedNames()
++	seen := make(map[types.NamespacedName]struct{}, len(candidates))
++	ret := make([]types.NamespacedName, 0, len(candidates))
++	for _, candidate := range candidates {
++		if _, ok := seen[candidate]; ok {
++			continue
++		}
++		seen[candidate] = struct{}{}
++		ret = append(ret, candidate)
++	}
++	return ret
++}
++
+ func (r *dataMigrateOperation) GetTargetDataset() (*datav1alpha1.Dataset, error) {
+ 	return utils.GetTargetDatasetOfMigrate(r.Client, r.dataMigrate)
+ }
+diff --git a/pkg/controllers/v1alpha1/datamigrate/implement_test.go b/pkg/controllers/v1alpha1/datamigrate/implement_test.go
+index 90d71e2..b57ab94 100644
+--- a/pkg/controllers/v1alpha1/datamigrate/implement_test.go
++++ b/pkg/controllers/v1alpha1/datamigrate/implement_test.go
+@@ -194,6 +194,96 @@ var _ = Describe("dataMigrateOperation", func() {
+ 		})
+ 	})
+ 
++	Describe("GetLockTargetDatasetNamespacedNames", func() {
++		It("should occupy both source and destination datasets for dataset-to-dataset migrate", func() {
++			op := &dataMigrateOperation{
++				dataMigrate: &datav1alpha1.DataMigrate{
++					ObjectMeta: v1.ObjectMeta{Namespace: "default"},
++					Spec: datav1alpha1.DataMigrateSpec{
++						From: datav1alpha1.DataToMigrate{
++							DataSet: &datav1alpha1.DatasetToMigrate{Name: "src-dataset", Namespace: "default"},
++						},
++						To: datav1alpha1.DataToMigrate{
++							DataSet: &datav1alpha1.DatasetToMigrate{Name: "dest-dataset", Namespace: "default"},
++						},
++					},
++				},
++			}
++
++			result := op.GetLockTargetDatasetNamespacedNames()
++
++			Expect(result).To(Equal([]types.NamespacedName{
++				{Namespace: "default", Name: "dest-dataset"},
++				{Namespace: "default", Name: "src-dataset"},
++			}))
++		})
++
++		It("should deduplicate when from and to point to the same dataset", func() {
++			op := &dataMigrateOperation{
++				dataMigrate: &datav1alpha1.DataMigrate{
++					ObjectMeta: v1.ObjectMeta{Namespace: "default"},
++					Spec: datav1alpha1.DataMigrateSpec{
++						From: datav1alpha1.DataToMigrate{
++							DataSet: &datav1alpha1.DatasetToMigrate{Name: "same-dataset", Namespace: "default"},
++						},
++						To: datav1alpha1.DataToMigrate{
++							DataSet: &datav1alpha1.DatasetToMigrate{Name: "same-dataset", Namespace: "default"},
++						},
++					},
++				},
++			}
++
++			result := op.GetLockTargetDatasetNamespacedNames()
++
++			Expect(result).To(HaveLen(1))
++			Expect(result[0]).To(Equal(types.NamespacedName{Namespace: "default", Name: "same-dataset"}))
++		})
++
++		It("should skip externalStorage endpoints and only occupy the dataset endpoint", func() {
++			op := &dataMigrateOperation{
++				dataMigrate: &datav1alpha1.DataMigrate{
++					ObjectMeta: v1.ObjectMeta{Namespace: "default"},
++					Spec: datav1alpha1.DataMigrateSpec{
++						From: datav1alpha1.DataToMigrate{
++							ExternalStorage: &datav1alpha1.ExternalStorage{URI: "s3://bucket/path"},
++						},
++						To: datav1alpha1.DataToMigrate{
++							DataSet: &datav1alpha1.DatasetToMigrate{Name: "dest-dataset", Namespace: "default"},
++						},
++					},
++				},
++			}
++
++			result := op.GetLockTargetDatasetNamespacedNames()
++
++			Expect(result).To(Equal([]types.NamespacedName{
++				{Namespace: "default", Name: "dest-dataset"},
++			}))
++		})
++
++		It("should fall back to the datamigrate namespace when dataset namespace is empty", func() {
++			op := &dataMigrateOperation{
++				dataMigrate: &datav1alpha1.DataMigrate{
++					ObjectMeta: v1.ObjectMeta{Namespace: "migrate-ns"},
++					Spec: datav1alpha1.DataMigrateSpec{
++						From: datav1alpha1.DataToMigrate{
++							DataSet: &datav1alpha1.DatasetToMigrate{Name: "src-dataset"},
++						},
++						To: datav1alpha1.DataToMigrate{
++							ExternalStorage: &datav1alpha1.ExternalStorage{URI: "oss://bucket/path"},
++						},
++					},
++				},
++			}
++
++			result := op.GetLockTargetDatasetNamespacedNames()
++
++			Expect(result).To(Equal([]types.NamespacedName{
++				{Namespace: "migrate-ns", Name: "src-dataset"},
++			}))
++		})
++	})
++
+ 	Describe("GetReleaseNameSpacedName", func() {
+ 		It("should return correct namespaced name for release", func() {
+ 			op := &dataMigrateOperation{
+diff --git a/pkg/dataoperation/interface.go b/pkg/dataoperation/interface.go
+index 15eb63c..1ebc745 100644
+--- a/pkg/dataoperation/interface.go
++++ b/pkg/dataoperation/interface.go
+@@ -81,3 +81,17 @@ type StatusHandler interface {
+ 	// GetOperationStatus get operation status according to helm chart status
+ 	GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus) (result *datav1alpha1.OperationStatus, err error)
+ }
++
++// MultiDatasetLockOperation is an optional extension of OperationInterface implemented by data
++// operations which may occupy more than one Dataset before their workload can start. A
++// Dataset-to-Dataset DataMigrate, for example, must occupy both its source and destination
++// Datasets with the same operation identity. Operations not implementing this interface keep
++// occupying their single target Dataset only.
++type MultiDatasetLockOperation interface {
++	// GetLockTargetDatasetNamespacedNames returns the deduplicated namespaced names of all
++	// Datasets that must carry the operation's occupancy (Dataset.Status.OperationRef) before
++	// the workload starts. The names are resolved from the operation spec instead of API
++	// fetches, so a Dataset that has been deleted is still returned and its missing occupancy
++	// can be treated as released when the operation cleans up.
++	GetLockTargetDatasetNamespacedNames() []types.NamespacedName
++}
+diff --git a/pkg/ddc/base/operation_lock.go b/pkg/ddc/base/operation_lock.go
+index d882dc5..8382fa4 100644
+--- a/pkg/ddc/base/operation_lock.go
++++ b/pkg/ddc/base/operation_lock.go
+@@ -22,7 +22,7 @@ import (
+ 	"reflect"
+ 
+ 	v1 "k8s.io/api/core/v1"
+-	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/client-go/util/retry"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+@@ -44,7 +44,47 @@ func getDataOperationKey(object client.Object) string {
+ 	return object.GetName()
+ }
+ 
+-// SetDataOperationInTargetDataset set status of target dataset to mark the data operation being performed.
++// dedupeNamespacedNames removes duplicated namespaced names while preserving the first
++// occurrence order. A Dataset referenced by both ends of a DataMigrate (from == to) is
++// therefore occupied only once.
++func dedupeNamespacedNames(names []types.NamespacedName) []types.NamespacedName {
++	seen := make(map[types.NamespacedName]struct{}, len(names))
++	ret := make([]types.NamespacedName, 0, len(names))
++	for _, name := range names {
++		if _, ok := seen[name]; ok {
++			continue
++		}
++		seen[name] = struct{}{}
++		ret = append(ret, name)
++	}
++	return ret
++}
++
++// resolveLockTargetDatasetNames returns the deduplicated namespaced names of all Datasets
++// that the operation must occupy. Operations implementing dataoperation.MultiDatasetLockOperation
++// (e.g. Dataset-to-Dataset DataMigrate) may occupy multiple Datasets whose names are derived
++// from the operation spec, so that a Dataset which has been deleted is still discoverable
++// during occupancy release. All other operations fall back to their single target Dataset.
++func resolveLockTargetDatasetNames(operation dataoperation.OperationInterface) ([]types.NamespacedName, error) {
++	if multi, ok := operation.(dataoperation.MultiDatasetLockOperation); ok {
++		if names := dedupeNamespacedNames(multi.GetLockTargetDatasetNamespacedNames()); len(names) > 0 {
++			return names, nil
++		}
++	}
++
++	dataset, err := operation.GetTargetDataset()
++	if err != nil {
++		return nil, err
++	}
++	return []types.NamespacedName{{Name: dataset.Name, Namespace: dataset.Namespace}}, nil
++}
++
++// SetDataOperationInTargetDataset sets the status of every occupied Dataset to mark the data
++// operation being performed. For operations occupying multiple Datasets (Dataset-to-Dataset
++// DataMigrate), all endpoints are occupied with the same operation identity before the
++// function returns successfully: if any endpoint cannot be occupied, every Dataset occupied
++// in the current reconciliation pass is rolled back so that no half-lock is persisted and the
++// workload is never started (the operation stays in Pending and is requeued).
+ func SetDataOperationInTargetDataset(ctx cruntime.ReconcileRequestContext, operation dataoperation.OperationInterface, engine OperationEngine) error {
+ 	targetDataset := ctx.Dataset
+ 	object := operation.GetOperationObject()
+@@ -64,45 +104,70 @@ func SetDataOperationInTargetDataset(ctx cruntime.ReconcileRequestContext, opera
+ 	operationTypeName := string(operation.GetOperationType())
+ 	dataOpKey := getDataOperationKey(object)
+ 
+-	// set current data operation in target dataset
+-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+-		dataset, err := utils.GetDataset(ctx.Client, targetDataset.Name, targetDataset.Namespace)
+-		if err != nil {
+-			return err
+-		}
+-
+-		// set current data operation in the target dataset
+-		datasetToUpdate := dataset.DeepCopy()
+-		datasetToUpdate.SetDataOperationInProgress(operationTypeName, dataOpKey)
+-		// different operation may set other fields
+-		operation.SetTargetDatasetStatusInProgress(datasetToUpdate)
++	targetNames, err := resolveLockTargetDatasetNames(operation)
++	if err != nil {
++		ctx.Log.Error(err, "can't resolve datasets to occupy")
++		return err
++	}
+ 
+-		if !reflect.DeepEqual(dataset.Status, datasetToUpdate.Status) {
+-			if err := ctx.Client.Status().Update(context.TODO(), datasetToUpdate); err != nil {
+-				ctx.Log.Info("fail to update target dataset's lock, will requeue", "targetDatasetName", targetDataset.Name)
++	// Occupy every target Dataset independently. Each Dataset is re-fetched and updated
++	// inside a conflict retry, so concurrent status writers (other operations or the runtime
++	// reconciler) can never make us overwrite their changes. Re-running this function is
++	// idempotent: an already persisted occupancy of the same operation is observed as a no-op.
++	occupied := make([]types.NamespacedName, 0, len(targetNames))
++	for _, targetName := range targetNames {
++		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++			dataset, err := utils.GetDataset(ctx.Client, targetName.Name, targetName.Namespace)
++			if err != nil {
+ 				return err
+ 			}
++
++			// set current data operation in the target dataset
++			datasetToUpdate := dataset.DeepCopy()
++			datasetToUpdate.SetDataOperationInProgress(operationTypeName, dataOpKey)
++			// different operation may set other fields
++			operation.SetTargetDatasetStatusInProgress(datasetToUpdate)
++
++			if !reflect.DeepEqual(dataset.Status, datasetToUpdate.Status) {
++				if err := ctx.Client.Status().Update(context.TODO(), datasetToUpdate); err != nil {
++					ctx.Log.Info("fail to update target dataset's lock, will requeue", "targetDatasetName", targetName)
++					return err
++				}
++			}
++			return nil
++		})
++		if err != nil {
++			ctx.Log.Error(err, "failed to occupy target dataset, rolling back partial occupancy",
++				"failedDataset", targetName, "occupiedDatasets", occupied)
++			// The rollback only removes the current operation's own OperationRef entry and
++			// never touches references owned by other operations. It is best effort: if it
++			// fails as well, the operation remains in Pending and the next reconciliation
++			// converges from the persisted Dataset status instead of starting any workload.
++			if rollbackErr := releaseLocksOnDatasets(ctx, operation, occupied); rollbackErr != nil {
++				ctx.Log.Error(rollbackErr, "failed to roll back partial occupancy, will keep converging on next reconciliation")
++			}
++			return err
+ 		}
+-		return nil
+-	})
+-	if err != nil {
+-		ctx.Log.Error(err, "can't set lock on target dataset", "targetDataset", targetDataset.Name)
++		occupied = append(occupied, targetName)
+ 	}
+-	return err
+-}
+ 
+-// ReleaseTargetDataset release target dataset OperationRef field which marks the data operation being performed.
+-func ReleaseTargetDataset(ctx cruntime.ReconcileRequestContext, operation dataoperation.OperationInterface) error {
++	return nil
++}
+ 
++// releaseLockOnDataset releases the operation's occupancy on a single Dataset. A Dataset
++// that no longer exists is treated as already released. Conflicts are retried with a fresh
++// fetch so that references owned by other operations are never removed.
++func releaseLockOnDataset(ctx cruntime.ReconcileRequestContext, operation dataoperation.OperationInterface, targetName types.NamespacedName) error {
+ 	dataOpKey := getDataOperationKey(operation.GetOperationObject())
+ 	operationTypeName := string(operation.GetOperationType())
+ 
+-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+-		dataset, err := operation.GetTargetDataset()
++	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
++		dataset, err := utils.GetDataset(ctx.Client, targetName.Name, targetName.Namespace)
+ 		if err != nil {
+ 			if utils.IgnoreNotFound(err) == nil {
+-				statusError := err.(*apierrors.StatusError)
+-				ctx.Log.Info("can't find target dataset, won't release lock", "dataset", statusError.Status().Details.Name)
++				// The Dataset has been deleted (or recreated without the occupancy), there is
++				// no persisted lock to release on this endpoint.
++				ctx.Log.Info("can't find target dataset when releasing lock, skip", "dataset", targetName)
+ 				return nil
+ 			}
+ 			// other error
+@@ -123,8 +188,34 @@ func ReleaseTargetDataset(ctx cruntime.ReconcileRequestContext, operation dataop
+ 		}
+ 		return nil
+ 	})
++}
++
++// releaseLocksOnDatasets releases the operation's occupancy on all given Datasets. Every
++// endpoint is attempted even if one of them fails, so a transient failure on one endpoint
++// does not block the cleanup of the others. The first encountered error is returned for
++// requeue, while successful endpoint releases are persisted and become no-ops on retry.
++func releaseLocksOnDatasets(ctx cruntime.ReconcileRequestContext, operation dataoperation.OperationInterface, targetNames []types.NamespacedName) error {
++	var firstErr error
++	for _, targetName := range targetNames {
++		if err := releaseLockOnDataset(ctx, operation, targetName); err != nil && firstErr == nil {
++			firstErr = err
++		}
++	}
++	return firstErr
++}
++
++// ReleaseTargetDataset releases the OperationRef field which marks the data operation being
++// performed on all Datasets occupied by the operation (both endpoints for a Dataset-to-Dataset
++// DataMigrate).
++func ReleaseTargetDataset(ctx cruntime.ReconcileRequestContext, operation dataoperation.OperationInterface) error {
++	targetNames, err := resolveLockTargetDatasetNames(operation)
+ 	if err != nil {
+-		ctx.Log.Error(err, "can't release lock on target dataset")
++		ctx.Log.Error(err, "can't resolve datasets to release")
++		return err
++	}
++
++	if err = releaseLocksOnDatasets(ctx, operation, targetNames); err != nil {
++		ctx.Log.Error(err, "can't release lock on target dataset(s)")
+ 	}
+ 	return err
+ }
+diff --git a/pkg/ddc/base/operation_lock_dual_test.go b/pkg/ddc/base/operation_lock_dual_test.go
+new file mode 100644
+index 0000000..8c2ad98
+--- /dev/null
++++ b/pkg/ddc/base/operation_lock_dual_test.go
+@@ -0,0 +1,475 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package base_test
++
++import (
++	"context"
++	stderrors "errors"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
++	enginemock "github.com/fluid-cloudnative/fluid/pkg/ddc/base/mock"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	"github.com/golang/mock/gomock"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	apimachineryRuntime "k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
++)
++
++const (
++	dualOpName      = "migrate-op"
++	sourceDataset   = "source-dataset"
++	destDataset     = "dest-dataset"
++	parallelOpName  = "another-migrate"
++	testLockNS      = "default"
++	dataMigrateKind = "DataMigrate"
++)
++
++// dualLockMockOperation implements both dataoperation.OperationInterface and
++// dataoperation.MultiDatasetLockOperation for testing dual-endpoint occupancy.
++type dualLockMockOperation struct {
++	lockTargets []types.NamespacedName
++}
++
++var (
++	_ dataoperation.OperationInterface        = &dualLockMockOperation{}
++	_ dataoperation.MultiDatasetLockOperation = &dualLockMockOperation{}
++)
++
++func (m *dualLockMockOperation) HasPrecedingOperation() bool { return false }
++
++func (m *dualLockMockOperation) GetOperationObject() ctrlclient.Object {
++	return &datav1alpha1.DataMigrate{
++		ObjectMeta: metav1.ObjectMeta{Name: dualOpName, Namespace: testLockNS},
++	}
++}
++
++func (m *dualLockMockOperation) GetPossibleTargetDatasetNamespacedNames() []types.NamespacedName {
++	return m.lockTargets
++}
++
++func (m *dualLockMockOperation) GetTargetDataset() (*datav1alpha1.Dataset, error) {
++	if len(m.lockTargets) == 0 {
++		return nil, stderrors.New("no target dataset")
++	}
++	return &datav1alpha1.Dataset{
++		ObjectMeta: metav1.ObjectMeta{Name: m.lockTargets[0].Name, Namespace: m.lockTargets[0].Namespace},
++	}, nil
++}
++
++func (m *dualLockMockOperation) GetReleaseNameSpacedName() types.NamespacedName {
++	return types.NamespacedName{Name: "release", Namespace: testLockNS}
++}
++
++func (m *dualLockMockOperation) GetChartsDirectory() string { return "/charts/datamigrate" }
++
++func (m *dualLockMockOperation) GetOperationType() dataoperation.OperationType {
++	return dataoperation.DataMigrateType
++}
++
++func (m *dualLockMockOperation) UpdateOperationApiStatus(opStatus *datav1alpha1.OperationStatus) error {
++	return nil
++}
++
++func (m *dualLockMockOperation) Validate(ctx cruntime.ReconcileRequestContext) ([]datav1alpha1.Condition, error) {
++	return nil, nil
++}
++
++func (m *dualLockMockOperation) UpdateStatusInfoForCompleted(infos map[string]string) error {
++	return nil
++}
++
++func (m *dualLockMockOperation) SetTargetDatasetStatusInProgress(dataset *datav1alpha1.Dataset) {
++	dataset.Status.Phase = datav1alpha1.DataMigrating
++}
++
++func (m *dualLockMockOperation) RemoveTargetDatasetStatusInProgress(dataset *datav1alpha1.Dataset) {
++	dataset.Status.Phase = datav1alpha1.BoundDatasetPhase
++}
++
++func (m *dualLockMockOperation) GetStatusHandler() dataoperation.StatusHandler { return nil }
++
++func (m *dualLockMockOperation) GetTTL() (ttl *int32, err error) { return nil, nil }
++
++func (m *dualLockMockOperation) GetParallelTaskNumber() int32 { return 1 }
++
++func (m *dualLockMockOperation) GetLockTargetDatasetNamespacedNames() []types.NamespacedName {
++	return m.lockTargets
++}
++
++// statusWriterClient allows replacing the status writer with an instrumented one.
++type statusWriterClient struct {
++	ctrlclient.Client
++	statusWriter ctrlclient.StatusWriter
++}
++
++func (c *statusWriterClient) Status() ctrlclient.StatusWriter { return c.statusWriter }
++
++type instrumentedStatusWriter struct {
++	ctrlclient.StatusWriter
++	failUpdateFor     *types.NamespacedName
++	conflictOnceFor   *types.NamespacedName
++	conflictTriggered bool
++}
++
++func (w *instrumentedStatusWriter) Update(ctx context.Context, obj ctrlclient.Object, opts ...ctrlclient.SubResourceUpdateOption) error {
++	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
++	if w.failUpdateFor != nil && *w.failUpdateFor == nn {
++		return stderrors.New("injected persistent status update failure")
++	}
++	if w.conflictOnceFor != nil && *w.conflictOnceFor == nn && !w.conflictTriggered {
++		w.conflictTriggered = true
++		return apierrors.NewConflict(schema.GroupResource{Resource: "datasets"}, obj.GetName(), stderrors.New("injected resourceVersion conflict"))
++	}
++	return w.StatusWriter.Update(ctx, obj, opts...)
++}
++
++func newDualLockScheme() *apimachineryRuntime.Scheme {
++	s := apimachineryRuntime.NewScheme()
++	Expect(datav1alpha1.AddToScheme(s)).To(Succeed())
++	return s
++}
++
++func newDatasetWithStatus(name string, operationRef map[string]string, phase datav1alpha1.DatasetPhase) *datav1alpha1.Dataset {
++	return &datav1alpha1.Dataset{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testLockNS},
++		Status: datav1alpha1.DatasetStatus{
++			Phase:        phase,
++			OperationRef: operationRef,
++		},
++	}
++}
++
++func getDatasetStatus(c ctrlclient.Client, name string) datav1alpha1.DatasetStatus {
++	var dataset datav1alpha1.Dataset
++	Expect(c.Get(context.TODO(), types.NamespacedName{Name: name, Namespace: testLockNS}, &dataset)).To(Succeed())
++	return dataset.Status
++}
++
++var _ = Describe("Dual-endpoint dataset occupancy", func() {
++	var (
++		gomockCtrl *gomock.Controller
++		engine     *enginemock.MockImplement
++		fakeCtx    cruntime.ReconcileRequestContext
++	)
++
++	BeforeEach(func() {
++		gomockCtrl = gomock.NewController(GinkgoT())
++		engine = enginemock.NewMockImplement(gomockCtrl)
++		fakeCtx = cruntime.ReconcileRequestContext{
++			Log:      fake.NullLogger(),
++			Recorder: record.NewFakeRecorder(20),
++		}
++	})
++
++	AfterEach(func() {
++		gomockCtrl.Finish()
++	})
++
++	Describe("SetDataOperationInTargetDataset", func() {
++		It("occupies both source and destination datasets with the same operation identity", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset, nil, datav1alpha1.BoundDatasetPhase)
++			dest := newDatasetWithStatus(destDataset, nil, datav1alpha1.BoundDatasetPhase)
++			client := fake.NewFakeClientWithScheme(s, source, dest)
++			fakeCtx.Client = client
++			fakeCtx.Dataset = dest
++			engine.EXPECT().CheckRuntimeReady().Return(true)
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.SetDataOperationInTargetDataset(fakeCtx, op, engine)).To(Succeed())
++
++			sourceStatus := getDatasetStatus(client, sourceDataset)
++			destStatus := getDatasetStatus(client, destDataset)
++			Expect(sourceStatus.OperationRef[dataMigrateKind]).To(Equal(dualOpName))
++			Expect(destStatus.OperationRef[dataMigrateKind]).To(Equal(dualOpName))
++			Expect(sourceStatus.Phase).To(Equal(datav1alpha1.DataMigrating))
++			Expect(destStatus.Phase).To(Equal(datav1alpha1.DataMigrating))
++		})
++
++		It("occupies a dataset only once when from and to point to the same dataset", func() {
++			s := newDualLockScheme()
++			only := newDatasetWithStatus(destDataset, nil, datav1alpha1.BoundDatasetPhase)
++			client := fake.NewFakeClientWithScheme(s, only)
++			fakeCtx.Client = client
++			fakeCtx.Dataset = only
++			engine.EXPECT().CheckRuntimeReady().Return(true)
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.SetDataOperationInTargetDataset(fakeCtx, op, engine)).To(Succeed())
++
++			status := getDatasetStatus(client, destDataset)
++			Expect(status.OperationRef[dataMigrateKind]).To(Equal(dualOpName))
++			Expect(status.Phase).To(Equal(datav1alpha1.DataMigrating))
++		})
++
++		It("falls back to the single target dataset for operations without multi-dataset lock", func() {
++			s := newDualLockScheme()
++			fakeDataset := &datav1alpha1.Dataset{
++				ObjectMeta: metav1.ObjectMeta{Name: mockDatasetName, Namespace: mockNamespace},
++			}
++			client := fake.NewFakeClientWithScheme(s, fakeDataset)
++			fakeCtx.Client = client
++			fakeCtx.Dataset = fakeDataset
++			engine.EXPECT().CheckRuntimeReady().Return(true)
++
++			op := newMockOperation()
++
++			Expect(base.SetDataOperationInTargetDataset(fakeCtx, op, engine)).To(Succeed())
++
++			status := getDatasetStatus(client, mockDatasetName)
++			Expect(status.OperationRef[string(dataoperation.DataLoadType)]).To(Equal(mockDatasetName))
++		})
++
++		It("rolls back the first endpoint and returns error when the second endpoint write fails", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset, nil, datav1alpha1.BoundDatasetPhase)
++			dest := newDatasetWithStatus(destDataset, nil, datav1alpha1.BoundDatasetPhase)
++			rawClient := fake.NewFakeClientWithScheme(s, source, dest)
++			failNN := types.NamespacedName{Name: destDataset, Namespace: testLockNS}
++			client := &statusWriterClient{
++				Client:       rawClient,
++				statusWriter: &instrumentedStatusWriter{StatusWriter: rawClient.Status(), failUpdateFor: &failNN},
++			}
++			fakeCtx.Client = client
++			fakeCtx.Dataset = dest
++			engine.EXPECT().CheckRuntimeReady().Return(true)
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			err := base.SetDataOperationInTargetDataset(fakeCtx, op, engine)
++			Expect(err).To(HaveOccurred())
++
++			// no half-lock: the occupancy acquired on the first endpoint is rolled back
++			sourceStatus := getDatasetStatus(client, sourceDataset)
++			destStatus := getDatasetStatus(client, destDataset)
++			Expect(sourceStatus.OperationRef).To(BeEmpty())
++			Expect(destStatus.OperationRef).To(BeEmpty())
++			Expect(sourceStatus.Phase).To(Equal(datav1alpha1.BoundDatasetPhase))
++		})
++
++		It("converges from persisted occupancy when the controller restarted between the two writes", func() {
++			s := newDualLockScheme()
++			// source endpoint had already been occupied and persisted before the restart
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: dualOpName}, datav1alpha1.DataMigrating)
++			dest := newDatasetWithStatus(destDataset, nil, datav1alpha1.BoundDatasetPhase)
++			client := fake.NewFakeClientWithScheme(s, source, dest)
++			fakeCtx.Client = client
++			fakeCtx.Dataset = dest
++			engine.EXPECT().CheckRuntimeReady().Return(true)
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.SetDataOperationInTargetDataset(fakeCtx, op, engine)).To(Succeed())
++
++			sourceStatus := getDatasetStatus(client, sourceDataset)
++			destStatus := getDatasetStatus(client, destDataset)
++			// re-acquiring the first endpoint must not duplicate the reference
++			Expect(sourceStatus.OperationRef[dataMigrateKind]).To(Equal(dualOpName))
++			Expect(destStatus.OperationRef[dataMigrateKind]).To(Equal(dualOpName))
++		})
++
++		It("preserves references of parallel operations when acquiring occupancy", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: parallelOpName}, datav1alpha1.DataMigrating)
++			dest := newDatasetWithStatus(destDataset, nil, datav1alpha1.BoundDatasetPhase)
++			client := fake.NewFakeClientWithScheme(s, source, dest)
++			fakeCtx.Client = client
++			fakeCtx.Dataset = dest
++			engine.EXPECT().CheckRuntimeReady().Return(true)
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.SetDataOperationInTargetDataset(fakeCtx, op, engine)).To(Succeed())
++
++			sourceStatus := getDatasetStatus(client, sourceDataset)
++			Expect(sourceStatus.OperationRef[dataMigrateKind]).To(ContainSubstring(parallelOpName))
++			Expect(sourceStatus.OperationRef[dataMigrateKind]).To(ContainSubstring(dualOpName))
++		})
++
++		It("returns error without writing any lock when the bounded runtime is not ready", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset, nil, datav1alpha1.BoundDatasetPhase)
++			dest := newDatasetWithStatus(destDataset, nil, datav1alpha1.BoundDatasetPhase)
++			client := fake.NewFakeClientWithScheme(s, source, dest)
++			fakeCtx.Client = client
++			fakeCtx.Dataset = dest
++			engine.EXPECT().CheckRuntimeReady().Return(false)
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.SetDataOperationInTargetDataset(fakeCtx, op, engine)).To(HaveOccurred())
++
++			Expect(getDatasetStatus(client, sourceDataset).OperationRef).To(BeEmpty())
++			Expect(getDatasetStatus(client, destDataset).OperationRef).To(BeEmpty())
++		})
++	})
++
++	Describe("ReleaseTargetDataset", func() {
++		It("releases both endpoints symmetrically", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: dualOpName}, datav1alpha1.DataMigrating)
++			dest := newDatasetWithStatus(destDataset,
++				map[string]string{dataMigrateKind: dualOpName}, datav1alpha1.DataMigrating)
++			client := fake.NewFakeClientWithScheme(s, source, dest)
++			fakeCtx.Client = client
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.ReleaseTargetDataset(fakeCtx, op)).To(Succeed())
++
++			Expect(getDatasetStatus(client, sourceDataset).OperationRef).To(BeEmpty())
++			Expect(getDatasetStatus(client, destDataset).OperationRef).To(BeEmpty())
++			Expect(getDatasetStatus(client, sourceDataset).Phase).To(Equal(datav1alpha1.BoundDatasetPhase))
++			Expect(getDatasetStatus(client, destDataset).Phase).To(Equal(datav1alpha1.BoundDatasetPhase))
++		})
++
++		It("only removes its own reference and keeps references owned by other operations", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: parallelOpName + "," + dualOpName},
++				datav1alpha1.DataMigrating)
++			client := fake.NewFakeClientWithScheme(s, source)
++			fakeCtx.Client = client
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.ReleaseTargetDataset(fakeCtx, op)).To(Succeed())
++
++			status := getDatasetStatus(client, sourceDataset)
++			Expect(status.OperationRef[dataMigrateKind]).To(Equal(parallelOpName))
++			// the dataset is still occupied by another operation, phase must not be reset
++			Expect(status.Phase).To(Equal(datav1alpha1.DataMigrating))
++		})
++
++		It("tolerates a deleted endpoint dataset while releasing the other endpoint", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: dualOpName}, datav1alpha1.DataMigrating)
++			// destination dataset has been deleted and does not exist in the client
++			client := fake.NewFakeClientWithScheme(s, source)
++			fakeCtx.Client = client
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.ReleaseTargetDataset(fakeCtx, op)).To(Succeed())
++			Expect(getDatasetStatus(client, sourceDataset).OperationRef).To(BeEmpty())
++		})
++
++		It("retries and succeeds when releasing hits a resourceVersion conflict", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: parallelOpName + "," + dualOpName},
++				datav1alpha1.DataMigrating)
++			rawClient := fake.NewFakeClientWithScheme(s, source)
++			conflictNN := types.NamespacedName{Name: sourceDataset, Namespace: testLockNS}
++			client := &statusWriterClient{
++				Client:       rawClient,
++				statusWriter: &instrumentedStatusWriter{StatusWriter: rawClient.Status(), conflictOnceFor: &conflictNN},
++			}
++			fakeCtx.Client = client
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.ReleaseTargetDataset(fakeCtx, op)).To(Succeed())
++
++			status := getDatasetStatus(client, sourceDataset)
++			Expect(status.OperationRef[dataMigrateKind]).To(Equal(parallelOpName))
++		})
++
++		It("is idempotent when the occupancy has already been released", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset, nil, datav1alpha1.BoundDatasetPhase)
++			client := fake.NewFakeClientWithScheme(s, source)
++			fakeCtx.Client = client
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++			}}
++
++			Expect(base.ReleaseTargetDataset(fakeCtx, op)).To(Succeed())
++			Expect(getDatasetStatus(client, sourceDataset).OperationRef).To(BeEmpty())
++		})
++
++		It("still releases the remaining endpoint when one endpoint release fails persistently", func() {
++			s := newDualLockScheme()
++			source := newDatasetWithStatus(sourceDataset,
++				map[string]string{dataMigrateKind: dualOpName}, datav1alpha1.DataMigrating)
++			dest := newDatasetWithStatus(destDataset,
++				map[string]string{dataMigrateKind: dualOpName}, datav1alpha1.DataMigrating)
++			rawClient := fake.NewFakeClientWithScheme(s, source, dest)
++			failNN := types.NamespacedName{Name: sourceDataset, Namespace: testLockNS}
++			client := &statusWriterClient{
++				Client:       rawClient,
++				statusWriter: &instrumentedStatusWriter{StatusWriter: rawClient.Status(), failUpdateFor: &failNN},
++			}
++			fakeCtx.Client = client
++
++			op := &dualLockMockOperation{lockTargets: []types.NamespacedName{
++				{Name: sourceDataset, Namespace: testLockNS},
++				{Name: destDataset, Namespace: testLockNS},
++			}}
++
++			err := base.ReleaseTargetDataset(fakeCtx, op)
++			Expect(err).To(HaveOccurred())
++			// the healthy endpoint must not be blocked by the failing endpoint
++			Expect(getDatasetStatus(client, destDataset).OperationRef).To(BeEmpty())
++			// the failing endpoint keeps its occupancy and will be converged on requeue
++			Expect(getDatasetStatus(client, sourceDataset).OperationRef[dataMigrateKind]).To(Equal(dualOpName))
++		})
++	})
++})

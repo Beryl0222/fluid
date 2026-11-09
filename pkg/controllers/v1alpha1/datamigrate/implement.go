@@ -47,6 +47,7 @@ type dataMigrateOperation struct {
 }
 
 var _ dataoperation.OperationInterface = &dataMigrateOperation{}
+var _ dataoperation.MultiDatasetLockOperation = &dataMigrateOperation{}
 
 func (r *dataMigrateOperation) GetOperationObject() client.Object {
 	return r.dataMigrate
@@ -69,6 +70,27 @@ func (r *dataMigrateOperation) GetPossibleTargetDatasetNamespacedNames() []types
 		}
 	}
 
+	return ret
+}
+
+// GetLockTargetDatasetNamespacedNames implements dataoperation.MultiDatasetLockOperation.
+// A Dataset-to-Dataset DataMigrate must occupy both the source ("from") and the destination
+// ("to") Datasets with the same operation identity before its workload starts. externalStorage
+// endpoints are not Datasets and therefore skipped, and a Dataset referenced by both ends
+// (from and to point to the same Dataset) is deduplicated so that it is occupied only once.
+// Names are resolved from the DataMigrate spec, so an endpoint Dataset which has been deleted
+// is still returned and its missing occupancy can be treated as released during cleanup.
+func (r *dataMigrateOperation) GetLockTargetDatasetNamespacedNames() []types.NamespacedName {
+	candidates := r.GetPossibleTargetDatasetNamespacedNames()
+	seen := make(map[types.NamespacedName]struct{}, len(candidates))
+	ret := make([]types.NamespacedName, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		ret = append(ret, candidate)
+	}
 	return ret
 }
 
