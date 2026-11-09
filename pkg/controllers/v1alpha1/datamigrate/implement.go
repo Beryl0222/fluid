@@ -47,6 +47,7 @@ type dataMigrateOperation struct {
 }
 
 var _ dataoperation.OperationInterface = &dataMigrateOperation{}
+var _ dataoperation.TargetDatasetAccessReleaser = &dataMigrateOperation{}
 
 func (r *dataMigrateOperation) GetOperationObject() client.Object {
 	return r.dataMigrate
@@ -141,10 +142,46 @@ func (r *dataMigrateOperation) UpdateStatusInfoForCompleted(infos map[string]str
 
 func (r *dataMigrateOperation) SetTargetDatasetStatusInProgress(dataset *datav1alpha1.Dataset) {
 	dataset.Status.Phase = datav1alpha1.DataMigrating
+	r.syncDataMigrateBlockRef(dataset)
 }
 
 func (r *dataMigrateOperation) RemoveTargetDatasetStatusInProgress(dataset *datav1alpha1.Dataset) {
 	dataset.Status.Phase = datav1alpha1.BoundDatasetPhase
+}
+
+// ReleaseTargetDatasetAccess implements dataoperation.TargetDatasetAccessReleaser and
+// is invoked on every ReleaseTargetDataset call, including when other DataMigrates still
+// hold the Dataset. The access barrier is an explicit block that must only be lifted when
+// the migration itself converges or is cleaned up:
+//   - For the Once policy, Complete/Failed is a terminal state, so release here.
+//   - For Cron/OnEvent policies, Complete/Failed are transient states between scheduled
+//     rounds; the barrier survives across rounds while block=true, but is removed when the
+//     flag has been flipped back to false so the stored state can never outlive the
+//     migration's intent.
+//   - On deletion (any policy), the deletion timestamp is set and the barrier is released
+//     so that no permanent block is left behind after cleanup.
+func (r *dataMigrateOperation) ReleaseTargetDatasetAccess(dataset *datav1alpha1.Dataset) {
+	if !r.dataMigrate.GetDeletionTimestamp().IsZero() ||
+		r.dataMigrate.Spec.Policy == datav1alpha1.Once ||
+		!r.dataMigrate.Spec.Block {
+		dataset.RemoveDataMigrateRef(r.dataMigrate.GetNamespace(), r.dataMigrate.GetName())
+	}
+}
+
+// syncDataMigrateBlockRef reconciles the Dataset's DataMigrateRef entry with the
+// DataMigrate spec.block flag while the migration holds the Dataset. It both installs
+// the barrier when block=true and removes a stale entry when the flag is flipped back
+// to false, so the stored barrier can never drift from the migration's intent.
+func (r *dataMigrateOperation) syncDataMigrateBlockRef(dataset *datav1alpha1.Dataset) {
+	if r.dataMigrate.Spec.Block {
+		dataset.SetDataMigrateRef(datav1alpha1.DataMigrateRef{
+			Name:      r.dataMigrate.GetName(),
+			Namespace: r.dataMigrate.GetNamespace(),
+			Block:     true,
+		})
+		return
+	}
+	dataset.RemoveDataMigrateRef(r.dataMigrate.GetNamespace(), r.dataMigrate.GetName())
 }
 
 func (r *dataMigrateOperation) GetStatusHandler() dataoperation.StatusHandler {

@@ -185,3 +185,65 @@ func TestDataset_SetDataOperationInProgress(t *testing.T) {
 		})
 	}
 }
+
+func TestDataset_DataMigrateRefLifecycle(t *testing.T) {
+	blockingRef := DataMigrateRef{Name: "migrate-block", Namespace: "fluid", Block: true}
+	nonBlockingRef := DataMigrateRef{Name: "migrate-pass", Namespace: "fluid", Block: false}
+
+	t.Run("set and upsert keeps one entry per migration identity", func(t *testing.T) {
+		dataset := &Dataset{}
+		dataset.SetDataMigrateRef(blockingRef)
+		dataset.SetDataMigrateRef(nonBlockingRef)
+		if len(dataset.Status.DataMigrateRefs) != 2 {
+			t.Fatalf("expected 2 refs, got %d", len(dataset.Status.DataMigrateRefs))
+		}
+
+		// upsert the same identity with a changed block flag, no new entry
+		dataset.SetDataMigrateRef(DataMigrateRef{Name: "migrate-pass", Namespace: "fluid", Block: true})
+		if len(dataset.Status.DataMigrateRefs) != 2 {
+			t.Fatalf("expected still 2 refs after upsert, got %d", len(dataset.Status.DataMigrateRefs))
+		}
+		blocked, blockers := dataset.IsDataAccessBlocked()
+		if !blocked || len(blockers) != 2 {
+			t.Fatalf("expected 2 blockers, got blocked=%v blockers=%v", blocked, blockers)
+		}
+	})
+
+	t.Run("remove only the targeted migration entry", func(t *testing.T) {
+		dataset := &Dataset{}
+		dataset.SetDataMigrateRef(blockingRef)
+		dataset.SetDataMigrateRef(nonBlockingRef)
+
+		dataset.RemoveDataMigrateRef("fluid", "migrate-block")
+		blocked, blockers := dataset.IsDataAccessBlocked()
+		if blocked {
+			t.Fatalf("expected no blocker after removal, got %v", blockers)
+		}
+		if len(dataset.Status.DataMigrateRefs) != 1 || dataset.Status.DataMigrateRefs[0].Name != "migrate-pass" {
+			t.Fatalf("unexpected refs after removal: %v", dataset.Status.DataMigrateRefs)
+		}
+
+		// removing again is a no-op
+		dataset.RemoveDataMigrateRef("fluid", "migrate-block")
+		if len(dataset.Status.DataMigrateRefs) != 1 {
+			t.Fatalf("removal should be idempotent")
+		}
+	})
+
+	t.Run("non-blocking entry never blocks access", func(t *testing.T) {
+		dataset := &Dataset{}
+		dataset.SetDataMigrateRef(nonBlockingRef)
+		blocked, _ := dataset.IsDataAccessBlocked()
+		if blocked {
+			t.Fatalf("a block=false migration must not block dataset access")
+		}
+	})
+
+	t.Run("empty status reports not blocked", func(t *testing.T) {
+		dataset := &Dataset{}
+		blocked, blockers := dataset.IsDataAccessBlocked()
+		if blocked || blockers != nil {
+			t.Fatalf("fresh dataset should not be blocked")
+		}
+	})
+}

@@ -151,6 +151,13 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		mountPath = filepath.Join(mountPath, subPath)
 	}
 
+	// Enforce the explicit DataMigrate block on new publish calls. The isMount early
+	// return above guarantees that already mounted target paths (i.e. existing running
+	// mounts) keep succeeding and are never actively torn down by the block.
+	if err = ns.checkDatasetAccessBlocked(req.GetVolumeContext(), req.GetVolumeId()); err != nil {
+		return nil, err
+	}
+
 	// 1. Wait the runtime fuse ready and check the sub path existence
 	skipCheckMountReadyMountModeSelector, err := base.ParseMountModeSelectorFromStr(req.GetVolumeContext()[common.AnnotationSkipCheckMountReadyTarget])
 	if err != nil {
@@ -363,6 +370,13 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, errors.Wrapf(err, "NodeStageVolume: can't get namespace and name by volume id %s", volumeId)
 	}
 
+	// Enforce the explicit DataMigrate block on new stage calls before labeling the
+	// node, so that no new FUSE pod is launched for a blocked dataset.
+	if err = ns.checkDatasetAccessBlocked(req.GetVolumeContext(), volumeId); err != nil {
+		glog.Errorf("NodeStageVolume: new stage is blocked for dataset %s/%s: %v", namespace, name, err)
+		return nil, err
+	}
+
 	// 4. Label node to launch FUSE Pod
 	fuseLabelKey := req.GetVolumeContext()[common.VolumeAttrMountPodNodeSelectorKey]
 	if len(fuseLabelKey) == 0 {
@@ -447,6 +461,28 @@ func (ns *nodeServer) getRuntimeNamespacedName(volumeContext map[string]string, 
 	// Fallback: query API Server to get namespaced name
 	glog.Infof("Get runtime namespace and name directly from api server with volumeId %s", volumeId)
 	return volume.GetNamespacedNameByVolumeId(ns.apiReader, volumeId)
+}
+
+// checkDatasetAccessBlocked resolves the target dataset of a CSI request from its
+// volume context (or, as a fallback, from its volume id) and enforces the explicit
+// DataMigrate access block. An active block is reported as FailedPrecondition so that
+// kubelet keeps retrying and succeeds once the barrier is lifted, while transient API
+// errors fail closed with an Internal error instead of opening the access prematurely.
+func (ns *nodeServer) checkDatasetAccessBlocked(volumeContext map[string]string, volumeId string) error {
+	namespace, name, err := ns.getRuntimeNamespacedName(volumeContext, volumeId)
+	if err != nil {
+		return status.Error(codes.Internal, errors.Wrapf(err,
+			"failed to resolve target dataset for volume %s before checking DataMigrate block", volumeId).Error())
+	}
+
+	if err = utils.CheckDatasetDataAccessBlocked(ns.apiReader, namespace, name); err != nil {
+		if blockedErr, ok := err.(*utils.DatasetAccessBlockedError); ok {
+			return status.Error(codes.FailedPrecondition, blockedErr.Error())
+		}
+		return status.Error(codes.Internal, errors.Wrapf(err,
+			"failed to check DataMigrate block for dataset \"%s/%s\"", namespace, name).Error())
+	}
+	return nil
 }
 
 // getNode first checks cached node

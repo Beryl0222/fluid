@@ -62,6 +62,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataLoadSpec":                      schema_fluid_cloudnative_fluid_api_v1alpha1_DataLoadSpec(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrate":                       schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrate(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateList":                   schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateList(ref),
+		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateRef":                    schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateRef(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateSpec":                   schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateSpec(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataOperationSpec":                 schema_fluid_cloudnative_fluid_api_v1alpha1_DataOperationSpec(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataProcess":                       schema_fluid_cloudnative_fluid_api_v1alpha1_DataProcess(ref),
@@ -3416,6 +3417,20 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetStatus(ref common.Refere
 							},
 						},
 					},
+					"dataMigrateRefs": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DataMigrateRefs records the DataMigrate operations that occupy this Dataset. A DataMigrate with block=true explicitly blocks all new access to the Dataset (new pod admission, FUSE sidecar injection and new CSI NodeStage/NodePublish calls) until the migration completes, fails to a converged state or is deleted. Existing mounts are never torn down by the block.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateRef"),
+									},
+								},
+							},
+						},
+					},
 					"datasetRef": {
 						SchemaProps: spec.SchemaProps{
 							Description: "DatasetRef specifies the datasets namespaced name mounting this Dataset.",
@@ -3436,7 +3451,43 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetStatus(ref common.Refere
 			},
 		},
 		Dependencies: []string{
-			"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetCondition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.HCFSStatus", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Mount", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Runtime"},
+			"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetCondition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateRef", "github.com/fluid-cloudnative/fluid/api/v1alpha1.HCFSStatus", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Mount", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Runtime"},
+	}
+}
+
+func schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "DataMigrateRef records a DataMigrate operation that occupies a Dataset and whether new access to the Dataset is blocked by this migration.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the name of the DataMigrate that holds this reference.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"namespace": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Namespace is the namespace of the DataMigrate that holds this reference.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"block": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Block indicates whether new access to the Dataset is explicitly blocked by this DataMigrate. It is only set to true when the DataMigrate's spec.block is true.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
 	}
 }
 

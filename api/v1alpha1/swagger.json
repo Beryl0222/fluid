@@ -1324,6 +1324,28 @@
         }
       }
     },
+    ".DataMigrateRef": {
+      "description": "DataMigrateRef records a DataMigrate operation that occupies a Dataset and whether new access to the Dataset is blocked by this migration.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "block": {
+          "description": "Block indicates whether new access to the Dataset is explicitly blocked by this DataMigrate. It is only set to true when the DataMigrate's spec.block is true.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Name is the name of the DataMigrate that holds this reference.",
+          "type": "string",
+          "default": ""
+        },
+        "namespace": {
+          "description": "Namespace is the namespace of the DataMigrate that holds this reference.",
+          "type": "string"
+        }
+      }
+    },
     ".DataMigrateSpec": {
       "description": "DataMigrateSpec defines the desired state of DataMigrate",
       "type": "object",
@@ -1769,6 +1791,14 @@
         "dataLoadRef": {
           "description": "DataLoadRef specifies the running DataLoad job that targets this Dataset. This is mainly used as a lock to prevent concurrent DataLoad jobs. Deprecated, use OperationRef instead",
           "type": "string"
+        },
+        "dataMigrateRefs": {
+          "description": "DataMigrateRefs records the DataMigrate operations that occupy this Dataset. A DataMigrate with block=true explicitly blocks all new access to the Dataset (new pod admission, FUSE sidecar injection and new CSI NodeStage/NodePublish calls) until the migration completes, fails to a converged state or is deleted. Existing mounts are never torn down by the block.",
+          "type": "array",
+          "items": {
+            "default": {},
+            "$ref": "#/definitions/.DataMigrateRef"
+          }
         },
         "datasetRef": {
           "description": "DatasetRef specifies the datasets namespaced name mounting this Dataset.",

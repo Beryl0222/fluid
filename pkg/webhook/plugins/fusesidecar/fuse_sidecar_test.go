@@ -23,8 +23,11 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
 )
 
 var _ = Describe("FuseSidecar Plugin", func() {
@@ -32,10 +35,15 @@ var _ = Describe("FuseSidecar Plugin", func() {
 		fakeClient  client.Client
 		plugin      api.MutatingHandler
 		runtimeInfo base.RuntimeInfoInterface
+		scheme      *runtime.Scheme
 	)
 
 	BeforeEach(func() {
-		fakeClient = fake.NewFakeClient()
+		scheme = runtime.NewScheme()
+		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		Expect(datav1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient = fake.NewClientBuilder().WithScheme(scheme).Build()
 
 		var err error
 		plugin, err = NewPlugin(fakeClient, "")
@@ -95,6 +103,38 @@ var _ = Describe("FuseSidecar Plugin", func() {
 				shouldStop, err := plugin.Mutate(pod, runtimeInfos)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(shouldStop).To(BeFalse())
+			})
+		})
+
+		Context("when the dataset access is explicitly blocked by a DataMigrate", func() {
+			It("should return a block error before injecting the sidecar", func() {
+				blockedDataset := &v1alpha1.Dataset{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "fluid",
+					},
+					Status: v1alpha1.DatasetStatus{
+						DataMigrateRefs: []v1alpha1.DataMigrateRef{
+							{Name: "blocking-migrate", Namespace: "fluid", Block: true},
+						},
+					},
+				}
+				blockedClient := fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithObjects(blockedDataset).
+					Build()
+				blockedPlugin, err := NewPlugin(blockedClient, "")
+				Expect(err).NotTo(HaveOccurred())
+
+				runtimeInfos := map[string]base.RuntimeInfoInterface{
+					"test": runtimeInfo,
+				}
+
+				_, err = blockedPlugin.Mutate(pod, runtimeInfos)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
+				// No sidecar container should be injected when the block is in effect.
+				Expect(pod.Spec.Containers).To(BeEmpty())
 			})
 		})
 	})

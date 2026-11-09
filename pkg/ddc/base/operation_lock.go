@@ -116,6 +116,14 @@ func ReleaseTargetDataset(ctx cruntime.ReconcileRequestContext, operation dataop
 			// different operation may set other fields
 			operation.RemoveTargetDatasetStatusInProgress(datasetToUpdate)
 		}
+
+		// Always release the operation's own extra dataset state (e.g. DataMigrate's
+		// access block), even when other operations of the same type still hold the
+		// dataset, so that no stale per-operation state can be left behind.
+		if accessReleaser, ok := operation.(dataoperation.TargetDatasetAccessReleaser); ok {
+			accessReleaser.ReleaseTargetDatasetAccess(datasetToUpdate)
+		}
+
 		if !reflect.DeepEqual(datasetToUpdate.Status, dataset.Status) {
 			if err = ctx.Client.Status().Update(context.TODO(), datasetToUpdate); err != nil {
 				return err

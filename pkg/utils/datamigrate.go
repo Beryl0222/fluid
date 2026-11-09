@@ -19,6 +19,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -126,4 +127,64 @@ func GetTargetDatasetOfMigrate(client client.Client, dataMigrate *datav1alpha1.D
 	}
 
 	return GetDataset(client, namespacedName.Name, namespacedName.Namespace)
+}
+
+// DatasetAccessBlockedError is the explicit error returned when a new dataset access
+// (pod admission, FUSE sidecar injection or a CSI NodeStage/NodePublish call) is blocked
+// by an in-progress DataMigrate with spec.block=true. It is a typed error on purpose so
+// that the webhook can translate it into an admission denial and the CSI plugin into a
+// gRPC FailedPrecondition result. The skipPrecheck annotation must never bypass it.
+type DatasetAccessBlockedError struct {
+	// Namespace of the blocked dataset
+	Namespace string
+	// Name of the blocked dataset
+	Name string
+	// Blockers are the DataMigrate references that explicitly block the dataset access
+	Blockers []datav1alpha1.DataMigrateRef
+}
+
+var _ error = &DatasetAccessBlockedError{}
+
+func (e *DatasetAccessBlockedError) Error() string {
+	blockerNames := make([]string, 0, len(e.Blockers))
+	for _, blocker := range e.Blockers {
+		blockerNames = append(blockerNames, fmt.Sprintf("%s/%s", blocker.Namespace, blocker.Name))
+	}
+	return fmt.Sprintf("new access to dataset \"%s/%s\" is blocked by DataMigrate %s with spec.block=true",
+		e.Namespace, e.Name, strings.Join(blockerNames, ","))
+}
+
+// CheckDatasetDataAccessBlocked checks whether new access to the given dataset is
+// explicitly blocked by an occupying DataMigrate with block=true. It returns:
+//   - nil when the dataset does not exist (nothing left to protect) or is not blocked;
+//   - *DatasetAccessBlockedError when an explicit migration block is in effect;
+//   - any other error when the dataset cannot be read, in which case callers must fail
+//     closed (retry) instead of opening the access prematurely.
+//
+// The check is intentionally independent of the skipPrecheck annotation.
+func CheckDatasetDataAccessBlocked(c client.Reader, namespace, name string) error {
+	if c == nil {
+		return fmt.Errorf("dataset reader is nil")
+	}
+
+	dataset, err := GetDataset(c, name, namespace)
+	if err != nil {
+		// The dataset is gone (e.g. cascading deletion), there is no barrier to enforce.
+		if IgnoreNotFound(err) == nil {
+			return nil
+		}
+		// Transient API errors must not open the access, return the error for retry.
+		return err
+	}
+
+	blocked, blockers := dataset.IsDataAccessBlocked()
+	if !blocked {
+		return nil
+	}
+
+	return &DatasetAccessBlockedError{
+		Namespace: namespace,
+		Name:      name,
+		Blockers:  blockers,
+	}
 }

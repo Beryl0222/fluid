@@ -21,8 +21,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
+	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
 	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins"
 	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins/api"
 	webhookutils "github.com/fluid-cloudnative/fluid/pkg/webhook/utils"
@@ -98,6 +100,15 @@ func (a *FluidMutatingHandler) Handle(ctx context.Context, req admission.Request
 
 	backupPod := pod.DeepCopy()
 	if err := a.MutatePod(pod, false); err != nil {
+		// An explicit DataMigrate block must result in an admission denial instead of
+		// a generic 500 error, even when the error is wrapped by lower-level plugins.
+		var blockedErr *utils.DatasetAccessBlockedError
+		if errors.As(err, &blockedErr) {
+			setupLog.Info("deny pod admission because new dataset access is blocked by DataMigrate",
+				"Pod", pod.Name, "Namespace", pod.Namespace, "reason", blockedErr.Error())
+			return admission.Denied(blockedErr.Error())
+		}
+
 		setupLog.Error(err, "failed to mutate pod with cache client", "Pod", pod.Name, "Namespace", pod.Namespace)
 		if webhookutils.IsNeedRetryWithApiReaderError(err) {
 			setupLog.Info("retrying with API reader",
@@ -107,6 +118,10 @@ func (a *FluidMutatingHandler) Handle(ctx context.Context, req admission.Request
 			)
 			pod = backupPod
 			if err := a.MutatePod(pod, true); err != nil {
+				var retryBlockedErr *utils.DatasetAccessBlockedError
+				if errors.As(err, &retryBlockedErr) {
+					return admission.Denied(retryBlockedErr.Error())
+				}
 				return admission.Errored(http.StatusInternalServerError, err)
 			}
 		}
@@ -148,6 +163,13 @@ func (a *FluidMutatingHandler) MutatePod(pod *corev1.Pod, useDirectReader bool) 
 		return webhookutils.NewNeedRetryWithApiReaderError(errors.Wrapf(err, "failed to collect runtime infos from PVCs %v", pvcNames))
 	}
 
+	// Enforce the explicit DataMigrate access block. The check is deliberately placed
+	// outside the skipPrecheck branch so that the skipPrecheck annotation can never
+	// bypass an explicit block, and it runs before any plugin mutates the pod.
+	if err = checkDatasetsDataAccessBlocked(handlerClient, runtimeInfos); err != nil {
+		return err
+	}
+
 	// get plugins registry and get the need plugins list from it
 	pluginsRegistry := plugins.GetRegistryHandler()
 	var pluginsList []api.MutatingHandler
@@ -186,4 +208,36 @@ func (a *FluidMutatingHandler) MutatePod(pod *corev1.Pod, useDirectReader bool) 
 
 	return
 
+}
+
+// checkDatasetsDataAccessBlocked enforces the explicit DataMigrate block on every
+// dataset referenced by the pod. It returns *utils.DatasetAccessBlockedError directly
+// when a block is in effect so that the admission handler can translate it into a
+// denial. Transient API errors are wrapped into a NeedRetryWithApiReaderError so that
+// the handler retries with the direct API reader and fails closed instead of admitting
+// the pod when the block state cannot be determined.
+func checkDatasetsDataAccessBlocked(c client.Reader, runtimeInfos map[string]base.RuntimeInfoInterface) error {
+	pvcNames := make([]string, 0, len(runtimeInfos))
+	for pvcName := range runtimeInfos {
+		pvcNames = append(pvcNames, pvcName)
+	}
+	sort.Strings(pvcNames)
+
+	for _, pvcName := range pvcNames {
+		runtimeInfo := runtimeInfos[pvcName]
+		if runtimeInfo == nil {
+			continue
+		}
+		err := utils.CheckDatasetDataAccessBlocked(c, runtimeInfo.GetNamespace(), runtimeInfo.GetName())
+		if err == nil {
+			continue
+		}
+		if _, ok := err.(*utils.DatasetAccessBlockedError); ok {
+			return err
+		}
+		return webhookutils.NewNeedRetryWithApiReaderError(
+			errors.Wrapf(err, "failed to check DataMigrate block for dataset \"%s/%s\"",
+				runtimeInfo.GetNamespace(), runtimeInfo.GetName()))
+	}
+	return nil
 }

@@ -17,13 +17,18 @@
 package utils
 
 import (
-	"github.com/fluid-cloudnative/fluid/pkg/common"
+	"context"
+	"fmt"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+	"github.com/fluid-cloudnative/fluid/pkg/common"
 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
 )
 
@@ -281,4 +286,88 @@ func TestGetTargetDatasetOfMigrate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failingReader is a client.Reader that always returns the injected error, used to
+// verify that transient API errors fail closed instead of opening dataset access.
+type failingReader struct {
+	err error
+}
+
+func (f *failingReader) Get(_ context.Context, _ types.NamespacedName, _ client.Object, _ ...client.GetOption) error {
+	return f.err
+}
+
+func (f *failingReader) List(_ context.Context, _ client.ObjectList, _ ...client.ListOption) error {
+	return f.err
+}
+
+func TestCheckDatasetDataAccessBlocked(t *testing.T) {
+	const namespace, name = "fluid", "test-dataset"
+
+	blockedDataset := &datav1alpha1.Dataset{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Status: datav1alpha1.DatasetStatus{
+			DataMigrateRefs: []datav1alpha1.DataMigrateRef{
+				{Name: "migration-job", Namespace: namespace, Block: true},
+			},
+		},
+	}
+	nonBlockedDataset := &datav1alpha1.Dataset{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Status: datav1alpha1.DatasetStatus{
+			DataMigrateRefs: []datav1alpha1.DataMigrateRef{
+				{Name: "migration-job", Namespace: namespace, Block: false},
+			},
+		},
+	}
+
+	t.Run("explicit block returns a typed block error", func(t *testing.T) {
+		c := fake.NewFakeClientWithScheme(testScheme, blockedDataset.DeepCopy())
+		err := CheckDatasetDataAccessBlocked(c, namespace, name)
+		if err == nil {
+			t.Fatal("expected block error, got nil")
+		}
+		blockedErr, ok := err.(*DatasetAccessBlockedError)
+		if !ok {
+			t.Fatalf("expected *DatasetAccessBlockedError, got %T: %v", err, err)
+		}
+		if blockedErr.Name != name || blockedErr.Namespace != namespace {
+			t.Fatalf("unexpected error target: %+v", blockedErr)
+		}
+		if len(blockedErr.Blockers) != 1 || blockedErr.Blockers[0].Name != "migration-job" {
+			t.Fatalf("unexpected blockers: %v", blockedErr.Blockers)
+		}
+	})
+
+	t.Run("block=false migration allows access", func(t *testing.T) {
+		c := fake.NewFakeClientWithScheme(testScheme, nonBlockedDataset.DeepCopy())
+		if err := CheckDatasetDataAccessBlocked(c, namespace, name); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("missing dataset opens nothing but does not block", func(t *testing.T) {
+		c := fake.NewFakeClientWithScheme(testScheme)
+		if err := CheckDatasetDataAccessBlocked(c, namespace, "gone-dataset"); err != nil {
+			t.Fatalf("expected nil for a deleted dataset, got %v", err)
+		}
+	})
+
+	t.Run("nil reader fails with an error", func(t *testing.T) {
+		if err := CheckDatasetDataAccessBlocked(nil, namespace, name); err == nil {
+			t.Fatal("expected error for nil reader")
+		}
+	})
+
+	t.Run("transient API error fails closed", func(t *testing.T) {
+		reader := &failingReader{err: apierrors.NewInternalError(fmt.Errorf("api server unavailable"))}
+		err := CheckDatasetDataAccessBlocked(reader, namespace, name)
+		if err == nil {
+			t.Fatal("expected error when dataset cannot be read")
+		}
+		if _, ok := err.(*DatasetAccessBlockedError); ok {
+			t.Fatalf("transient errors must not be misreported as block: %v", err)
+		}
+	})
 }

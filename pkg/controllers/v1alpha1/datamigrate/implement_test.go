@@ -254,6 +254,147 @@ var _ = Describe("dataMigrateOperation", func() {
 		})
 	})
 
+	Describe("DataMigrate access block barrier", func() {
+		const migrateName, migrateNamespace = "blocking-migrate", "fluid"
+
+		newOperation := func(block bool, policy datav1alpha1.Policy, deleting bool) *dataMigrateOperation {
+			dm := &datav1alpha1.DataMigrate{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      migrateName,
+					Namespace: migrateNamespace,
+				},
+				Spec: datav1alpha1.DataMigrateSpec{
+					Block:  block,
+					Policy: policy,
+				},
+			}
+			if deleting {
+				dm.ObjectMeta.DeletionTimestamp = &v1.Time{Time: v1.Now().Time}
+			}
+			return &dataMigrateOperation{dataMigrate: dm}
+		}
+
+		It("installs an identity-scoped barrier when block=true and the dataset is occupied", func() {
+			op := newOperation(true, datav1alpha1.Once, false)
+			dataset := &datav1alpha1.Dataset{}
+
+			op.SetTargetDatasetStatusInProgress(dataset)
+
+			Expect(dataset.Status.Phase).To(Equal(datav1alpha1.DataMigrating))
+			blocked, blockers := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeTrue())
+			Expect(blockers).To(HaveLen(1))
+			Expect(blockers[0].Name).To(Equal(migrateName))
+			Expect(blockers[0].Namespace).To(Equal(migrateNamespace))
+		})
+
+		It("does not install any barrier when block=false", func() {
+			op := newOperation(false, datav1alpha1.Once, false)
+			dataset := &datav1alpha1.Dataset{}
+
+			op.SetTargetDatasetStatusInProgress(dataset)
+
+			blocked, _ := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeFalse())
+			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
+		})
+
+		It("removes a stale barrier when block is flipped back to false on re-acquire", func() {
+			op := newOperation(false, datav1alpha1.Cron, false)
+			dataset := &datav1alpha1.Dataset{}
+			dataset.SetDataMigrateRef(datav1alpha1.DataMigrateRef{
+				Name: migrateName, Namespace: migrateNamespace, Block: true,
+			})
+
+			op.SetTargetDatasetStatusInProgress(dataset)
+
+			blocked, _ := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeFalse())
+			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
+		})
+
+		It("releases the barrier when a Once migration converges", func() {
+			op := newOperation(true, datav1alpha1.Once, false)
+			dataset := &datav1alpha1.Dataset{}
+			op.SetTargetDatasetStatusInProgress(dataset)
+
+			op.ReleaseTargetDatasetAccess(dataset)
+
+			blocked, _ := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeFalse())
+			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
+		})
+
+		It("keeps the barrier across Cron rounds until the DataMigrate is deleted", func() {
+			op := newOperation(true, datav1alpha1.Cron, false)
+			dataset := &datav1alpha1.Dataset{}
+			op.SetTargetDatasetStatusInProgress(dataset)
+
+			// A transient Complete/Failed state between two scheduled rounds must not
+			// open the barrier prematurely.
+			op.ReleaseTargetDatasetAccess(dataset)
+			blocked, _ := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeTrue())
+
+			// The next round re-asserts the same identity-scoped entry.
+			op.SetTargetDatasetStatusInProgress(dataset)
+			Expect(dataset.Status.DataMigrateRefs).To(HaveLen(1))
+
+			// Deletion cleanup finally lifts the barrier.
+			deletingOp := newOperation(true, datav1alpha1.Cron, true)
+			deletingOp.ReleaseTargetDatasetAccess(dataset)
+			blocked, _ = dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeFalse())
+			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
+		})
+
+		It("heals the barrier when block is flipped to false between Cron rounds", func() {
+			blockingOp := newOperation(true, datav1alpha1.Cron, false)
+			dataset := &datav1alpha1.Dataset{}
+			blockingOp.SetTargetDatasetStatusInProgress(dataset)
+			Expect(dataset.IsDataAccessBlocked()).To(BeTrue())
+
+			// The admin flips block back to false; the next spec-triggered reconcile runs
+			// the release hook while the DataMigrate keeps existing between rounds.
+			openOp := newOperation(false, datav1alpha1.Cron, false)
+			openOp.ReleaseTargetDatasetAccess(dataset)
+			blocked, _ := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeFalse())
+			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
+		})
+
+		It("keeps the barrier across OnEvent rounds until deletion", func() {
+			op := newOperation(true, datav1alpha1.OnEvent, false)
+			dataset := &datav1alpha1.Dataset{}
+			op.SetTargetDatasetStatusInProgress(dataset)
+
+			op.ReleaseTargetDatasetAccess(dataset)
+			blocked, _ := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeTrue())
+
+			deletingOp := newOperation(true, datav1alpha1.OnEvent, true)
+			deletingOp.ReleaseTargetDatasetAccess(dataset)
+			blocked, _ = dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeFalse())
+		})
+
+		It("only removes its own entry when other migrations still occupy the dataset", func() {
+			op := newOperation(true, datav1alpha1.Once, false)
+			dataset := &datav1alpha1.Dataset{}
+			op.SetTargetDatasetStatusInProgress(dataset)
+			dataset.SetDataMigrateRef(datav1alpha1.DataMigrateRef{
+				Name: "other-migrate", Namespace: migrateNamespace, Block: true,
+			})
+
+			op.ReleaseTargetDatasetAccess(dataset)
+
+			blocked, blockers := dataset.IsDataAccessBlocked()
+			Expect(blocked).To(BeTrue())
+			Expect(blockers).To(HaveLen(1))
+			Expect(blockers[0].Name).To(Equal("other-migrate"))
+		})
+	})
+
 	Describe("GetStatusHandler", func() {
 		It("should return OnceStatusHandler for Once policy", func() {
 			op := &dataMigrateOperation{

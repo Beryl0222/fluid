@@ -81,3 +81,15 @@ type StatusHandler interface {
 	// GetOperationStatus get operation status according to helm chart status
 	GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus) (result *datav1alpha1.OperationStatus, err error)
 }
+
+// TargetDatasetAccessReleaser is an optional interface implemented by operations that
+// hold additional per-operation state on the target dataset (e.g. DataMigrate's access
+// block). Unlike OperationInterface.RemoveTargetDatasetStatusInProgress, which is only
+// invoked when no other operation of the same type is still in progress, the hook here
+// is invoked on every ReleaseTargetDataset call so that each operation can always clean
+// up its own state even when other operations still hold the dataset.
+type TargetDatasetAccessReleaser interface {
+	// ReleaseTargetDatasetAccess releases the extra dataset state owned by this
+	// operation. Implementations must be idempotent.
+	ReleaseTargetDatasetAccess(dataset *datav1alpha1.Dataset)
+}

@@ -231,8 +231,32 @@ type DatasetStatus struct {
 	// This is mainly used as a lock to prevent concurrent same Operation jobs.
 	OperationRef map[string]string `json:"operationRef,omitempty"`
 
+	// DataMigrateRefs records the DataMigrate operations that occupy this Dataset.
+	// A DataMigrate with block=true explicitly blocks all new access to the Dataset
+	// (new pod admission, FUSE sidecar injection and new CSI NodeStage/NodePublish calls)
+	// until the migration completes, fails to a converged state or is deleted. Existing
+	// mounts are never torn down by the block.
+	// +optional
+	DataMigrateRefs []DataMigrateRef `json:"dataMigrateRefs,omitempty"`
+
 	// DatasetRef specifies the datasets namespaced name mounting this Dataset.
 	DatasetRef []string `json:"datasetRef,omitempty"`
+}
+
+// DataMigrateRef records a DataMigrate operation that occupies a Dataset and whether
+// new access to the Dataset is blocked by this migration.
+type DataMigrateRef struct {
+	// Name is the name of the DataMigrate that holds this reference.
+	Name string `json:"name"`
+
+	// Namespace is the namespace of the DataMigrate that holds this reference.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Block indicates whether new access to the Dataset is explicitly blocked by
+	// this DataMigrate. It is only set to true when the DataMigrate's spec.block is true.
+	// +optional
+	Block bool `json:"block,omitempty"`
 }
 
 // DatasetConditionType defines all kinds of types of cacheStatus.<br>
@@ -391,4 +415,41 @@ func (dataset *Dataset) RemoveDataOperationInProgress(operationType, name string
 	}
 	dataset.Status.OperationRef[operationType] = strings.Join(dataOpKeys, ",")
 	return dataset.Status.OperationRef[operationType]
+}
+
+// SetDataMigrateRef records (or updates) the DataMigrate reference that occupies this
+// Dataset. The reference is keyed by the DataMigrate's namespace and name so that
+// concurrent DataMigrates keep their own entry.
+func (dataset *Dataset) SetDataMigrateRef(ref DataMigrateRef) {
+	for i := range dataset.Status.DataMigrateRefs {
+		existing := &dataset.Status.DataMigrateRefs[i]
+		if existing.Name == ref.Name && existing.Namespace == ref.Namespace {
+			existing.Block = ref.Block
+			return
+		}
+	}
+	dataset.Status.DataMigrateRefs = append(dataset.Status.DataMigrateRefs, ref)
+}
+
+// RemoveDataMigrateRef removes the DataMigrate reference identified by its namespace
+// and name. It is a no-op when no matching reference exists.
+func (dataset *Dataset) RemoveDataMigrateRef(namespace, name string) {
+	refs := dataset.Status.DataMigrateRefs
+	for i := range refs {
+		if refs[i].Name == name && refs[i].Namespace == namespace {
+			dataset.Status.DataMigrateRefs = append(refs[:i], refs[i+1:]...)
+			return
+		}
+	}
+}
+
+// IsDataAccessBlocked reports whether new access to the Dataset is explicitly blocked
+// by any occupying DataMigrate with block=true, together with the blocking references.
+func (dataset *Dataset) IsDataAccessBlocked() (blocked bool, blockers []DataMigrateRef) {
+	for i := range dataset.Status.DataMigrateRefs {
+		if dataset.Status.DataMigrateRefs[i].Block {
+			blockers = append(blockers, dataset.Status.DataMigrateRefs[i])
+		}
+	}
+	return len(blockers) > 0, blockers
 }

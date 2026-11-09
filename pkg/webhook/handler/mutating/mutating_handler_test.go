@@ -18,13 +18,16 @@ package mutating
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 
 	"github.com/agiledragon/gomonkey/v2"
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
 	"github.com/fluid-cloudnative/fluid/pkg/common"
+	fluidutils "github.com/fluid-cloudnative/fluid/pkg/utils"
 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
 	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins"
+	"github.com/pkg/errors"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -1946,5 +1949,221 @@ var _ = Describe("MutatePod - PVC Collection Error", func() {
 
 		err := handler.MutatePod(pod, false)
 		Expect(err).To(HaveOccurred())
+	})
+})
+
+var _ = Describe("DataMigrate access block", func() {
+	const (
+		blockNamespace = "big-data"
+		blockPVCName   = "exist"
+	)
+
+	var (
+		s     *runtime.Scheme
+		patch *gomonkey.Patches
+	)
+
+	BeforeEach(func() {
+		s = runtime.NewScheme()
+		Expect(corev1.AddToScheme(s)).To(Succeed())
+		Expect(datav1alpha1.AddToScheme(s)).To(Succeed())
+		Expect(appsv1.AddToScheme(s)).To(Succeed())
+
+		mockReadFile := func(content string) ([]byte, error) {
+			return []byte(pluginsProfile), nil
+		}
+		patch = gomonkey.ApplyFunc(os.ReadFile, mockReadFile)
+	})
+
+	AfterEach(func() {
+		patch.Reset()
+	})
+
+	buildBlockedDataset := func(blocked bool) *datav1alpha1.Dataset {
+		dataset := &datav1alpha1.Dataset{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      blockPVCName,
+				Namespace: blockNamespace,
+			},
+			Status: datav1alpha1.DatasetStatus{
+				Phase: datav1alpha1.BoundDatasetPhase,
+				Runtimes: []datav1alpha1.Runtime{
+					{
+						Name:      blockPVCName,
+						Namespace: blockNamespace,
+						Type:      common.JindoRuntime,
+					},
+				},
+			},
+		}
+		if blocked {
+			dataset.Status.DataMigrateRefs = []datav1alpha1.DataMigrateRef{
+				{Name: "blocking-migrate", Namespace: blockNamespace, Block: true},
+			}
+		} else {
+			dataset.Status.DataMigrateRefs = []datav1alpha1.DataMigrateRef{
+				{Name: "non-blocking-migrate", Namespace: blockNamespace, Block: false},
+			}
+		}
+		return dataset
+	}
+
+	buildFixtures := func(dataset *datav1alpha1.Dataset) []runtime.Object {
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: blockNamespace + "-" + blockPVCName},
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{
+						Driver: "fuse.csi.fluid.io",
+						VolumeAttributes: map[string]string{
+							common.VolumeAttrFluidPath: "/runtime-mnt/jindo/big-data/exist/jindofs-fuse",
+							common.VolumeAttrMountType: common.JindoRuntime,
+						},
+					},
+				},
+			},
+		}
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      blockPVCName,
+				Namespace: blockNamespace,
+				Labels: map[string]string{
+					"fluid.io/s-big-data-exist": "true",
+				},
+			},
+			Spec: corev1.PersistentVolumeSpec{
+				VolumeName: blockNamespace + "-" + blockPVCName,
+			},
+		}
+		jindoRuntime := &datav1alpha1.JindoRuntime{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      blockPVCName,
+				Namespace: blockNamespace,
+			},
+		}
+		// Same fuse DaemonSet fixture as the successful serverless mutation test,
+		// so that a non-blocked dataset goes through the whole injection pipeline.
+		privileged := true
+		fuseDaemonSet := &appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      blockPVCName + "-jindofs-fuse",
+				Namespace: blockNamespace,
+			},
+			Spec: appsv1.DaemonSetSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:    "fuse",
+								Image:   "test",
+								Command: []string{"/entrypoint.sh"},
+								Args:    []string{"-okernel_cache"},
+								SecurityContext: &corev1.SecurityContext{
+									Privileged: &privileged,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		return []runtime.Object{dataset, pv, pvc, jindoRuntime, fuseDaemonSet}
+	}
+
+	buildPod := func(skipPrecheck bool) *corev1.Pod {
+		annotations := map[string]string{}
+		if skipPrecheck {
+			annotations[common.SkipPrecheckAnnotationKey] = common.True
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "blocked-pod",
+				Namespace:   blockNamespace,
+				Labels:      map[string]string{common.InjectServerless: common.True},
+				Annotations: annotations,
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Image: "test",
+						Name:  "test",
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "dataset", MountPath: "/data"},
+						},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "dataset",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: blockPVCName,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	It("should return a typed block error from MutatePod when the dataset is blocked", func() {
+		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(true))...)
+		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
+
+		handler := &FluidMutatingHandler{Client: fakeClient, Reader: fakeClient}
+		err := handler.MutatePod(buildPod(false), false)
+		Expect(err).To(HaveOccurred())
+
+		var blockedErr *fluidutils.DatasetAccessBlockedError
+		Expect(errors.As(err, &blockedErr)).To(BeTrue())
+		Expect(blockedErr.Name).To(Equal(blockPVCName))
+	})
+
+	It("should not let the skipPrecheck annotation bypass an explicit block", func() {
+		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(true))...)
+		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
+
+		handler := &FluidMutatingHandler{Client: fakeClient, Reader: fakeClient}
+		err := handler.MutatePod(buildPod(true), true)
+		Expect(err).To(HaveOccurred())
+
+		var blockedErr *fluidutils.DatasetAccessBlockedError
+		Expect(errors.As(err, &blockedErr)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
+	})
+
+	It("should allow mutation when the migration does not set block", func() {
+		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(false))...)
+		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
+
+		handler := &FluidMutatingHandler{Client: fakeClient, Reader: fakeClient}
+		err := handler.MutatePod(buildPod(false), false)
+		// Whatever the downstream injection does, it must never be a migration block.
+		var blockedErr *fluidutils.DatasetAccessBlockedError
+		Expect(errors.As(err, &blockedErr)).To(BeFalse())
+	})
+
+	It("should translate the block into an explicit admission denial", func() {
+		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(true))...)
+		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
+
+		decoder := admission.NewDecoder(scheme.Scheme)
+		handler := &FluidMutatingHandler{}
+		handler.Setup(fakeClient, fakeClient, decoder)
+
+		rawPod, err := json.Marshal(buildPod(false))
+		Expect(err).NotTo(HaveOccurred())
+
+		req := admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				Namespace: blockNamespace,
+				Object:    runtime.RawExtension{Raw: rawPod},
+			},
+		}
+
+		resp := handler.Handle(context.TODO(), req)
+		Expect(resp.AdmissionResponse.Allowed).To(BeFalse())
+		Expect(resp.AdmissionResponse.Result).NotTo(BeNil())
+		Expect(resp.AdmissionResponse.Result.Message).To(ContainSubstring("blocked by DataMigrate"))
 	})
 })

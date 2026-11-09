@@ -514,6 +514,85 @@ var _ = Describe("NodeServer", func() {
 				_ = err
 			})
 		})
+
+		Context("when the target dataset is blocked by a DataMigrate", func() {
+			var blockedDataset *v1alpha1.Dataset
+
+			BeforeEach(func() {
+				blockedDataset = &v1alpha1.Dataset{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      testName,
+						Namespace: testNamespace,
+					},
+					Status: v1alpha1.DatasetStatus{
+						DataMigrateRefs: []v1alpha1.DataMigrateRef{
+							{Name: "blocking-migrate", Namespace: testNamespace, Block: true},
+						},
+					},
+				}
+				blockedClient := fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithObjects(testNode, blockedDataset).
+					Build()
+				ns.client = blockedClient
+				ns.apiReader = blockedClient
+			})
+
+			It("should reject a new publish with FailedPrecondition and never reach the mount", func() {
+				tempDir, err := os.MkdirTemp("", "node-publish-blocked-*")
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(func() {
+					Expect(os.RemoveAll(tempDir)).To(Succeed())
+				})
+
+				Expect(os.Setenv(utils.MountRoot, tempDir)).To(Succeed())
+				DeferCleanup(func() {
+					Expect(os.Unsetenv(utils.MountRoot)).To(Succeed())
+				})
+
+				isMountedPatch := gomonkey.ApplyFunc(utils.IsMounted, func(absPath string) (bool, error) {
+					return false, os.ErrNotExist
+				})
+				defer isMountedPatch.Reset()
+
+				req := &csi.NodePublishVolumeRequest{
+					VolumeId:   testVolumeID,
+					TargetPath: filepath.Join(tempDir, "target"),
+					VolumeContext: map[string]string{
+						common.VolumeAttrFluidPath:  filepath.Join(tempDir, testName, "fuse"),
+						common.VolumeAttrName:       testName,
+						common.VolumeAttrNamespace:  testNamespace,
+					},
+				}
+
+				resp, err := ns.NodePublishVolume(context.Background(), req)
+				Expect(err).To(HaveOccurred())
+				Expect(resp).To(BeNil())
+				Expect(status.Code(err)).To(Equal(codes.FailedPrecondition))
+				Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
+			})
+
+			It("should keep an already mounted target path working without actively breaking it", func() {
+				// An existing mount hits the idempotent isMount early-return, which must run
+				// before the block check so running workloads are not disrupted.
+				isMountedPatch := gomonkey.ApplyFunc(utils.IsMounted, func(absPath string) (bool, error) {
+					return true, nil
+				})
+				defer isMountedPatch.Reset()
+
+				req := &csi.NodePublishVolumeRequest{
+					VolumeId:   testVolumeID,
+					TargetPath: testTargetPath,
+					VolumeContext: map[string]string{
+						common.VolumeAttrFluidPath: testFluidPath,
+					},
+				}
+
+				resp, err := ns.NodePublishVolume(context.Background(), req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+			})
+		})
 	})
 
 	Describe("NodeUnpublishVolume", func() {
@@ -817,6 +896,82 @@ var _ = Describe("NodeServer", func() {
 
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp).NotTo(BeNil())
+			})
+		})
+
+		Context("when the target dataset is blocked by a DataMigrate", func() {
+			fuseLabelKey := "fluid.io/f-default-test-dataset"
+			stageReq := func() *csi.NodeStageVolumeRequest {
+				return &csi.NodeStageVolumeRequest{
+					VolumeId: testVolumeID,
+					VolumeContext: map[string]string{
+						common.VolumeAttrName:                    testName,
+						common.VolumeAttrNamespace:               testNamespace,
+						common.VolumeAttrFluidPath:               testFluidPath,
+						common.VolumeAttrMountPodNodeSelectorKey: fuseLabelKey,
+					},
+				}
+			}
+
+			It("should reject a new stage with FailedPrecondition and not label the node", func() {
+				blockedDataset := &v1alpha1.Dataset{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      testName,
+						Namespace: testNamespace,
+					},
+					Status: v1alpha1.DatasetStatus{
+						DataMigrateRefs: []v1alpha1.DataMigrateRef{
+							{Name: "blocking-migrate", Namespace: testNamespace, Block: true},
+						},
+					},
+				}
+				blockedClient := fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithObjects(testNode, blockedDataset).
+					Build()
+				ns.client = blockedClient
+				ns.apiReader = blockedClient
+				ns.node = nil
+
+				resp, err := ns.NodeStageVolume(context.Background(), stageReq())
+				Expect(err).To(HaveOccurred())
+				Expect(resp).To(BeNil())
+				Expect(status.Code(err)).To(Equal(codes.FailedPrecondition))
+				Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
+
+				// No node label must be patched, so no FUSE pod is launched.
+				updatedNode := &corev1.Node{}
+				Expect(blockedClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, updatedNode)).To(Succeed())
+				Expect(updatedNode.Labels).NotTo(HaveKey(fuseLabelKey))
+			})
+
+			It("should allow the stage when the migration does not set block", func() {
+				nonBlockedDataset := &v1alpha1.Dataset{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      testName,
+						Namespace: testNamespace,
+					},
+					Status: v1alpha1.DatasetStatus{
+						DataMigrateRefs: []v1alpha1.DataMigrateRef{
+							{Name: "non-blocking-migrate", Namespace: testNamespace, Block: false},
+						},
+					},
+				}
+				openClient := fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithObjects(testNode, nonBlockedDataset).
+					Build()
+				ns.client = openClient
+				ns.apiReader = openClient
+				ns.node = nil
+
+				resp, err := ns.NodeStageVolume(context.Background(), stageReq())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+
+				updatedNode := &corev1.Node{}
+				Expect(openClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, updatedNode)).To(Succeed())
+				Expect(updatedNode.Labels).To(HaveKeyWithValue(fuseLabelKey, "true"))
 			})
 		})
 	})

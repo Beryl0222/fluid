@@ -278,6 +278,19 @@ spec:
                 type: string
               dataLoadRef:
                 type: string
+              dataMigrateRefs:
+                items:
+                  properties:
+                    block:
+                      type: boolean
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               datasetRef:
                 items:
                   type: string

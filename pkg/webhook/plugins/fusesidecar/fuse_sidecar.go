@@ -69,6 +69,19 @@ func (p *FuseSidecar) Mutate(pod *corev1.Pod, runtimeInfos map[string]base.Runti
 	}
 
 	for len(runtimeInfos) > 0 {
+		// Enforce the explicit DataMigrate block on every dataset to be injected,
+		// including transitive datasets discovered during the injection loop. The
+		// check is independent of the skipPrecheck annotation.
+		for _, runtimeInfo := range runtimeInfos {
+			if runtimeInfo == nil {
+				continue
+			}
+			if err := utils.CheckDatasetDataAccessBlocked(p.client, runtimeInfo.GetNamespace(), runtimeInfo.GetName()); err != nil {
+				return shouldStop, errors.Wrapf(err, "fuse sidecar injection is blocked for dataset \"%s/%s\"",
+					runtimeInfo.GetNamespace(), runtimeInfo.GetName())
+			}
+		}
+
 		var injector inject.Injector = fuse.NewInjector(p.client)
 		out, err := injector.InjectPod(pod, runtimeInfos)
 		if err != nil {

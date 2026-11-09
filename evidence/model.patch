@@ -1,0 +1,1558 @@
+diff --git a/api/v1alpha1/dataset_types.go b/api/v1alpha1/dataset_types.go
+index 91524bc..500875a 100644
+--- a/api/v1alpha1/dataset_types.go
++++ b/api/v1alpha1/dataset_types.go
+@@ -231,10 +231,34 @@ type DatasetStatus struct {
+ 	// This is mainly used as a lock to prevent concurrent same Operation jobs.
+ 	OperationRef map[string]string `json:"operationRef,omitempty"`
+ 
++	// DataMigrateRefs records the DataMigrate operations that occupy this Dataset.
++	// A DataMigrate with block=true explicitly blocks all new access to the Dataset
++	// (new pod admission, FUSE sidecar injection and new CSI NodeStage/NodePublish calls)
++	// until the migration completes, fails to a converged state or is deleted. Existing
++	// mounts are never torn down by the block.
++	// +optional
++	DataMigrateRefs []DataMigrateRef `json:"dataMigrateRefs,omitempty"`
++
+ 	// DatasetRef specifies the datasets namespaced name mounting this Dataset.
+ 	DatasetRef []string `json:"datasetRef,omitempty"`
+ }
+ 
++// DataMigrateRef records a DataMigrate operation that occupies a Dataset and whether
++// new access to the Dataset is blocked by this migration.
++type DataMigrateRef struct {
++	// Name is the name of the DataMigrate that holds this reference.
++	Name string `json:"name"`
++
++	// Namespace is the namespace of the DataMigrate that holds this reference.
++	// +optional
++	Namespace string `json:"namespace,omitempty"`
++
++	// Block indicates whether new access to the Dataset is explicitly blocked by
++	// this DataMigrate. It is only set to true when the DataMigrate's spec.block is true.
++	// +optional
++	Block bool `json:"block,omitempty"`
++}
++
+ // DatasetConditionType defines all kinds of types of cacheStatus.<br>
+ // one of the three types: `RuntimeScheduled`, `Ready` and `Initialized`
+ type DatasetConditionType string
+@@ -392,3 +416,40 @@ func (dataset *Dataset) RemoveDataOperationInProgress(operationType, name string
+ 	dataset.Status.OperationRef[operationType] = strings.Join(dataOpKeys, ",")
+ 	return dataset.Status.OperationRef[operationType]
+ }
++
++// SetDataMigrateRef records (or updates) the DataMigrate reference that occupies this
++// Dataset. The reference is keyed by the DataMigrate's namespace and name so that
++// concurrent DataMigrates keep their own entry.
++func (dataset *Dataset) SetDataMigrateRef(ref DataMigrateRef) {
++	for i := range dataset.Status.DataMigrateRefs {
++		existing := &dataset.Status.DataMigrateRefs[i]
++		if existing.Name == ref.Name && existing.Namespace == ref.Namespace {
++			existing.Block = ref.Block
++			return
++		}
++	}
++	dataset.Status.DataMigrateRefs = append(dataset.Status.DataMigrateRefs, ref)
++}
++
++// RemoveDataMigrateRef removes the DataMigrate reference identified by its namespace
++// and name. It is a no-op when no matching reference exists.
++func (dataset *Dataset) RemoveDataMigrateRef(namespace, name string) {
++	refs := dataset.Status.DataMigrateRefs
++	for i := range refs {
++		if refs[i].Name == name && refs[i].Namespace == namespace {
++			dataset.Status.DataMigrateRefs = append(refs[:i], refs[i+1:]...)
++			return
++		}
++	}
++}
++
++// IsDataAccessBlocked reports whether new access to the Dataset is explicitly blocked
++// by any occupying DataMigrate with block=true, together with the blocking references.
++func (dataset *Dataset) IsDataAccessBlocked() (blocked bool, blockers []DataMigrateRef) {
++	for i := range dataset.Status.DataMigrateRefs {
++		if dataset.Status.DataMigrateRefs[i].Block {
++			blockers = append(blockers, dataset.Status.DataMigrateRefs[i])
++		}
++	}
++	return len(blockers) > 0, blockers
++}
+diff --git a/api/v1alpha1/dataset_types_test.go b/api/v1alpha1/dataset_types_test.go
+index 8a567e4..2942f60 100644
+--- a/api/v1alpha1/dataset_types_test.go
++++ b/api/v1alpha1/dataset_types_test.go
+@@ -185,3 +185,65 @@ func TestDataset_SetDataOperationInProgress(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestDataset_DataMigrateRefLifecycle(t *testing.T) {
++	blockingRef := DataMigrateRef{Name: "migrate-block", Namespace: "fluid", Block: true}
++	nonBlockingRef := DataMigrateRef{Name: "migrate-pass", Namespace: "fluid", Block: false}
++
++	t.Run("set and upsert keeps one entry per migration identity", func(t *testing.T) {
++		dataset := &Dataset{}
++		dataset.SetDataMigrateRef(blockingRef)
++		dataset.SetDataMigrateRef(nonBlockingRef)
++		if len(dataset.Status.DataMigrateRefs) != 2 {
++			t.Fatalf("expected 2 refs, got %d", len(dataset.Status.DataMigrateRefs))
++		}
++
++		// upsert the same identity with a changed block flag, no new entry
++		dataset.SetDataMigrateRef(DataMigrateRef{Name: "migrate-pass", Namespace: "fluid", Block: true})
++		if len(dataset.Status.DataMigrateRefs) != 2 {
++			t.Fatalf("expected still 2 refs after upsert, got %d", len(dataset.Status.DataMigrateRefs))
++		}
++		blocked, blockers := dataset.IsDataAccessBlocked()
++		if !blocked || len(blockers) != 2 {
++			t.Fatalf("expected 2 blockers, got blocked=%v blockers=%v", blocked, blockers)
++		}
++	})
++
++	t.Run("remove only the targeted migration entry", func(t *testing.T) {
++		dataset := &Dataset{}
++		dataset.SetDataMigrateRef(blockingRef)
++		dataset.SetDataMigrateRef(nonBlockingRef)
++
++		dataset.RemoveDataMigrateRef("fluid", "migrate-block")
++		blocked, blockers := dataset.IsDataAccessBlocked()
++		if blocked {
++			t.Fatalf("expected no blocker after removal, got %v", blockers)
++		}
++		if len(dataset.Status.DataMigrateRefs) != 1 || dataset.Status.DataMigrateRefs[0].Name != "migrate-pass" {
++			t.Fatalf("unexpected refs after removal: %v", dataset.Status.DataMigrateRefs)
++		}
++
++		// removing again is a no-op
++		dataset.RemoveDataMigrateRef("fluid", "migrate-block")
++		if len(dataset.Status.DataMigrateRefs) != 1 {
++			t.Fatalf("removal should be idempotent")
++		}
++	})
++
++	t.Run("non-blocking entry never blocks access", func(t *testing.T) {
++		dataset := &Dataset{}
++		dataset.SetDataMigrateRef(nonBlockingRef)
++		blocked, _ := dataset.IsDataAccessBlocked()
++		if blocked {
++			t.Fatalf("a block=false migration must not block dataset access")
++		}
++	})
++
++	t.Run("empty status reports not blocked", func(t *testing.T) {
++		dataset := &Dataset{}
++		blocked, blockers := dataset.IsDataAccessBlocked()
++		if blocked || blockers != nil {
++			t.Fatalf("fresh dataset should not be blocked")
++		}
++	})
++}
+diff --git a/api/v1alpha1/openapi_generated.go b/api/v1alpha1/openapi_generated.go
+index ee62078..eb6884d 100644
+--- a/api/v1alpha1/openapi_generated.go
++++ b/api/v1alpha1/openapi_generated.go
+@@ -62,6 +62,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataLoadSpec":                      schema_fluid_cloudnative_fluid_api_v1alpha1_DataLoadSpec(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrate":                       schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrate(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateList":                   schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateList(ref),
++		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateRef":                    schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateRef(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateSpec":                   schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateSpec(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataOperationSpec":                 schema_fluid_cloudnative_fluid_api_v1alpha1_DataOperationSpec(ref),
+ 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DataProcess":                       schema_fluid_cloudnative_fluid_api_v1alpha1_DataProcess(ref),
+@@ -3416,6 +3417,20 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetStatus(ref common.Refere
+ 							},
+ 						},
+ 					},
++					"dataMigrateRefs": {
++						SchemaProps: spec.SchemaProps{
++							Description: "DataMigrateRefs records the DataMigrate operations that occupy this Dataset. A DataMigrate with block=true explicitly blocks all new access to the Dataset (new pod admission, FUSE sidecar injection and new CSI NodeStage/NodePublish calls) until the migration completes, fails to a converged state or is deleted. Existing mounts are never torn down by the block.",
++							Type:        []string{"array"},
++							Items: &spec.SchemaOrArray{
++								Schema: &spec.Schema{
++									SchemaProps: spec.SchemaProps{
++										Default: map[string]interface{}{},
++										Ref:     ref("github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateRef"),
++									},
++								},
++							},
++						},
++					},
+ 					"datasetRef": {
+ 						SchemaProps: spec.SchemaProps{
+ 							Description: "DatasetRef specifies the datasets namespaced name mounting this Dataset.",
+@@ -3436,7 +3451,43 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetStatus(ref common.Refere
+ 			},
+ 		},
+ 		Dependencies: []string{
+-			"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetCondition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.HCFSStatus", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Mount", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Runtime"},
++			"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetCondition", "github.com/fluid-cloudnative/fluid/api/v1alpha1.DataMigrateRef", "github.com/fluid-cloudnative/fluid/api/v1alpha1.HCFSStatus", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Mount", "github.com/fluid-cloudnative/fluid/api/v1alpha1.Runtime"},
++	}
++}
++
++func schema_fluid_cloudnative_fluid_api_v1alpha1_DataMigrateRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
++	return common.OpenAPIDefinition{
++		Schema: spec.Schema{
++			SchemaProps: spec.SchemaProps{
++				Description: "DataMigrateRef records a DataMigrate operation that occupies a Dataset and whether new access to the Dataset is blocked by this migration.",
++				Type:        []string{"object"},
++				Properties: map[string]spec.Schema{
++					"name": {
++						SchemaProps: spec.SchemaProps{
++							Description: "Name is the name of the DataMigrate that holds this reference.",
++							Default:     "",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
++					"namespace": {
++						SchemaProps: spec.SchemaProps{
++							Description: "Namespace is the namespace of the DataMigrate that holds this reference.",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
++					"block": {
++						SchemaProps: spec.SchemaProps{
++							Description: "Block indicates whether new access to the Dataset is explicitly blocked by this DataMigrate. It is only set to true when the DataMigrate's spec.block is true.",
++							Type:        []string{"boolean"},
++							Format:      "",
++						},
++					},
++				},
++				Required: []string{"name"},
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/api/v1alpha1/swagger.json b/api/v1alpha1/swagger.json
+index dc4460d..e35d13e 100644
+--- a/api/v1alpha1/swagger.json
++++ b/api/v1alpha1/swagger.json
+@@ -1324,6 +1324,28 @@
+         }
+       }
+     },
++    ".DataMigrateRef": {
++      "description": "DataMigrateRef records a DataMigrate operation that occupies a Dataset and whether new access to the Dataset is blocked by this migration.",
++      "type": "object",
++      "required": [
++        "name"
++      ],
++      "properties": {
++        "block": {
++          "description": "Block indicates whether new access to the Dataset is explicitly blocked by this DataMigrate. It is only set to true when the DataMigrate's spec.block is true.",
++          "type": "boolean"
++        },
++        "name": {
++          "description": "Name is the name of the DataMigrate that holds this reference.",
++          "type": "string",
++          "default": ""
++        },
++        "namespace": {
++          "description": "Namespace is the namespace of the DataMigrate that holds this reference.",
++          "type": "string"
++        }
++      }
++    },
+     ".DataMigrateSpec": {
+       "description": "DataMigrateSpec defines the desired state of DataMigrate",
+       "type": "object",
+@@ -1770,6 +1792,14 @@
+           "description": "DataLoadRef specifies the running DataLoad job that targets this Dataset. This is mainly used as a lock to prevent concurrent DataLoad jobs. Deprecated, use OperationRef instead",
+           "type": "string"
+         },
++        "dataMigrateRefs": {
++          "description": "DataMigrateRefs records the DataMigrate operations that occupy this Dataset. A DataMigrate with block=true explicitly blocks all new access to the Dataset (new pod admission, FUSE sidecar injection and new CSI NodeStage/NodePublish calls) until the migration completes, fails to a converged state or is deleted. Existing mounts are never torn down by the block.",
++          "type": "array",
++          "items": {
++            "default": {},
++            "$ref": "#/definitions/.DataMigrateRef"
++          }
++        },
+         "datasetRef": {
+           "description": "DatasetRef specifies the datasets namespaced name mounting this Dataset.",
+           "type": "array",
+diff --git a/api/v1alpha1/zz_generated.deepcopy.go b/api/v1alpha1/zz_generated.deepcopy.go
+index 8bc5597..2d417d8 100644
+--- a/api/v1alpha1/zz_generated.deepcopy.go
++++ b/api/v1alpha1/zz_generated.deepcopy.go
+@@ -977,6 +977,21 @@ func (in *DataMigrateList) DeepCopyObject() runtime.Object {
+ 	return nil
+ }
+ 
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *DataMigrateRef) DeepCopyInto(out *DataMigrateRef) {
++	*out = *in
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new DataMigrateRef.
++func (in *DataMigrateRef) DeepCopy() *DataMigrateRef {
++	if in == nil {
++		return nil
++	}
++	out := new(DataMigrateRef)
++	in.DeepCopyInto(out)
++	return out
++}
++
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *DataMigrateSpec) DeepCopyInto(out *DataMigrateSpec) {
+ 	*out = *in
+@@ -1374,6 +1389,11 @@ func (in *DatasetStatus) DeepCopyInto(out *DatasetStatus) {
+ 			(*out)[key] = val
+ 		}
+ 	}
++	if in.DataMigrateRefs != nil {
++		in, out := &in.DataMigrateRefs, &out.DataMigrateRefs
++		*out = make([]DataMigrateRef, len(*in))
++		copy(*out, *in)
++	}
+ 	if in.DatasetRef != nil {
+ 		in, out := &in.DatasetRef, &out.DatasetRef
+ 		*out = make([]string, len(*in))
+diff --git a/charts/fluid/fluid/crds/data.fluid.io_datasets.yaml b/charts/fluid/fluid/crds/data.fluid.io_datasets.yaml
+index 7dd2050..0d35d7d 100644
+--- a/charts/fluid/fluid/crds/data.fluid.io_datasets.yaml
++++ b/charts/fluid/fluid/crds/data.fluid.io_datasets.yaml
+@@ -278,6 +278,19 @@ spec:
+                 type: string
+               dataLoadRef:
+                 type: string
++              dataMigrateRefs:
++                items:
++                  properties:
++                    block:
++                      type: boolean
++                    name:
++                      type: string
++                    namespace:
++                      type: string
++                  required:
++                  - name
++                  type: object
++                type: array
+               datasetRef:
+                 items:
+                   type: string
+diff --git a/config/crd/bases/data.fluid.io_datasets.yaml b/config/crd/bases/data.fluid.io_datasets.yaml
+index 7dd2050..0d35d7d 100644
+--- a/config/crd/bases/data.fluid.io_datasets.yaml
++++ b/config/crd/bases/data.fluid.io_datasets.yaml
+@@ -278,6 +278,19 @@ spec:
+                 type: string
+               dataLoadRef:
+                 type: string
++              dataMigrateRefs:
++                items:
++                  properties:
++                    block:
++                      type: boolean
++                    name:
++                      type: string
++                    namespace:
++                      type: string
++                  required:
++                  - name
++                  type: object
++                type: array
+               datasetRef:
+                 items:
+                   type: string
+diff --git a/pkg/controllers/v1alpha1/datamigrate/implement.go b/pkg/controllers/v1alpha1/datamigrate/implement.go
+index b866e23..aee3900 100644
+--- a/pkg/controllers/v1alpha1/datamigrate/implement.go
++++ b/pkg/controllers/v1alpha1/datamigrate/implement.go
+@@ -47,6 +47,7 @@ type dataMigrateOperation struct {
+ }
+ 
+ var _ dataoperation.OperationInterface = &dataMigrateOperation{}
++var _ dataoperation.TargetDatasetAccessReleaser = &dataMigrateOperation{}
+ 
+ func (r *dataMigrateOperation) GetOperationObject() client.Object {
+ 	return r.dataMigrate
+@@ -141,12 +142,48 @@ func (r *dataMigrateOperation) UpdateStatusInfoForCompleted(infos map[string]str
+ 
+ func (r *dataMigrateOperation) SetTargetDatasetStatusInProgress(dataset *datav1alpha1.Dataset) {
+ 	dataset.Status.Phase = datav1alpha1.DataMigrating
++	r.syncDataMigrateBlockRef(dataset)
+ }
+ 
+ func (r *dataMigrateOperation) RemoveTargetDatasetStatusInProgress(dataset *datav1alpha1.Dataset) {
+ 	dataset.Status.Phase = datav1alpha1.BoundDatasetPhase
+ }
+ 
++// ReleaseTargetDatasetAccess implements dataoperation.TargetDatasetAccessReleaser and
++// is invoked on every ReleaseTargetDataset call, including when other DataMigrates still
++// hold the Dataset. The access barrier is an explicit block that must only be lifted when
++// the migration itself converges or is cleaned up:
++//   - For the Once policy, Complete/Failed is a terminal state, so release here.
++//   - For Cron/OnEvent policies, Complete/Failed are transient states between scheduled
++//     rounds; the barrier survives across rounds while block=true, but is removed when the
++//     flag has been flipped back to false so the stored state can never outlive the
++//     migration's intent.
++//   - On deletion (any policy), the deletion timestamp is set and the barrier is released
++//     so that no permanent block is left behind after cleanup.
++func (r *dataMigrateOperation) ReleaseTargetDatasetAccess(dataset *datav1alpha1.Dataset) {
++	if !r.dataMigrate.GetDeletionTimestamp().IsZero() ||
++		r.dataMigrate.Spec.Policy == datav1alpha1.Once ||
++		!r.dataMigrate.Spec.Block {
++		dataset.RemoveDataMigrateRef(r.dataMigrate.GetNamespace(), r.dataMigrate.GetName())
++	}
++}
++
++// syncDataMigrateBlockRef reconciles the Dataset's DataMigrateRef entry with the
++// DataMigrate spec.block flag while the migration holds the Dataset. It both installs
++// the barrier when block=true and removes a stale entry when the flag is flipped back
++// to false, so the stored barrier can never drift from the migration's intent.
++func (r *dataMigrateOperation) syncDataMigrateBlockRef(dataset *datav1alpha1.Dataset) {
++	if r.dataMigrate.Spec.Block {
++		dataset.SetDataMigrateRef(datav1alpha1.DataMigrateRef{
++			Name:      r.dataMigrate.GetName(),
++			Namespace: r.dataMigrate.GetNamespace(),
++			Block:     true,
++		})
++		return
++	}
++	dataset.RemoveDataMigrateRef(r.dataMigrate.GetNamespace(), r.dataMigrate.GetName())
++}
++
+ func (r *dataMigrateOperation) GetStatusHandler() dataoperation.StatusHandler {
+ 	policy := r.dataMigrate.Spec.Policy
+ 
+diff --git a/pkg/controllers/v1alpha1/datamigrate/implement_test.go b/pkg/controllers/v1alpha1/datamigrate/implement_test.go
+index 90d71e2..2c204f9 100644
+--- a/pkg/controllers/v1alpha1/datamigrate/implement_test.go
++++ b/pkg/controllers/v1alpha1/datamigrate/implement_test.go
+@@ -254,6 +254,147 @@ var _ = Describe("dataMigrateOperation", func() {
+ 		})
+ 	})
+ 
++	Describe("DataMigrate access block barrier", func() {
++		const migrateName, migrateNamespace = "blocking-migrate", "fluid"
++
++		newOperation := func(block bool, policy datav1alpha1.Policy, deleting bool) *dataMigrateOperation {
++			dm := &datav1alpha1.DataMigrate{
++				ObjectMeta: v1.ObjectMeta{
++					Name:      migrateName,
++					Namespace: migrateNamespace,
++				},
++				Spec: datav1alpha1.DataMigrateSpec{
++					Block:  block,
++					Policy: policy,
++				},
++			}
++			if deleting {
++				dm.ObjectMeta.DeletionTimestamp = &v1.Time{Time: v1.Now().Time}
++			}
++			return &dataMigrateOperation{dataMigrate: dm}
++		}
++
++		It("installs an identity-scoped barrier when block=true and the dataset is occupied", func() {
++			op := newOperation(true, datav1alpha1.Once, false)
++			dataset := &datav1alpha1.Dataset{}
++
++			op.SetTargetDatasetStatusInProgress(dataset)
++
++			Expect(dataset.Status.Phase).To(Equal(datav1alpha1.DataMigrating))
++			blocked, blockers := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeTrue())
++			Expect(blockers).To(HaveLen(1))
++			Expect(blockers[0].Name).To(Equal(migrateName))
++			Expect(blockers[0].Namespace).To(Equal(migrateNamespace))
++		})
++
++		It("does not install any barrier when block=false", func() {
++			op := newOperation(false, datav1alpha1.Once, false)
++			dataset := &datav1alpha1.Dataset{}
++
++			op.SetTargetDatasetStatusInProgress(dataset)
++
++			blocked, _ := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeFalse())
++			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
++		})
++
++		It("removes a stale barrier when block is flipped back to false on re-acquire", func() {
++			op := newOperation(false, datav1alpha1.Cron, false)
++			dataset := &datav1alpha1.Dataset{}
++			dataset.SetDataMigrateRef(datav1alpha1.DataMigrateRef{
++				Name: migrateName, Namespace: migrateNamespace, Block: true,
++			})
++
++			op.SetTargetDatasetStatusInProgress(dataset)
++
++			blocked, _ := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeFalse())
++			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
++		})
++
++		It("releases the barrier when a Once migration converges", func() {
++			op := newOperation(true, datav1alpha1.Once, false)
++			dataset := &datav1alpha1.Dataset{}
++			op.SetTargetDatasetStatusInProgress(dataset)
++
++			op.ReleaseTargetDatasetAccess(dataset)
++
++			blocked, _ := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeFalse())
++			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
++		})
++
++		It("keeps the barrier across Cron rounds until the DataMigrate is deleted", func() {
++			op := newOperation(true, datav1alpha1.Cron, false)
++			dataset := &datav1alpha1.Dataset{}
++			op.SetTargetDatasetStatusInProgress(dataset)
++
++			// A transient Complete/Failed state between two scheduled rounds must not
++			// open the barrier prematurely.
++			op.ReleaseTargetDatasetAccess(dataset)
++			blocked, _ := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeTrue())
++
++			// The next round re-asserts the same identity-scoped entry.
++			op.SetTargetDatasetStatusInProgress(dataset)
++			Expect(dataset.Status.DataMigrateRefs).To(HaveLen(1))
++
++			// Deletion cleanup finally lifts the barrier.
++			deletingOp := newOperation(true, datav1alpha1.Cron, true)
++			deletingOp.ReleaseTargetDatasetAccess(dataset)
++			blocked, _ = dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeFalse())
++			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
++		})
++
++		It("heals the barrier when block is flipped to false between Cron rounds", func() {
++			blockingOp := newOperation(true, datav1alpha1.Cron, false)
++			dataset := &datav1alpha1.Dataset{}
++			blockingOp.SetTargetDatasetStatusInProgress(dataset)
++			Expect(dataset.IsDataAccessBlocked()).To(BeTrue())
++
++			// The admin flips block back to false; the next spec-triggered reconcile runs
++			// the release hook while the DataMigrate keeps existing between rounds.
++			openOp := newOperation(false, datav1alpha1.Cron, false)
++			openOp.ReleaseTargetDatasetAccess(dataset)
++			blocked, _ := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeFalse())
++			Expect(dataset.Status.DataMigrateRefs).To(BeEmpty())
++		})
++
++		It("keeps the barrier across OnEvent rounds until deletion", func() {
++			op := newOperation(true, datav1alpha1.OnEvent, false)
++			dataset := &datav1alpha1.Dataset{}
++			op.SetTargetDatasetStatusInProgress(dataset)
++
++			op.ReleaseTargetDatasetAccess(dataset)
++			blocked, _ := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeTrue())
++
++			deletingOp := newOperation(true, datav1alpha1.OnEvent, true)
++			deletingOp.ReleaseTargetDatasetAccess(dataset)
++			blocked, _ = dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeFalse())
++		})
++
++		It("only removes its own entry when other migrations still occupy the dataset", func() {
++			op := newOperation(true, datav1alpha1.Once, false)
++			dataset := &datav1alpha1.Dataset{}
++			op.SetTargetDatasetStatusInProgress(dataset)
++			dataset.SetDataMigrateRef(datav1alpha1.DataMigrateRef{
++				Name: "other-migrate", Namespace: migrateNamespace, Block: true,
++			})
++
++			op.ReleaseTargetDatasetAccess(dataset)
++
++			blocked, blockers := dataset.IsDataAccessBlocked()
++			Expect(blocked).To(BeTrue())
++			Expect(blockers).To(HaveLen(1))
++			Expect(blockers[0].Name).To(Equal("other-migrate"))
++		})
++	})
++
+ 	Describe("GetStatusHandler", func() {
+ 		It("should return OnceStatusHandler for Once policy", func() {
+ 			op := &dataMigrateOperation{
+diff --git a/pkg/csi/plugins/nodeserver.go b/pkg/csi/plugins/nodeserver.go
+index dab6ddd..ede774d 100644
+--- a/pkg/csi/plugins/nodeserver.go
++++ b/pkg/csi/plugins/nodeserver.go
+@@ -151,6 +151,13 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
+ 		mountPath = filepath.Join(mountPath, subPath)
+ 	}
+ 
++	// Enforce the explicit DataMigrate block on new publish calls. The isMount early
++	// return above guarantees that already mounted target paths (i.e. existing running
++	// mounts) keep succeeding and are never actively torn down by the block.
++	if err = ns.checkDatasetAccessBlocked(req.GetVolumeContext(), req.GetVolumeId()); err != nil {
++		return nil, err
++	}
++
+ 	// 1. Wait the runtime fuse ready and check the sub path existence
+ 	skipCheckMountReadyMountModeSelector, err := base.ParseMountModeSelectorFromStr(req.GetVolumeContext()[common.AnnotationSkipCheckMountReadyTarget])
+ 	if err != nil {
+@@ -363,6 +370,13 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
+ 		return nil, errors.Wrapf(err, "NodeStageVolume: can't get namespace and name by volume id %s", volumeId)
+ 	}
+ 
++	// Enforce the explicit DataMigrate block on new stage calls before labeling the
++	// node, so that no new FUSE pod is launched for a blocked dataset.
++	if err = ns.checkDatasetAccessBlocked(req.GetVolumeContext(), volumeId); err != nil {
++		glog.Errorf("NodeStageVolume: new stage is blocked for dataset %s/%s: %v", namespace, name, err)
++		return nil, err
++	}
++
+ 	// 4. Label node to launch FUSE Pod
+ 	fuseLabelKey := req.GetVolumeContext()[common.VolumeAttrMountPodNodeSelectorKey]
+ 	if len(fuseLabelKey) == 0 {
+@@ -449,6 +463,28 @@ func (ns *nodeServer) getRuntimeNamespacedName(volumeContext map[string]string,
+ 	return volume.GetNamespacedNameByVolumeId(ns.apiReader, volumeId)
+ }
+ 
++// checkDatasetAccessBlocked resolves the target dataset of a CSI request from its
++// volume context (or, as a fallback, from its volume id) and enforces the explicit
++// DataMigrate access block. An active block is reported as FailedPrecondition so that
++// kubelet keeps retrying and succeeds once the barrier is lifted, while transient API
++// errors fail closed with an Internal error instead of opening the access prematurely.
++func (ns *nodeServer) checkDatasetAccessBlocked(volumeContext map[string]string, volumeId string) error {
++	namespace, name, err := ns.getRuntimeNamespacedName(volumeContext, volumeId)
++	if err != nil {
++		return status.Error(codes.Internal, errors.Wrapf(err,
++			"failed to resolve target dataset for volume %s before checking DataMigrate block", volumeId).Error())
++	}
++
++	if err = utils.CheckDatasetDataAccessBlocked(ns.apiReader, namespace, name); err != nil {
++		if blockedErr, ok := err.(*utils.DatasetAccessBlockedError); ok {
++			return status.Error(codes.FailedPrecondition, blockedErr.Error())
++		}
++		return status.Error(codes.Internal, errors.Wrapf(err,
++			"failed to check DataMigrate block for dataset \"%s/%s\"", namespace, name).Error())
++	}
++	return nil
++}
++
+ // getNode first checks cached node
+ func (ns *nodeServer) getNode() (node *corev1.Node, err error) {
+ 	// Default to allow patch stale node info
+diff --git a/pkg/csi/plugins/nodeserver_test.go b/pkg/csi/plugins/nodeserver_test.go
+index 1fce98b..3dea7d4 100644
+--- a/pkg/csi/plugins/nodeserver_test.go
++++ b/pkg/csi/plugins/nodeserver_test.go
+@@ -514,6 +514,85 @@ var _ = Describe("NodeServer", func() {
+ 				_ = err
+ 			})
+ 		})
++
++		Context("when the target dataset is blocked by a DataMigrate", func() {
++			var blockedDataset *v1alpha1.Dataset
++
++			BeforeEach(func() {
++				blockedDataset = &v1alpha1.Dataset{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      testName,
++						Namespace: testNamespace,
++					},
++					Status: v1alpha1.DatasetStatus{
++						DataMigrateRefs: []v1alpha1.DataMigrateRef{
++							{Name: "blocking-migrate", Namespace: testNamespace, Block: true},
++						},
++					},
++				}
++				blockedClient := fake.NewClientBuilder().
++					WithScheme(scheme).
++					WithObjects(testNode, blockedDataset).
++					Build()
++				ns.client = blockedClient
++				ns.apiReader = blockedClient
++			})
++
++			It("should reject a new publish with FailedPrecondition and never reach the mount", func() {
++				tempDir, err := os.MkdirTemp("", "node-publish-blocked-*")
++				Expect(err).NotTo(HaveOccurred())
++				DeferCleanup(func() {
++					Expect(os.RemoveAll(tempDir)).To(Succeed())
++				})
++
++				Expect(os.Setenv(utils.MountRoot, tempDir)).To(Succeed())
++				DeferCleanup(func() {
++					Expect(os.Unsetenv(utils.MountRoot)).To(Succeed())
++				})
++
++				isMountedPatch := gomonkey.ApplyFunc(utils.IsMounted, func(absPath string) (bool, error) {
++					return false, os.ErrNotExist
++				})
++				defer isMountedPatch.Reset()
++
++				req := &csi.NodePublishVolumeRequest{
++					VolumeId:   testVolumeID,
++					TargetPath: filepath.Join(tempDir, "target"),
++					VolumeContext: map[string]string{
++						common.VolumeAttrFluidPath:  filepath.Join(tempDir, testName, "fuse"),
++						common.VolumeAttrName:       testName,
++						common.VolumeAttrNamespace:  testNamespace,
++					},
++				}
++
++				resp, err := ns.NodePublishVolume(context.Background(), req)
++				Expect(err).To(HaveOccurred())
++				Expect(resp).To(BeNil())
++				Expect(status.Code(err)).To(Equal(codes.FailedPrecondition))
++				Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
++			})
++
++			It("should keep an already mounted target path working without actively breaking it", func() {
++				// An existing mount hits the idempotent isMount early-return, which must run
++				// before the block check so running workloads are not disrupted.
++				isMountedPatch := gomonkey.ApplyFunc(utils.IsMounted, func(absPath string) (bool, error) {
++					return true, nil
++				})
++				defer isMountedPatch.Reset()
++
++				req := &csi.NodePublishVolumeRequest{
++					VolumeId:   testVolumeID,
++					TargetPath: testTargetPath,
++					VolumeContext: map[string]string{
++						common.VolumeAttrFluidPath: testFluidPath,
++					},
++				}
++
++				resp, err := ns.NodePublishVolume(context.Background(), req)
++				Expect(err).NotTo(HaveOccurred())
++				Expect(resp).NotTo(BeNil())
++			})
++		})
+ 	})
+ 
+ 	Describe("NodeUnpublishVolume", func() {
+@@ -819,6 +898,82 @@ var _ = Describe("NodeServer", func() {
+ 				Expect(resp).NotTo(BeNil())
+ 			})
+ 		})
++
++		Context("when the target dataset is blocked by a DataMigrate", func() {
++			fuseLabelKey := "fluid.io/f-default-test-dataset"
++			stageReq := func() *csi.NodeStageVolumeRequest {
++				return &csi.NodeStageVolumeRequest{
++					VolumeId: testVolumeID,
++					VolumeContext: map[string]string{
++						common.VolumeAttrName:                    testName,
++						common.VolumeAttrNamespace:               testNamespace,
++						common.VolumeAttrFluidPath:               testFluidPath,
++						common.VolumeAttrMountPodNodeSelectorKey: fuseLabelKey,
++					},
++				}
++			}
++
++			It("should reject a new stage with FailedPrecondition and not label the node", func() {
++				blockedDataset := &v1alpha1.Dataset{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      testName,
++						Namespace: testNamespace,
++					},
++					Status: v1alpha1.DatasetStatus{
++						DataMigrateRefs: []v1alpha1.DataMigrateRef{
++							{Name: "blocking-migrate", Namespace: testNamespace, Block: true},
++						},
++					},
++				}
++				blockedClient := fake.NewClientBuilder().
++					WithScheme(scheme).
++					WithObjects(testNode, blockedDataset).
++					Build()
++				ns.client = blockedClient
++				ns.apiReader = blockedClient
++				ns.node = nil
++
++				resp, err := ns.NodeStageVolume(context.Background(), stageReq())
++				Expect(err).To(HaveOccurred())
++				Expect(resp).To(BeNil())
++				Expect(status.Code(err)).To(Equal(codes.FailedPrecondition))
++				Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
++
++				// No node label must be patched, so no FUSE pod is launched.
++				updatedNode := &corev1.Node{}
++				Expect(blockedClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, updatedNode)).To(Succeed())
++				Expect(updatedNode.Labels).NotTo(HaveKey(fuseLabelKey))
++			})
++
++			It("should allow the stage when the migration does not set block", func() {
++				nonBlockedDataset := &v1alpha1.Dataset{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      testName,
++						Namespace: testNamespace,
++					},
++					Status: v1alpha1.DatasetStatus{
++						DataMigrateRefs: []v1alpha1.DataMigrateRef{
++							{Name: "non-blocking-migrate", Namespace: testNamespace, Block: false},
++						},
++					},
++				}
++				openClient := fake.NewClientBuilder().
++					WithScheme(scheme).
++					WithObjects(testNode, nonBlockedDataset).
++					Build()
++				ns.client = openClient
++				ns.apiReader = openClient
++				ns.node = nil
++
++				resp, err := ns.NodeStageVolume(context.Background(), stageReq())
++				Expect(err).NotTo(HaveOccurred())
++				Expect(resp).NotTo(BeNil())
++
++				updatedNode := &corev1.Node{}
++				Expect(openClient.Get(context.Background(), types.NamespacedName{Name: testNode.Name}, updatedNode)).To(Succeed())
++				Expect(updatedNode.Labels).To(HaveKeyWithValue(fuseLabelKey, "true"))
++			})
++		})
+ 	})
+ 
+ 	Describe("NodeUnstageVolume", func() {
+diff --git a/pkg/dataoperation/interface.go b/pkg/dataoperation/interface.go
+index 15eb63c..7605e7d 100644
+--- a/pkg/dataoperation/interface.go
++++ b/pkg/dataoperation/interface.go
+@@ -81,3 +81,15 @@ type StatusHandler interface {
+ 	// GetOperationStatus get operation status according to helm chart status
+ 	GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus) (result *datav1alpha1.OperationStatus, err error)
+ }
++
++// TargetDatasetAccessReleaser is an optional interface implemented by operations that
++// hold additional per-operation state on the target dataset (e.g. DataMigrate's access
++// block). Unlike OperationInterface.RemoveTargetDatasetStatusInProgress, which is only
++// invoked when no other operation of the same type is still in progress, the hook here
++// is invoked on every ReleaseTargetDataset call so that each operation can always clean
++// up its own state even when other operations still hold the dataset.
++type TargetDatasetAccessReleaser interface {
++	// ReleaseTargetDatasetAccess releases the extra dataset state owned by this
++	// operation. Implementations must be idempotent.
++	ReleaseTargetDatasetAccess(dataset *datav1alpha1.Dataset)
++}
+diff --git a/pkg/ddc/base/operation_lock.go b/pkg/ddc/base/operation_lock.go
+index d882dc5..f91acc9 100644
+--- a/pkg/ddc/base/operation_lock.go
++++ b/pkg/ddc/base/operation_lock.go
+@@ -116,6 +116,14 @@ func ReleaseTargetDataset(ctx cruntime.ReconcileRequestContext, operation dataop
+ 			// different operation may set other fields
+ 			operation.RemoveTargetDatasetStatusInProgress(datasetToUpdate)
+ 		}
++
++		// Always release the operation's own extra dataset state (e.g. DataMigrate's
++		// access block), even when other operations of the same type still hold the
++		// dataset, so that no stale per-operation state can be left behind.
++		if accessReleaser, ok := operation.(dataoperation.TargetDatasetAccessReleaser); ok {
++			accessReleaser.ReleaseTargetDatasetAccess(datasetToUpdate)
++		}
++
+ 		if !reflect.DeepEqual(datasetToUpdate.Status, dataset.Status) {
+ 			if err = ctx.Client.Status().Update(context.TODO(), datasetToUpdate); err != nil {
+ 				return err
+diff --git a/pkg/ddc/base/operation_lock_test.go b/pkg/ddc/base/operation_lock_test.go
+index 3103033..4ae2fde 100644
+--- a/pkg/ddc/base/operation_lock_test.go
++++ b/pkg/ddc/base/operation_lock_test.go
+@@ -18,11 +18,89 @@ package base
+ 
+ import (
+ 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
++// accessReleaserOperation is a minimal OperationInterface that also implements
++// TargetDatasetAccessReleaser. Embedding the interface leaves unused methods panicking,
++// which is fine because ReleaseTargetDataset only touches the overridden methods below.
++type accessReleaserOperation struct {
++	dataoperation.OperationInterface
++	object   client.Object
++	dataset  *datav1alpha1.Dataset
++	released bool
++}
++
++func (a *accessReleaserOperation) GetOperationObject() client.Object { return a.object }
++
++func (a *accessReleaserOperation) GetOperationType() dataoperation.OperationType {
++	return dataoperation.DataMigrateType
++}
++
++func (a *accessReleaserOperation) GetTargetDataset() (*datav1alpha1.Dataset, error) {
++	return a.dataset, nil
++}
++
++func (a *accessReleaserOperation) RemoveTargetDatasetStatusInProgress(*datav1alpha1.Dataset) {}
++
++func (a *accessReleaserOperation) ReleaseTargetDatasetAccess(dataset *datav1alpha1.Dataset) {
++	a.released = true
++	dataset.RemoveDataMigrateRef(a.object.GetNamespace(), a.object.GetName())
++}
++
++var _ = Describe("ReleaseTargetDataset access releaser", func() {
++	It("should invoke the access releaser even when other operations still hold the dataset", func() {
++		dataset := &datav1alpha1.Dataset{
++			ObjectMeta: metav1.ObjectMeta{Name: "test-dataset", Namespace: "default"},
++			Status: datav1alpha1.DatasetStatus{
++				OperationRef: map[string]string{
++					string(dataoperation.DataMigrateType): "m1,m2",
++				},
++				DataMigrateRefs: []datav1alpha1.DataMigrateRef{
++					{Name: "m1", Namespace: "default", Block: true},
++					{Name: "m2", Namespace: "default", Block: true},
++				},
++			},
++		}
++
++		s := runtime.NewScheme()
++		s.AddKnownTypes(datav1alpha1.GroupVersion, &datav1alpha1.Dataset{})
++		fakeClient := fake.NewFakeClientWithScheme(s, dataset.DeepCopy())
++
++		migrateObject := &datav1alpha1.DataMigrate{
++			ObjectMeta: metav1.ObjectMeta{Name: "m1", Namespace: "default"},
++		}
++		op := &accessReleaserOperation{
++			object:  migrateObject,
++			dataset: dataset,
++		}
++
++		ctx := cruntime.ReconcileRequestContext{
++			Client: fakeClient,
++			Log:    fake.NullLogger(),
++		}
++
++		Expect(ReleaseTargetDataset(ctx, op)).To(Succeed())
++		Expect(op.released).To(BeTrue())
++
++		updated := &datav1alpha1.Dataset{}
++		Expect(fakeClient.Get(ctx, client.ObjectKeyFromObject(dataset), updated)).To(Succeed())
++
++		// The generic in-progress phase hook is not run because m2 still holds the lock,
++		// but the per-operation access state of m1 must have been released.
++		Expect(updated.Status.OperationRef[string(dataoperation.DataMigrateType)]).To(Equal("m2"))
++		Expect(updated.Status.DataMigrateRefs).To(HaveLen(1))
++		Expect(updated.Status.DataMigrateRefs[0].Name).To(Equal("m2"))
++	})
++})
++
+ var _ = Describe("getDataOperationKey", func() {
+ 	It("should return the object name", func() {
+ 		obj := &datav1alpha1.DataBackup{
+diff --git a/pkg/utils/datamigrate.go b/pkg/utils/datamigrate.go
+index 6b0b71a..ecfff7d 100644
+--- a/pkg/utils/datamigrate.go
++++ b/pkg/utils/datamigrate.go
+@@ -19,6 +19,7 @@ package utils
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/pkg/errors"
+ 	"k8s.io/apimachinery/pkg/types"
+@@ -127,3 +128,63 @@ func GetTargetDatasetOfMigrate(client client.Client, dataMigrate *datav1alpha1.D
+ 
+ 	return GetDataset(client, namespacedName.Name, namespacedName.Namespace)
+ }
++
++// DatasetAccessBlockedError is the explicit error returned when a new dataset access
++// (pod admission, FUSE sidecar injection or a CSI NodeStage/NodePublish call) is blocked
++// by an in-progress DataMigrate with spec.block=true. It is a typed error on purpose so
++// that the webhook can translate it into an admission denial and the CSI plugin into a
++// gRPC FailedPrecondition result. The skipPrecheck annotation must never bypass it.
++type DatasetAccessBlockedError struct {
++	// Namespace of the blocked dataset
++	Namespace string
++	// Name of the blocked dataset
++	Name string
++	// Blockers are the DataMigrate references that explicitly block the dataset access
++	Blockers []datav1alpha1.DataMigrateRef
++}
++
++var _ error = &DatasetAccessBlockedError{}
++
++func (e *DatasetAccessBlockedError) Error() string {
++	blockerNames := make([]string, 0, len(e.Blockers))
++	for _, blocker := range e.Blockers {
++		blockerNames = append(blockerNames, fmt.Sprintf("%s/%s", blocker.Namespace, blocker.Name))
++	}
++	return fmt.Sprintf("new access to dataset \"%s/%s\" is blocked by DataMigrate %s with spec.block=true",
++		e.Namespace, e.Name, strings.Join(blockerNames, ","))
++}
++
++// CheckDatasetDataAccessBlocked checks whether new access to the given dataset is
++// explicitly blocked by an occupying DataMigrate with block=true. It returns:
++//   - nil when the dataset does not exist (nothing left to protect) or is not blocked;
++//   - *DatasetAccessBlockedError when an explicit migration block is in effect;
++//   - any other error when the dataset cannot be read, in which case callers must fail
++//     closed (retry) instead of opening the access prematurely.
++//
++// The check is intentionally independent of the skipPrecheck annotation.
++func CheckDatasetDataAccessBlocked(c client.Reader, namespace, name string) error {
++	if c == nil {
++		return fmt.Errorf("dataset reader is nil")
++	}
++
++	dataset, err := GetDataset(c, name, namespace)
++	if err != nil {
++		// The dataset is gone (e.g. cascading deletion), there is no barrier to enforce.
++		if IgnoreNotFound(err) == nil {
++			return nil
++		}
++		// Transient API errors must not open the access, return the error for retry.
++		return err
++	}
++
++	blocked, blockers := dataset.IsDataAccessBlocked()
++	if !blocked {
++		return nil
++	}
++
++	return &DatasetAccessBlockedError{
++		Namespace: namespace,
++		Name:      name,
++		Blockers:  blockers,
++	}
++}
+diff --git a/pkg/utils/datamigrate_test.go b/pkg/utils/datamigrate_test.go
+index 6d17b8e..1272ba7 100644
+--- a/pkg/utils/datamigrate_test.go
++++ b/pkg/utils/datamigrate_test.go
+@@ -17,13 +17,18 @@
+ package utils
+ 
+ import (
+-	"github.com/fluid-cloudnative/fluid/pkg/common"
++	"context"
++	"fmt"
+ 	"testing"
+ 
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
+ )
+ 
+@@ -282,3 +287,87 @@ func TestGetTargetDatasetOfMigrate(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// failingReader is a client.Reader that always returns the injected error, used to
++// verify that transient API errors fail closed instead of opening dataset access.
++type failingReader struct {
++	err error
++}
++
++func (f *failingReader) Get(_ context.Context, _ types.NamespacedName, _ client.Object, _ ...client.GetOption) error {
++	return f.err
++}
++
++func (f *failingReader) List(_ context.Context, _ client.ObjectList, _ ...client.ListOption) error {
++	return f.err
++}
++
++func TestCheckDatasetDataAccessBlocked(t *testing.T) {
++	const namespace, name = "fluid", "test-dataset"
++
++	blockedDataset := &datav1alpha1.Dataset{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
++		Status: datav1alpha1.DatasetStatus{
++			DataMigrateRefs: []datav1alpha1.DataMigrateRef{
++				{Name: "migration-job", Namespace: namespace, Block: true},
++			},
++		},
++	}
++	nonBlockedDataset := &datav1alpha1.Dataset{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
++		Status: datav1alpha1.DatasetStatus{
++			DataMigrateRefs: []datav1alpha1.DataMigrateRef{
++				{Name: "migration-job", Namespace: namespace, Block: false},
++			},
++		},
++	}
++
++	t.Run("explicit block returns a typed block error", func(t *testing.T) {
++		c := fake.NewFakeClientWithScheme(testScheme, blockedDataset.DeepCopy())
++		err := CheckDatasetDataAccessBlocked(c, namespace, name)
++		if err == nil {
++			t.Fatal("expected block error, got nil")
++		}
++		blockedErr, ok := err.(*DatasetAccessBlockedError)
++		if !ok {
++			t.Fatalf("expected *DatasetAccessBlockedError, got %T: %v", err, err)
++		}
++		if blockedErr.Name != name || blockedErr.Namespace != namespace {
++			t.Fatalf("unexpected error target: %+v", blockedErr)
++		}
++		if len(blockedErr.Blockers) != 1 || blockedErr.Blockers[0].Name != "migration-job" {
++			t.Fatalf("unexpected blockers: %v", blockedErr.Blockers)
++		}
++	})
++
++	t.Run("block=false migration allows access", func(t *testing.T) {
++		c := fake.NewFakeClientWithScheme(testScheme, nonBlockedDataset.DeepCopy())
++		if err := CheckDatasetDataAccessBlocked(c, namespace, name); err != nil {
++			t.Fatalf("expected no error, got %v", err)
++		}
++	})
++
++	t.Run("missing dataset opens nothing but does not block", func(t *testing.T) {
++		c := fake.NewFakeClientWithScheme(testScheme)
++		if err := CheckDatasetDataAccessBlocked(c, namespace, "gone-dataset"); err != nil {
++			t.Fatalf("expected nil for a deleted dataset, got %v", err)
++		}
++	})
++
++	t.Run("nil reader fails with an error", func(t *testing.T) {
++		if err := CheckDatasetDataAccessBlocked(nil, namespace, name); err == nil {
++			t.Fatal("expected error for nil reader")
++		}
++	})
++
++	t.Run("transient API error fails closed", func(t *testing.T) {
++		reader := &failingReader{err: apierrors.NewInternalError(fmt.Errorf("api server unavailable"))}
++		err := CheckDatasetDataAccessBlocked(reader, namespace, name)
++		if err == nil {
++			t.Fatal("expected error when dataset cannot be read")
++		}
++		if _, ok := err.(*DatasetAccessBlockedError); ok {
++			t.Fatalf("transient errors must not be misreported as block: %v", err)
++		}
++	})
++}
+diff --git a/pkg/webhook/handler/mutating/mutating_handler.go b/pkg/webhook/handler/mutating/mutating_handler.go
+index 1e52805..1f65fd7 100644
+--- a/pkg/webhook/handler/mutating/mutating_handler.go
++++ b/pkg/webhook/handler/mutating/mutating_handler.go
+@@ -21,8 +21,10 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/http"
++	"sort"
+ 	"time"
+ 
++	"github.com/fluid-cloudnative/fluid/pkg/ddc/base"
+ 	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins"
+ 	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins/api"
+ 	webhookutils "github.com/fluid-cloudnative/fluid/pkg/webhook/utils"
+@@ -98,6 +100,15 @@ func (a *FluidMutatingHandler) Handle(ctx context.Context, req admission.Request
+ 
+ 	backupPod := pod.DeepCopy()
+ 	if err := a.MutatePod(pod, false); err != nil {
++		// An explicit DataMigrate block must result in an admission denial instead of
++		// a generic 500 error, even when the error is wrapped by lower-level plugins.
++		var blockedErr *utils.DatasetAccessBlockedError
++		if errors.As(err, &blockedErr) {
++			setupLog.Info("deny pod admission because new dataset access is blocked by DataMigrate",
++				"Pod", pod.Name, "Namespace", pod.Namespace, "reason", blockedErr.Error())
++			return admission.Denied(blockedErr.Error())
++		}
++
+ 		setupLog.Error(err, "failed to mutate pod with cache client", "Pod", pod.Name, "Namespace", pod.Namespace)
+ 		if webhookutils.IsNeedRetryWithApiReaderError(err) {
+ 			setupLog.Info("retrying with API reader",
+@@ -107,6 +118,10 @@ func (a *FluidMutatingHandler) Handle(ctx context.Context, req admission.Request
+ 			)
+ 			pod = backupPod
+ 			if err := a.MutatePod(pod, true); err != nil {
++				var retryBlockedErr *utils.DatasetAccessBlockedError
++				if errors.As(err, &retryBlockedErr) {
++					return admission.Denied(retryBlockedErr.Error())
++				}
+ 				return admission.Errored(http.StatusInternalServerError, err)
+ 			}
+ 		}
+@@ -148,6 +163,13 @@ func (a *FluidMutatingHandler) MutatePod(pod *corev1.Pod, useDirectReader bool)
+ 		return webhookutils.NewNeedRetryWithApiReaderError(errors.Wrapf(err, "failed to collect runtime infos from PVCs %v", pvcNames))
+ 	}
+ 
++	// Enforce the explicit DataMigrate access block. The check is deliberately placed
++	// outside the skipPrecheck branch so that the skipPrecheck annotation can never
++	// bypass an explicit block, and it runs before any plugin mutates the pod.
++	if err = checkDatasetsDataAccessBlocked(handlerClient, runtimeInfos); err != nil {
++		return err
++	}
++
+ 	// get plugins registry and get the need plugins list from it
+ 	pluginsRegistry := plugins.GetRegistryHandler()
+ 	var pluginsList []api.MutatingHandler
+@@ -187,3 +209,35 @@ func (a *FluidMutatingHandler) MutatePod(pod *corev1.Pod, useDirectReader bool)
+ 	return
+ 
+ }
++
++// checkDatasetsDataAccessBlocked enforces the explicit DataMigrate block on every
++// dataset referenced by the pod. It returns *utils.DatasetAccessBlockedError directly
++// when a block is in effect so that the admission handler can translate it into a
++// denial. Transient API errors are wrapped into a NeedRetryWithApiReaderError so that
++// the handler retries with the direct API reader and fails closed instead of admitting
++// the pod when the block state cannot be determined.
++func checkDatasetsDataAccessBlocked(c client.Reader, runtimeInfos map[string]base.RuntimeInfoInterface) error {
++	pvcNames := make([]string, 0, len(runtimeInfos))
++	for pvcName := range runtimeInfos {
++		pvcNames = append(pvcNames, pvcName)
++	}
++	sort.Strings(pvcNames)
++
++	for _, pvcName := range pvcNames {
++		runtimeInfo := runtimeInfos[pvcName]
++		if runtimeInfo == nil {
++			continue
++		}
++		err := utils.CheckDatasetDataAccessBlocked(c, runtimeInfo.GetNamespace(), runtimeInfo.GetName())
++		if err == nil {
++			continue
++		}
++		if _, ok := err.(*utils.DatasetAccessBlockedError); ok {
++			return err
++		}
++		return webhookutils.NewNeedRetryWithApiReaderError(
++			errors.Wrapf(err, "failed to check DataMigrate block for dataset \"%s/%s\"",
++				runtimeInfo.GetNamespace(), runtimeInfo.GetName()))
++	}
++	return nil
++}
+diff --git a/pkg/webhook/handler/mutating/mutating_handler_test.go b/pkg/webhook/handler/mutating/mutating_handler_test.go
+index 4424733..f52b055 100644
+--- a/pkg/webhook/handler/mutating/mutating_handler_test.go
++++ b/pkg/webhook/handler/mutating/mutating_handler_test.go
+@@ -18,13 +18,16 @@ package mutating
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"os"
+ 
+ 	"github.com/agiledragon/gomonkey/v2"
+ 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
++	fluidutils "github.com/fluid-cloudnative/fluid/pkg/utils"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
+ 	"github.com/fluid-cloudnative/fluid/pkg/webhook/plugins"
++	"github.com/pkg/errors"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	admissionv1 "k8s.io/api/admission/v1"
+@@ -1948,3 +1951,219 @@ var _ = Describe("MutatePod - PVC Collection Error", func() {
+ 		Expect(err).To(HaveOccurred())
+ 	})
+ })
++
++var _ = Describe("DataMigrate access block", func() {
++	const (
++		blockNamespace = "big-data"
++		blockPVCName   = "exist"
++	)
++
++	var (
++		s     *runtime.Scheme
++		patch *gomonkey.Patches
++	)
++
++	BeforeEach(func() {
++		s = runtime.NewScheme()
++		Expect(corev1.AddToScheme(s)).To(Succeed())
++		Expect(datav1alpha1.AddToScheme(s)).To(Succeed())
++		Expect(appsv1.AddToScheme(s)).To(Succeed())
++
++		mockReadFile := func(content string) ([]byte, error) {
++			return []byte(pluginsProfile), nil
++		}
++		patch = gomonkey.ApplyFunc(os.ReadFile, mockReadFile)
++	})
++
++	AfterEach(func() {
++		patch.Reset()
++	})
++
++	buildBlockedDataset := func(blocked bool) *datav1alpha1.Dataset {
++		dataset := &datav1alpha1.Dataset{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      blockPVCName,
++				Namespace: blockNamespace,
++			},
++			Status: datav1alpha1.DatasetStatus{
++				Phase: datav1alpha1.BoundDatasetPhase,
++				Runtimes: []datav1alpha1.Runtime{
++					{
++						Name:      blockPVCName,
++						Namespace: blockNamespace,
++						Type:      common.JindoRuntime,
++					},
++				},
++			},
++		}
++		if blocked {
++			dataset.Status.DataMigrateRefs = []datav1alpha1.DataMigrateRef{
++				{Name: "blocking-migrate", Namespace: blockNamespace, Block: true},
++			}
++		} else {
++			dataset.Status.DataMigrateRefs = []datav1alpha1.DataMigrateRef{
++				{Name: "non-blocking-migrate", Namespace: blockNamespace, Block: false},
++			}
++		}
++		return dataset
++	}
++
++	buildFixtures := func(dataset *datav1alpha1.Dataset) []runtime.Object {
++		pv := &corev1.PersistentVolume{
++			ObjectMeta: metav1.ObjectMeta{Name: blockNamespace + "-" + blockPVCName},
++			Spec: corev1.PersistentVolumeSpec{
++				PersistentVolumeSource: corev1.PersistentVolumeSource{
++					CSI: &corev1.CSIPersistentVolumeSource{
++						Driver: "fuse.csi.fluid.io",
++						VolumeAttributes: map[string]string{
++							common.VolumeAttrFluidPath: "/runtime-mnt/jindo/big-data/exist/jindofs-fuse",
++							common.VolumeAttrMountType: common.JindoRuntime,
++						},
++					},
++				},
++			},
++		}
++		pvc := &corev1.PersistentVolumeClaim{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      blockPVCName,
++				Namespace: blockNamespace,
++				Labels: map[string]string{
++					"fluid.io/s-big-data-exist": "true",
++				},
++			},
++			Spec: corev1.PersistentVolumeSpec{
++				VolumeName: blockNamespace + "-" + blockPVCName,
++			},
++		}
++		jindoRuntime := &datav1alpha1.JindoRuntime{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      blockPVCName,
++				Namespace: blockNamespace,
++			},
++		}
++		// Same fuse DaemonSet fixture as the successful serverless mutation test,
++		// so that a non-blocked dataset goes through the whole injection pipeline.
++		privileged := true
++		fuseDaemonSet := &appsv1.DaemonSet{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      blockPVCName + "-jindofs-fuse",
++				Namespace: blockNamespace,
++			},
++			Spec: appsv1.DaemonSetSpec{
++				Template: corev1.PodTemplateSpec{
++					Spec: corev1.PodSpec{
++						Containers: []corev1.Container{
++							{
++								Name:    "fuse",
++								Image:   "test",
++								Command: []string{"/entrypoint.sh"},
++								Args:    []string{"-okernel_cache"},
++								SecurityContext: &corev1.SecurityContext{
++									Privileged: &privileged,
++								},
++							},
++						},
++					},
++				},
++			},
++		}
++		return []runtime.Object{dataset, pv, pvc, jindoRuntime, fuseDaemonSet}
++	}
++
++	buildPod := func(skipPrecheck bool) *corev1.Pod {
++		annotations := map[string]string{}
++		if skipPrecheck {
++			annotations[common.SkipPrecheckAnnotationKey] = common.True
++		}
++		return &corev1.Pod{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:        "blocked-pod",
++				Namespace:   blockNamespace,
++				Labels:      map[string]string{common.InjectServerless: common.True},
++				Annotations: annotations,
++			},
++			Spec: corev1.PodSpec{
++				Containers: []corev1.Container{
++					{
++						Image: "test",
++						Name:  "test",
++						VolumeMounts: []corev1.VolumeMount{
++							{Name: "dataset", MountPath: "/data"},
++						},
++					},
++				},
++				Volumes: []corev1.Volume{
++					{
++						Name: "dataset",
++						VolumeSource: corev1.VolumeSource{
++							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
++								ClaimName: blockPVCName,
++							},
++						},
++					},
++				},
++			},
++		}
++	}
++
++	It("should return a typed block error from MutatePod when the dataset is blocked", func() {
++		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(true))...)
++		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
++
++		handler := &FluidMutatingHandler{Client: fakeClient, Reader: fakeClient}
++		err := handler.MutatePod(buildPod(false), false)
++		Expect(err).To(HaveOccurred())
++
++		var blockedErr *fluidutils.DatasetAccessBlockedError
++		Expect(errors.As(err, &blockedErr)).To(BeTrue())
++		Expect(blockedErr.Name).To(Equal(blockPVCName))
++	})
++
++	It("should not let the skipPrecheck annotation bypass an explicit block", func() {
++		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(true))...)
++		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
++
++		handler := &FluidMutatingHandler{Client: fakeClient, Reader: fakeClient}
++		err := handler.MutatePod(buildPod(true), true)
++		Expect(err).To(HaveOccurred())
++
++		var blockedErr *fluidutils.DatasetAccessBlockedError
++		Expect(errors.As(err, &blockedErr)).To(BeTrue())
++		Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
++	})
++
++	It("should allow mutation when the migration does not set block", func() {
++		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(false))...)
++		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
++
++		handler := &FluidMutatingHandler{Client: fakeClient, Reader: fakeClient}
++		err := handler.MutatePod(buildPod(false), false)
++		// Whatever the downstream injection does, it must never be a migration block.
++		var blockedErr *fluidutils.DatasetAccessBlockedError
++		Expect(errors.As(err, &blockedErr)).To(BeFalse())
++	})
++
++	It("should translate the block into an explicit admission denial", func() {
++		fakeClient := fake.NewFakeClientWithScheme(s, buildFixtures(buildBlockedDataset(true))...)
++		Expect(plugins.RegisterMutatingHandlers(fakeClient)).To(Succeed())
++
++		decoder := admission.NewDecoder(scheme.Scheme)
++		handler := &FluidMutatingHandler{}
++		handler.Setup(fakeClient, fakeClient, decoder)
++
++		rawPod, err := json.Marshal(buildPod(false))
++		Expect(err).NotTo(HaveOccurred())
++
++		req := admission.Request{
++			AdmissionRequest: admissionv1.AdmissionRequest{
++				Namespace: blockNamespace,
++				Object:    runtime.RawExtension{Raw: rawPod},
++			},
++		}
++
++		resp := handler.Handle(context.TODO(), req)
++		Expect(resp.AdmissionResponse.Allowed).To(BeFalse())
++		Expect(resp.AdmissionResponse.Result).NotTo(BeNil())
++		Expect(resp.AdmissionResponse.Result.Message).To(ContainSubstring("blocked by DataMigrate"))
++	})
++})
+diff --git a/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go b/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go
+index 896d5f1..3ae36ba 100644
+--- a/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go
++++ b/pkg/webhook/plugins/fusesidecar/fuse_sidecar.go
+@@ -69,6 +69,19 @@ func (p *FuseSidecar) Mutate(pod *corev1.Pod, runtimeInfos map[string]base.Runti
+ 	}
+ 
+ 	for len(runtimeInfos) > 0 {
++		// Enforce the explicit DataMigrate block on every dataset to be injected,
++		// including transitive datasets discovered during the injection loop. The
++		// check is independent of the skipPrecheck annotation.
++		for _, runtimeInfo := range runtimeInfos {
++			if runtimeInfo == nil {
++				continue
++			}
++			if err := utils.CheckDatasetDataAccessBlocked(p.client, runtimeInfo.GetNamespace(), runtimeInfo.GetName()); err != nil {
++				return shouldStop, errors.Wrapf(err, "fuse sidecar injection is blocked for dataset \"%s/%s\"",
++					runtimeInfo.GetNamespace(), runtimeInfo.GetName())
++			}
++		}
++
+ 		var injector inject.Injector = fuse.NewInjector(p.client)
+ 		out, err := injector.InjectPod(pod, runtimeInfos)
+ 		if err != nil {
+diff --git a/pkg/webhook/plugins/fusesidecar/fuse_sidecar_test.go b/pkg/webhook/plugins/fusesidecar/fuse_sidecar_test.go
+index d649336..7a2c881 100644
+--- a/pkg/webhook/plugins/fusesidecar/fuse_sidecar_test.go
++++ b/pkg/webhook/plugins/fusesidecar/fuse_sidecar_test.go
+@@ -23,8 +23,11 @@ import (
+ 	. "github.com/onsi/gomega"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ )
+ 
+ var _ = Describe("FuseSidecar Plugin", func() {
+@@ -32,10 +35,15 @@ var _ = Describe("FuseSidecar Plugin", func() {
+ 		fakeClient  client.Client
+ 		plugin      api.MutatingHandler
+ 		runtimeInfo base.RuntimeInfoInterface
++		scheme      *runtime.Scheme
+ 	)
+ 
+ 	BeforeEach(func() {
+-		fakeClient = fake.NewFakeClient()
++		scheme = runtime.NewScheme()
++		Expect(corev1.AddToScheme(scheme)).To(Succeed())
++		Expect(datav1alpha1.AddToScheme(scheme)).To(Succeed())
++
++		fakeClient = fake.NewClientBuilder().WithScheme(scheme).Build()
+ 
+ 		var err error
+ 		plugin, err = NewPlugin(fakeClient, "")
+@@ -97,5 +105,37 @@ var _ = Describe("FuseSidecar Plugin", func() {
+ 				Expect(shouldStop).To(BeFalse())
+ 			})
+ 		})
++
++		Context("when the dataset access is explicitly blocked by a DataMigrate", func() {
++			It("should return a block error before injecting the sidecar", func() {
++				blockedDataset := &v1alpha1.Dataset{
++					ObjectMeta: metav1.ObjectMeta{
++						Name:      "test",
++						Namespace: "fluid",
++					},
++					Status: v1alpha1.DatasetStatus{
++						DataMigrateRefs: []v1alpha1.DataMigrateRef{
++							{Name: "blocking-migrate", Namespace: "fluid", Block: true},
++						},
++					},
++				}
++				blockedClient := fake.NewClientBuilder().
++					WithScheme(scheme).
++					WithObjects(blockedDataset).
++					Build()
++				blockedPlugin, err := NewPlugin(blockedClient, "")
++				Expect(err).NotTo(HaveOccurred())
++
++				runtimeInfos := map[string]base.RuntimeInfoInterface{
++					"test": runtimeInfo,
++				}
++
++				_, err = blockedPlugin.Mutate(pod, runtimeInfos)
++				Expect(err).To(HaveOccurred())
++				Expect(err.Error()).To(ContainSubstring("blocked by DataMigrate"))
++				// No sidecar container should be injected when the block is in effect.
++				Expect(pod.Spec.Containers).To(BeEmpty())
++			})
++		})
+ 	})
+ })
