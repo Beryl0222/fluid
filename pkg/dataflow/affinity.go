@@ -43,8 +43,17 @@ func InjectAffinityAnnotation(opAnnotation map[string]string, podAnnotation map[
 	return copiedMap
 }
 
-// InjectAffinityByRunAfterOp inject the affinity based on preceding operation
-func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.OperationRef, opNamespace string, currentAffinity *v1.Affinity) (*v1.Affinity, error) {
+// InjectAffinityByRunAfterOp inject the affinity based on preceding operation. The
+// dependencies argument carries the identity and observed terminal state persisted on the
+// successor status (Status.WaitingFor.Dependencies), which makes the decision identical to
+// the one made by the DataFlow waiting controller:
+//   - a confirmed Complete record (including when the preceding object has since been
+//     deleted) is trusted and its NodeAffinity snapshot is used;
+//   - a same-name object with a different UID is rejected as an identity conflict;
+//   - Failed/non-terminal/unknown states return an error so the engine keeps retrying
+//     instead of inheriting affinity from an impersonating object.
+func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.OperationRef, opNamespace string,
+	currentAffinity *v1.Affinity, dependencies []datav1alpha1.DependencyStatus) (*v1.Affinity, error) {
 	// no previous operation or use default affinity strategy, no need to generate node affinity
 	if runAfter == nil || runAfter.AffinityStrategy.Policy == datav1alpha1.DefaultAffinityStrategy {
 		return currentAffinity, nil
@@ -56,33 +65,37 @@ func InjectAffinityByRunAfterOp(c client.Client, runAfter *datav1alpha1.Operatio
 		dependOnOp = &runAfter.ObjectRef
 	}
 
-	precedingOpNamespace := opNamespace
-	if len(dependOnOp.Namespace) != 0 {
-		precedingOpNamespace = dependOnOp.Namespace
-	}
+	recorded := FindDependencyRecord(dependencies, dependOnOp, opNamespace)
+	result := CheckPrecedingOperation(c, dependOnOp, opNamespace, recorded)
 
-	precedingOpStatus, err := utils.GetPrecedingOperationStatus(c, dependOnOp, precedingOpNamespace)
-	if err != nil {
-		return currentAffinity, err
+	switch result.Verdict {
+	case DependencySucceeded:
+		// proceed with the terminal record below
+	case DependencyFailed, DependencyConflict:
+		// Stable failure: never inherit affinity from a failed dependency or an impostor.
+		return currentAffinity, result.Err
+	default:
+		// DependencyWaiting: non-terminal object, unknown state, or a retryable API error.
+		if result.Err != nil {
+			return currentAffinity, result.Err
+		}
+		return currentAffinity, errors.New(fmt.Sprintf("dependOn operation %s is not completed yet", dependOnOp.Name))
 	}
 
 	// ensure the dependent operation was completed, the outer caller will record the event.
-	if precedingOpStatus.Phase != common.PhaseComplete {
-		return nil, errors.New(fmt.Sprintf("dependOn operation %s status is %s, not completed.", dependOnOp.Name, precedingOpStatus.Phase))
-	}
-
-	if precedingOpStatus.NodeAffinity == nil {
+	precedingNodeAffinity := result.Record.NodeAffinity
+	if precedingNodeAffinity == nil {
 		return currentAffinity, nil
 	}
 
 	// require policy
 	if runAfter.AffinityStrategy.Policy == datav1alpha1.RequireAffinityStrategy {
-		return injectRequiredAffinity(runAfter, precedingOpStatus.NodeAffinity, currentAffinity)
+		return injectRequiredAffinity(runAfter, precedingNodeAffinity, currentAffinity)
 	}
 
 	// prefer policy
 	if runAfter.AffinityStrategy.Policy == datav1alpha1.PreferAffinityStrategy {
-		return injectPreferredAffinity(runAfter, precedingOpStatus.NodeAffinity, currentAffinity)
+		return injectPreferredAffinity(runAfter, precedingNodeAffinity, currentAffinity)
 	}
 
 	return currentAffinity, fmt.Errorf("unknown policy for affinity strategy: %s", runAfter.AffinityStrategy.Policy)

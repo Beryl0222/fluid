@@ -132,7 +132,7 @@ func (e *CacheEngine) genDataLoadValue(ctx cruntime.ReconcileRequestContext, tar
 	}
 
 	// inject the node affinity by previous operation pod.
-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
+	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity, dataload.Status.WaitingFor.Dependencies)
 	if err != nil {
 		return nil, err
 	}

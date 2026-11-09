@@ -24,6 +24,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"reflect"
 	"testing"
 )
@@ -35,6 +36,7 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
 		opNamespace     string
 		objects         []runtime.Object
 		currentAffinity *v1.Affinity
+		dependencies    []datav1alpha1.DependencyStatus
 	}
 	tests := []struct {
 		name    string
@@ -511,6 +513,179 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
 			want:    nil,
 			wantErr: true,
 		},
+		{
+			name: "snapshot affinity is retained after the preceding object is deleted",
+			args: args{
+				runAfter: &datav1alpha1.OperationRef{
+					ObjectRef: datav1alpha1.ObjectRef{
+						Kind: "DataLoad",
+						Name: "test-op",
+					},
+					AffinityStrategy: datav1alpha1.AffinityStrategy{
+						Policy: datav1alpha1.RequireAffinityStrategy,
+					},
+				},
+				// no live object: the TTL cleanup has removed the preceding DataLoad
+				objects: []runtime.Object{},
+				dependencies: []datav1alpha1.DependencyStatus{
+					{
+						Ref:   datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "test-op", Namespace: "default"},
+						UID:   types.UID("uid-a"),
+						Phase: common.PhaseComplete,
+						NodeAffinity: &v1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+								NodeSelectorTerms: []v1.NodeSelectorTerm{
+									{
+										MatchExpressions: []v1.NodeSelectorRequirement{
+											{
+												Key:      common.K8sNodeNameLabelKey,
+												Operator: v1.NodeSelectorOpIn,
+												Values:   []string{"node01"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				opNamespace:     "default",
+				currentAffinity: nil,
+			},
+			want: &v1.Affinity{
+				NodeAffinity: &v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      common.K8sNodeNameLabelKey,
+										Operator: v1.NodeSelectorOpIn,
+										Values:   []string{"node01"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "same-name object with a different UID cannot provide affinity",
+			args: args{
+				runAfter: &datav1alpha1.OperationRef{
+					ObjectRef: datav1alpha1.ObjectRef{
+						Kind: "DataLoad",
+						Name: "test-op",
+					},
+					AffinityStrategy: datav1alpha1.AffinityStrategy{
+						Policy: datav1alpha1.RequireAffinityStrategy,
+					},
+				},
+				objects: []runtime.Object{
+					&datav1alpha1.DataLoad{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "test-op",
+							Namespace: "default",
+							UID:       types.UID("impostor-uid"),
+						},
+						Status: datav1alpha1.OperationStatus{
+							Phase:        common.PhaseComplete,
+							NodeAffinity: sampleNodeAffinity(),
+						},
+					},
+				},
+				dependencies: []datav1alpha1.DependencyStatus{
+					{
+						Ref:   datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "test-op", Namespace: "default"},
+						UID:   types.UID("recorded-uid"),
+						Phase: common.PhaseComplete,
+					},
+				},
+				opNamespace:     "default",
+				currentAffinity: nil,
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name: "confirmed failed dependency never injects affinity from the record",
+			args: args{
+				runAfter: &datav1alpha1.OperationRef{
+					ObjectRef: datav1alpha1.ObjectRef{
+						Kind: "DataLoad",
+						Name: "test-op",
+					},
+					AffinityStrategy: datav1alpha1.AffinityStrategy{
+						Policy: datav1alpha1.PreferAffinityStrategy,
+					},
+				},
+				objects: []runtime.Object{},
+				dependencies: []datav1alpha1.DependencyStatus{
+					{
+						Ref:     datav1alpha1.ObjectRef{Kind: "DataLoad", Name: "test-op", Namespace: "default"},
+						UID:     types.UID("uid-a"),
+						Phase:   common.PhaseFailed,
+						Reason:  "JobFailed",
+						Message: "boom",
+					},
+				},
+				opNamespace:     "default",
+				currentAffinity: nil,
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name: "dependOn affinity comes from its own persisted record",
+			args: args{
+				runAfter: &datav1alpha1.OperationRef{
+					ObjectRef: datav1alpha1.ObjectRef{
+						Kind: "DataLoad",
+						Name: "run-after-op",
+					},
+					AffinityStrategy: datav1alpha1.AffinityStrategy{
+						Policy: datav1alpha1.RequireAffinityStrategy,
+						DependOn: &datav1alpha1.ObjectRef{
+							Kind:      "DataProcess",
+							Name:      "affinity-op",
+							Namespace: "default",
+						},
+					},
+				},
+				// the dependOn object has already been deleted, only its terminal record remains
+				objects: []runtime.Object{},
+				dependencies: []datav1alpha1.DependencyStatus{
+					{
+						Ref:          datav1alpha1.ObjectRef{Kind: "DataProcess", Name: "affinity-op", Namespace: "default"},
+						UID:          types.UID("uid-dep"),
+						Phase:        common.PhaseComplete,
+						NodeAffinity: sampleNodeAffinity(),
+					},
+				},
+				opNamespace:     "default",
+				currentAffinity: nil,
+			},
+			want: &v1.Affinity{
+				NodeAffinity: &v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      common.K8sNodeNameLabelKey,
+										Operator: v1.NodeSelectorOpIn,
+										Values:   []string{"node01"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
 	}
 	testScheme := runtime.NewScheme()
 	_ = v1.AddToScheme(testScheme)
@@ -521,7 +696,7 @@ func TestInjectAffinityByRunAfterOp(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := fake.NewFakeClientWithScheme(testScheme, tt.args.objects...)
 
-			got, err := InjectAffinityByRunAfterOp(c, tt.args.runAfter, tt.args.opNamespace, tt.args.currentAffinity)
+			got, err := InjectAffinityByRunAfterOp(c, tt.args.runAfter, tt.args.opNamespace, tt.args.currentAffinity, tt.args.dependencies)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("InjectAffinityByRunAfterOp() error = %v, wantErr %v", err, tt.wantErr)
 				return

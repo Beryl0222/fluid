@@ -70,31 +70,30 @@ func GetPrecedingOperationStatus(client client.Client, opRef *datav1alpha1.Objec
 		return nil, nil
 	}
 
+	object, err := GetPrecedingOperation(client, opRef, opRefNamespace)
+	if err != nil {
+		return nil, err
+	}
+	return GetOperationStatus(object)
+}
+
+// GetPrecedingOperation returns the full preceding data operation object referred to by opRef.
+// Compared with GetPrecedingOperationStatus, the returned object also carries object metadata
+// (e.g. UID) which is required to pin the identity of the preceding operation.
+func GetPrecedingOperation(client client.Client, opRef *datav1alpha1.ObjectRef, opRefNamespace string) (client.Object, error) {
+	if opRef == nil {
+		return nil, nil
+	}
+
 	switch opRef.Kind {
 	case string(dataoperation.DataBackupType):
-		object, err := GetDataBackup(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataBackup(client, opRef.Name, opRefNamespace)
 	case string(dataoperation.DataLoadType):
-		object, err := GetDataLoad(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataLoad(client, opRef.Name, opRefNamespace)
 	case string(dataoperation.DataMigrateType):
-		object, err := GetDataMigrate(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataMigrate(client, opRef.Name, opRefNamespace)
 	case string(dataoperation.DataProcessType):
-		object, err := GetDataProcess(client, opRef.Name, opRefNamespace)
-		if err != nil {
-			return nil, err
-		}
-		return &object.Status, nil
+		return GetDataProcess(client, opRef.Name, opRefNamespace)
 	default:
 		// TODO: Support non-builtin Kind
 		return nil, fmt.Errorf("kind %v is currently not supported for runAfter", opRef.Kind)

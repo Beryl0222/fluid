@@ -77,6 +77,14 @@ const (
 	DataOperationNotFound = "DataOperationNotFound"
 
 	DataOperationWaiting = "DataOperationWaiting"
+
+	// DataOperationDependencyFailed indicates that a preceding operation referred to by
+	// spec.runAfter (or affinityStrategy.dependOn) reached a confirmed Failed terminal state.
+	DataOperationDependencyFailed = "DataOperationDependencyFailed"
+
+	// DataOperationDependencyConflict indicates that the live object at the referenced
+	// name/namespace carries a UID different from the UID the successor has pinned.
+	DataOperationDependencyConflict = "DataOperationDependencyConflict"
 )
 
 // Events related to DataLoad

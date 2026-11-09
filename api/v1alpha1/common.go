@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fluid-cloudnative/fluid/pkg/common"
 )
@@ -308,6 +309,56 @@ type OperationRef struct {
 type WaitingStatus struct {
 	// OperationComplete indicates if the preceding operation is complete
 	OperationComplete *bool `json:"operationComplete,omitempty"`
+
+	// Dependencies records the identity and the observed terminal state of every
+	// preceding data operation this operation depends on, including the spec.runAfter
+	// referent and, when it points to a different object, its affinityStrategy.dependOn
+	// referent. The records are persisted on the status so that reconcile decisions stay
+	// stable across controller restarts, TTL-based cleanup of the preceding object and
+	// same-name recreations with a different UID.
+	// +optional
+	Dependencies []DependencyStatus `json:"dependencies,omitempty"`
+}
+
+// DependencyStatus records the identity and the last observed state of a preceding
+// data operation referred to by spec.runAfter or its affinityStrategy.dependOn. Once a
+// terminal state (Complete/Failed) has been observed, the record becomes the source of
+// truth for the dependency decision and must not be overridden by a same-name object
+// carrying a different UID.
+type DependencyStatus struct {
+	// Ref is the reference (kind/name/namespace) of the preceding operation. The
+	// namespace is resolved to the dependent operation's namespace when it is omitted.
+	Ref ObjectRef `json:"ref"`
+
+	// UID is the UID of the preceding object that was actually observed. It pins the
+	// dependency identity: a same-name object with a different UID is never treated as
+	// the same dependency and results in an identity conflict.
+	// +optional
+	UID types.UID `json:"uid,omitempty"`
+
+	// Phase is the last observed phase of the preceding operation. Only Complete and
+	// Failed are treated as confirmed terminal states; other phases mean the dependency
+	// is still pending.
+	// +optional
+	Phase common.Phase `json:"phase,omitempty"`
+
+	// Reason carries the machine-readable reason of the preceding operation's terminal
+	// transition so that a successor failure remains diagnosable after the preceding
+	// object has been deleted.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message carries the human-readable message of the preceding operation's terminal
+	// transition so that a successor failure remains diagnosable after the preceding
+	// object has been deleted.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// NodeAffinity caches the node affinity observed on the completed preceding
+	// operation. It allows affinity inheritance to keep working even after the preceding
+	// object has been deleted (e.g. cleaned up by TTLSecondsAfterFinished).
+	// +optional
+	NodeAffinity *corev1.NodeAffinity `json:"nodeAffinity,omitempty"`
 }
 
 type ClientMetrics struct {

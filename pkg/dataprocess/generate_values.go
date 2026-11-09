@@ -35,13 +35,13 @@ func GenDataProcessValueFile(client client.Client, dataset *datav1alpha1.Dataset
 
 	// generate the node affinity by previous operation pod.
 	if dataProcess.Spec.Processor.Job != nil {
-		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, dataProcess.Spec.Processor.Job.PodSpec.Affinity)
+		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, dataProcess.Spec.Processor.Job.PodSpec.Affinity, dataProcess.Status.WaitingFor.Dependencies)
 		if err != nil {
 			return "", errors.Wrapf(err, "failed to inject affinity by runAfterOp")
 		}
 		dataProcessValue.DataProcessInfo.JobProcessor.PodSpec.Affinity = affinity
 	} else {
-		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, nil)
+		affinity, err := dataflow.InjectAffinityByRunAfterOp(client, dataProcess.Spec.RunAfter, dataProcess.Namespace, nil, dataProcess.Status.WaitingFor.Dependencies)
 		if err != nil {
 			return "", errors.Wrapf(err, "failed to inject affinity by runAfterOp")
 		}

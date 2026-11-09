@@ -132,7 +132,7 @@ func (e *JindoCacheEngine) genDataLoadValue(image string, runtime *datav1alpha1.
 
 	// inject the node affinity by previous operation pod.
 	var err error
-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
+	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity, dataload.Status.WaitingFor.Dependencies)
 	if err != nil {
 		return nil, err
 	}

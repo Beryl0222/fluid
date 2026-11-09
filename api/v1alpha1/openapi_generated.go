@@ -75,6 +75,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetSpec":                       schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetSpec(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetStatus":                     schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetStatus(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DatasetToMigrate":                  schema_fluid_cloudnative_fluid_api_v1alpha1_DatasetToMigrate(ref),
+		"github.com/fluid-cloudnative/fluid/api/v1alpha1.DependencyStatus":                  schema_fluid_cloudnative_fluid_api_v1alpha1_DependencyStatus(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.EFCCompTemplateSpec":               schema_fluid_cloudnative_fluid_api_v1alpha1_EFCCompTemplateSpec(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.EFCFuseSpec":                       schema_fluid_cloudnative_fluid_api_v1alpha1_EFCFuseSpec(ref),
 		"github.com/fluid-cloudnative/fluid/api/v1alpha1.EFCRuntime":                        schema_fluid_cloudnative_fluid_api_v1alpha1_EFCRuntime(ref),
@@ -8734,6 +8735,62 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_VolumeSource(ref common.Referen
 	}
 }
 
+func schema_fluid_cloudnative_fluid_api_v1alpha1_DependencyStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "DependencyStatus records the identity and the last observed state of a preceding data operation referred to by spec.runAfter or its affinityStrategy.dependOn. Once a terminal state (Complete/Failed) has been observed, the record becomes the source of truth for the dependency decision and must not be overridden by a same-name object carrying a different UID.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"ref": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Ref is the reference (kind/name/namespace) of the preceding operation. The namespace is resolved to the dependent operation's namespace when it is omitted.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("github.com/fluid-cloudnative/fluid/api/v1alpha1.ObjectRef"),
+						},
+					},
+					"uid": {
+						SchemaProps: spec.SchemaProps{
+							Description: "UID is the UID of the preceding object that was actually observed. It pins the dependency identity: a same-name object with a different UID is never treated as the same dependency and results in an identity conflict.",
+							Ref:         ref("k8s.io/apimachinery/pkg/types.UID"),
+						},
+					},
+					"phase": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Phase is the last observed phase of the preceding operation. Only Complete and Failed are treated as confirmed terminal states; other phases mean the dependency is still pending.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"reason": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Reason carries the machine-readable reason of the preceding operation's terminal transition so that a successor failure remains diagnosable after the preceding object has been deleted.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"message": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Message carries the human-readable message of the preceding operation's terminal transition so that a successor failure remains diagnosable after the preceding object has been deleted.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"nodeAffinity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeAffinity caches the node affinity observed on the completed preceding operation. It allows affinity inheritance to keep working even after the preceding object has been deleted (e.g. cleaned up by TTLSecondsAfterFinished).",
+							Ref:         ref("k8s.io/api/core/v1.NodeAffinity"),
+						},
+					},
+				},
+				Required: []string{"ref"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/fluid-cloudnative/fluid/api/v1alpha1.ObjectRef", "k8s.io/api/core/v1.NodeAffinity", "k8s.io/apimachinery/pkg/types.UID"},
+	}
+}
+
 func schema_fluid_cloudnative_fluid_api_v1alpha1_WaitingStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -8747,8 +8804,24 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_WaitingStatus(ref common.Refere
 							Format:      "",
 						},
 					},
+					"dependencies": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Dependencies records the identity and the observed terminal state of every preceding data operation this operation depends on, including the spec.runAfter referent and, when it points to a different object, its affinityStrategy.dependOn referent. The records are persisted on the status so that reconcile decisions stay stable across controller restarts, TTL-based cleanup of the preceding object and same-name recreations with a different UID.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("github.com/fluid-cloudnative/fluid/api/v1alpha1.DependencyStatus"),
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"github.com/fluid-cloudnative/fluid/api/v1alpha1.DependencyStatus"},
 	}
 }

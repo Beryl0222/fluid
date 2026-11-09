@@ -140,7 +140,7 @@ func (j *JuiceFSEngine) genDataLoadValue(image string, cacheinfo map[string]stri
 
 	// generate the node affinity by previous operation pod.
 	var err error
-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
+	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(j.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity, dataload.Status.WaitingFor.Dependencies)
 	if err != nil {
 		return nil, err
 	}

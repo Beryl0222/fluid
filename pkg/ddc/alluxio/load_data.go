@@ -129,7 +129,7 @@ func (e *AlluxioEngine) genDataLoadValue(image string, targetDataset *datav1alph
 
 	// inject the node affinity by previous operation pod.
 	var err error
-	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity)
+	dataloadInfo.Affinity, err = dataflow.InjectAffinityByRunAfterOp(e.Client, dataload.Spec.RunAfter, dataload.Namespace, dataloadInfo.Affinity, dataload.Status.WaitingFor.Dependencies)
 	if err != nil {
 		return nil, err
 	}
