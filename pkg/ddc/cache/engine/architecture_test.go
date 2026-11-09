@@ -50,7 +50,7 @@ var _ = Describe("resolveArchitectureApi Tests", Label("pkg.ddc.cache.engine.arc
 			},
 		}
 
-		archApi := resolveArchitectureApi("test-runtime", "default", rt, runtimeClass)
+		archApi := resolveArchitectureApi(nil, "test-runtime", "default", rt, runtimeClass)
 		Expect(archApi).NotTo(BeNil())
 		_, ok := archApi.(*masterWorkerArchApi)
 		Expect(ok).To(BeTrue(), "expected masterWorkerArchApi")
@@ -58,7 +58,7 @@ var _ = Describe("resolveArchitectureApi Tests", Label("pkg.ddc.cache.engine.arc
 	})
 
 	It("should return workersOnlyArchApi when runtimeClass is nil", func() {
-		archApi := resolveArchitectureApi("test-runtime", "default", &datav1alpha1.CacheRuntime{}, nil)
+		archApi := resolveArchitectureApi(nil, "test-runtime", "default", &datav1alpha1.CacheRuntime{}, nil)
 		Expect(archApi).NotTo(BeNil())
 		_, ok := archApi.(*workersOnlyArchApi)
 		Expect(ok).To(BeTrue(), "expected workersOnlyArchApi when runtimeClass is nil")
@@ -78,7 +78,7 @@ var _ = Describe("resolveArchitectureApi Tests", Label("pkg.ddc.cache.engine.arc
 			},
 		}
 
-		archApi := resolveArchitectureApi("test-runtime", "default", rt, runtimeClass)
+		archApi := resolveArchitectureApi(nil, "test-runtime", "default", rt, runtimeClass)
 		Expect(archApi).NotTo(BeNil())
 		_, ok := archApi.(*workersOnlyArchApi)
 		Expect(ok).To(BeTrue(), "expected workersOnlyArchApi when topology is nil")
@@ -107,7 +107,7 @@ var _ = Describe("resolveArchitectureApi Tests", Label("pkg.ddc.cache.engine.arc
 			},
 		}
 
-		archApi := resolveArchitectureApi("test-runtime", "default", rt, runtimeClass)
+		archApi := resolveArchitectureApi(nil, "test-runtime", "default", rt, runtimeClass)
 		Expect(archApi).NotTo(BeNil())
 		_, ok := archApi.(*workersOnlyArchApi)
 		Expect(ok).To(BeTrue(), "expected workersOnlyArchApi")
@@ -130,7 +130,7 @@ var _ = Describe("resolveArchitectureApi Tests", Label("pkg.ddc.cache.engine.arc
 			},
 		}
 
-		archApi := resolveArchitectureApi("test-runtime", "default", nil, runtimeClass)
+		archApi := resolveArchitectureApi(nil, "test-runtime", "default", nil, runtimeClass)
 		Expect(archApi).NotTo(BeNil())
 		_, ok := archApi.(*workersOnlyArchApi)
 		Expect(ok).To(BeTrue(), "expected workersOnlyArchApi when runtime is nil")
@@ -167,7 +167,7 @@ var _ = Describe("resolveArchitectureApi Tests", Label("pkg.ddc.cache.engine.arc
 			},
 		}
 
-		archApi := resolveArchitectureApi("test-runtime", "default", rt, runtimeClass)
+		archApi := resolveArchitectureApi(nil, "test-runtime", "default", rt, runtimeClass)
 		Expect(archApi).NotTo(BeNil())
 		_, ok := archApi.(*workersOnlyArchApi)
 		Expect(ok).To(BeTrue(), "expected workersOnlyArchApi when master is disabled")

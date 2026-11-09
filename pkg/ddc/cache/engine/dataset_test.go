@@ -17,11 +17,13 @@ limitations under the License.
 package engine
 
 import (
+	stderrors "errors"
 	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
 	"github.com/fluid-cloudnative/fluid/pkg/common"
+	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
 	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -29,6 +31,7 @@ import (
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 var _ = Describe("generateDatasetMountOptions Tests", Label("pkg.ddc.cache.engine.dataset_test.go"), func() {
@@ -760,6 +763,23 @@ var _ = Describe("GetCacheStates Tests", Label("pkg.ddc.cache.engine.dataset_tes
 	})
 
 	Describe("GetCacheStates with Workers-Only architecture", func() {
+		workerCompName := common.GetCacheComponentName("test-runtime", common.ComponentTypeWorker)
+
+		// useWorkersOnlyClient builds a fake client mirroring the live worker StatefulSet
+		// and its pods, which is the state the execution pod selection is based on.
+		useWorkersOnlyClient := func(replicas int32, pods ...*corev1.Pod) {
+			sts := buildWorkerASTS("test-runtime", "default", replicas)
+			objs := []runtime.Object{sts}
+			for _, pod := range pods {
+				objs = append(objs, pod)
+			}
+			engine.Client = fake.NewFakeClientWithScheme(CacheEngineTestScheme, objs...)
+		}
+
+		readyWorkerPod := func(ordinal int) *corev1.Pod {
+			return buildWorkerPod("test-runtime", "default", "worker", ordinal, true, corev1.PodRunning, false)
+		}
+
 		Context("when ReportSummary returns valid JSON through worker pod", func() {
 			It("should parse JSON and return correct CacheStateList via workers-only handler", func() {
 				reportSummary := &datav1alpha1.ExecutionCommonEntry{
@@ -768,10 +788,11 @@ var _ = Describe("GetCacheStates Tests", Label("pkg.ddc.cache.engine.dataset_tes
 				}
 				runtimeClass := buildWorkersOnlyRuntimeClass(reportSummary)
 				runtime := newWorkersOnlyRuntime()
+				useWorkersOnlyClient(1, readyWorkerPod(0))
 
 				patches = gomonkey.ApplyFunc(kubeclient.ExecCommandInContainerWithTimeout,
 					func(podName, containerName, namespace string, command []string, timeout time.Duration) (stdout string, stderr string, err error) {
-						Expect(podName).To(Equal(common.GetCacheComponentName("test-runtime", common.ComponentTypeWorker) + "-0"))
+						Expect(podName).To(Equal(workerCompName + "-0"))
 						Expect(containerName).To(Equal("worker"))
 						return `{"cached":"5242880","cachedPercentage":"25","cacheCapacity":"20971520","cacheHitRatio":"0.75"}`, "", nil
 					})
@@ -784,6 +805,84 @@ var _ = Describe("GetCacheStates Tests", Label("pkg.ddc.cache.engine.dataset_tes
 				Expect(cacheStates[common.CachedPercentage]).To(Equal("25"))
 				Expect(cacheStates[common.CacheCapacity]).To(Equal("20971520"))
 				Expect(cacheStates[common.CacheHitRatio]).To(Equal("0.75"))
+			})
+
+			It("should fail over to a healthy worker and pin that identity for the command", func() {
+				reportSummary := &datav1alpha1.ExecutionCommonEntry{
+					Command:        []string{"/report-summary"},
+					TimeoutSeconds: 30,
+				}
+				runtimeClass := buildWorkersOnlyRuntimeClass(reportSummary)
+				runtime := newWorkersOnlyRuntime()
+				// worker-0 is not ready (e.g. rolling replacement in progress), worker-1 is healthy.
+				notReadyPod0 := buildWorkerPod("test-runtime", "default", "worker", 0, false, corev1.PodPending, false)
+				useWorkersOnlyClient(2, notReadyPod0, readyWorkerPod(1))
+
+				patches = gomonkey.ApplyFunc(kubeclient.ExecCommandInContainerWithTimeout,
+					func(podName, containerName, namespace string, command []string, timeout time.Duration) (stdout string, stderr string, err error) {
+						Expect(podName).To(Equal(workerCompName + "-1"))
+						Expect(containerName).To(Equal("worker"))
+						return `{"cached":"1"}`, "", nil
+					})
+
+				cacheStates, err := engine.GetCacheStates(runtime, runtimeClass)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(cacheStates).NotTo(BeNil())
+			})
+		})
+
+		Context("when no ready worker pod is available", func() {
+			It("should return the unavailable sentinel and nil states without executing any command", func() {
+				reportSummary := &datav1alpha1.ExecutionCommonEntry{
+					Command:        []string{"/report-summary"},
+					TimeoutSeconds: 30,
+				}
+				runtimeClass := buildWorkersOnlyRuntimeClass(reportSummary)
+				runtime := newWorkersOnlyRuntime()
+				notReadyPod0 := buildWorkerPod("test-runtime", "default", "worker", 0, false, corev1.PodPending, false)
+				useWorkersOnlyClient(1, notReadyPod0)
+
+				execCalled := false
+				patches = gomonkey.ApplyFunc(kubeclient.ExecCommandInContainerWithTimeout,
+					func(podName, containerName, namespace string, command []string, timeout time.Duration) (stdout string, stderr string, err error) {
+						execCalled = true
+						return "", "", nil
+					})
+
+				cacheStates, err := engine.GetCacheStates(runtime, runtimeClass)
+
+				Expect(err).To(HaveOccurred())
+				Expect(stderrors.Is(err, ErrExecutionPodUnavailable)).To(BeTrue())
+				Expect(cacheStates).To(BeNil())
+				Expect(execCalled).To(BeFalse(), "no command should be executed when no worker is ready")
+			})
+
+			It("should return the zero-replica sentinel when the worker statefulset is scaled to zero", func() {
+				reportSummary := &datav1alpha1.ExecutionCommonEntry{
+					Command:        []string{"/report-summary"},
+					TimeoutSeconds: 30,
+				}
+				runtimeClass := buildWorkersOnlyRuntimeClass(reportSummary)
+				runtime := newWorkersOnlyRuntime()
+				useWorkersOnlyClient(0)
+
+				execCalled := false
+				patches = gomonkey.ApplyFunc(kubeclient.ExecCommandInContainerWithTimeout,
+					func(podName, containerName, namespace string, command []string, timeout time.Duration) (stdout string, stderr string, err error) {
+						execCalled = true
+						return "", "", nil
+					})
+
+				cacheStates, err := engine.GetCacheStates(runtime, runtimeClass)
+
+				Expect(err).To(HaveOccurred())
+				Expect(stderrors.Is(err, ErrExecutionPodUnavailable)).To(BeTrue())
+				var unavailableErr *ExecutionPodUnavailableError
+				Expect(stderrors.As(err, &unavailableErr)).To(BeTrue())
+				Expect(unavailableErr.Reason()).To(Equal(ExecutionPodUnavailableReasonZeroReplicas))
+				Expect(cacheStates).To(BeNil())
+				Expect(execCalled).To(BeFalse())
 			})
 		})
 
@@ -859,6 +958,7 @@ var _ = Describe("GetCacheStates Tests", Label("pkg.ddc.cache.engine.dataset_tes
 				}
 				runtimeClass := buildWorkersOnlyRuntimeClass(reportSummary)
 				runtime := newWorkersOnlyRuntime()
+				useWorkersOnlyClient(1, readyWorkerPod(0))
 
 				patches = gomonkey.ApplyFunc(kubeclient.ExecCommandInContainerWithTimeout,
 					func(podName, containerName, namespace string, command []string, timeout time.Duration) (stdout string, stderr string, err error) {
@@ -880,6 +980,7 @@ var _ = Describe("GetCacheStates Tests", Label("pkg.ddc.cache.engine.dataset_tes
 				}
 				runtimeClass := buildWorkersOnlyRuntimeClass(reportSummary)
 				runtime := newWorkersOnlyRuntime()
+				useWorkersOnlyClient(1, readyWorkerPod(0))
 
 				patches = gomonkey.ApplyFunc(kubeclient.ExecCommandInContainerWithTimeout,
 					func(podName, containerName, namespace string, command []string, timeout time.Duration) (stdout string, stderr string, err error) {

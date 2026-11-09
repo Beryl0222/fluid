@@ -39,9 +39,15 @@ func (e *CacheEngine) PrepareUFS(archApi ArchitectureApi) (mountOutput *datav1al
 	}
 	mountUfs := entries.MountUFS
 
-	// execute mount command in master pod
+	// Resolve the execution pod once and pin its identity for this mount command. A
+	// transient "no ready pod" condition is surfaced explicitly so callers can retry on
+	// the next reconcile instead of treating it as a configuration failure.
 	podName, containerName, err := archApi.GetExecutionPodInfo()
 	if err != nil {
+		if IsExecutionPodUnavailable(err) {
+			e.Log.Info("Execution pod is temporarily unavailable, skip mount ufs and retry on the next reconcile",
+				"name", e.name, "namespace", e.namespace, "reason", err.Error())
+		}
 		return nil, err
 	}
 
@@ -100,7 +106,7 @@ func (e *CacheEngine) UpdateOnUFSChange(runtime *datav1alpha1.CacheRuntime) (err
 	}
 
 	// update only when architecture supports mount ufs.
-	archApi := resolveArchitectureApi(e.name, e.namespace, runtime, runtimeClass)
+	archApi := resolveArchitectureApi(e.Client, e.name, e.namespace, runtime, runtimeClass)
 	if !archApi.IsMountUFSSupported() {
 		return
 	}

@@ -64,7 +64,14 @@ func (e *CacheEngine) UpdateDatasetStatus(phase datav1alpha1.DatasetPhase, runti
 		e.Log.V(1).Info("Start to update cache states")
 		cacheStates, err = e.GetCacheStates(runtime, runtimeClass)
 		if err != nil {
-			e.Log.Error(err, "Failed to get cache states, keeping previous cache states in dataset status")
+			if IsExecutionPodUnavailable(err) {
+				// No ready execution pod: keep the previous cache states and let the next
+				// reconcile retry. This must not be recorded as an error condition.
+				e.Log.Info("Execution pod is temporarily unavailable, keeping previous cache states in dataset status",
+					"name", e.name, "namespace", e.namespace, "reason", err.Error())
+			} else {
+				e.Log.Error(err, "Failed to get cache states, keeping previous cache states in dataset status")
+			}
 		}
 	}
 
@@ -137,7 +144,7 @@ func (e *CacheEngine) UpdateDatasetStatus(phase datav1alpha1.DatasetPhase, runti
 
 func (e *CacheEngine) GetCacheStates(runtime *datav1alpha1.CacheRuntime, runtimeClass *datav1alpha1.CacheRuntimeClass) (common.CacheStateList, error) {
 
-	handler := resolveArchitectureApi(e.name, e.namespace, runtime, runtimeClass)
+	handler := resolveArchitectureApi(e.Client, e.name, e.namespace, runtime, runtimeClass)
 
 	executionEntries := handler.GetExecutionEntries()
 	if executionEntries == nil || executionEntries.ReportSummary == nil {
@@ -150,9 +157,20 @@ func (e *CacheEngine) GetCacheStates(runtime *datav1alpha1.CacheRuntime, runtime
 
 	timeout := max(reportSummaryEntry.TimeoutSeconds, common.MinExecutionTimeoutSeconds)
 
-	// Resolve target pod/container according to the runtime architecture.
+	// Resolve target pod/container according to the runtime architecture once and pin the
+	// identity for this whole command: every retry of the command execution below targets
+	// the same pod. Fail-over to another healthy replica happens on the next command, i.e.
+	// the next reconcile retry, when the previously selected pod is no longer Ready.
 	podName, containerName, err := handler.GetExecutionPodInfo()
 	if err != nil {
+		if IsExecutionPodUnavailable(err) {
+			// Expected transient condition (zero replicas, rolling update, node failure, ...).
+			// Return nil cache states so callers keep the last known good cache states instead
+			// of writing an error state; the next reconcile retries the selection.
+			e.Log.Info("Execution pod is temporarily unavailable, skip fetching cache states and keep previous states",
+				"name", e.name, "namespace", e.namespace, "reason", err.Error())
+			return nil, err
+		}
 		e.Log.Error(err, "Failed to get pod info")
 		return nil, err
 	}

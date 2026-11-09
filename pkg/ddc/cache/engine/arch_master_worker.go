@@ -20,12 +20,17 @@ import (
 	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
 	"github.com/fluid-cloudnative/fluid/pkg/common"
 	"github.com/pkg/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // masterWorkerArchApi handles the Master-Worker runtime architecture.
 // Operations (report summary, ufs mount) are executed on the master pod, and
 // configuration is read from the Master topology definition.
+//
+// The master identity stays pinned to <runtime>-master-0 by design (the master is the
+// single coordination endpoint), so the injected client is intentionally unused here.
 type masterWorkerArchApi struct {
+	client       client.Client
 	name         string
 	namespace    string
 	runtimeClass *datav1alpha1.CacheRuntimeClass

@@ -294,7 +294,15 @@ func desiredComponentResources(runtimeResources corev1.ResourceRequirements, com
 func (e *CacheEngine) syncDatasetCacheStates(ctx cruntime.ReconcileRequestContext, runtime *datav1alpha1.CacheRuntime, runtimeClass *datav1alpha1.CacheRuntimeClass) (err error) {
 	cacheStates, err := e.GetCacheStates(runtime, runtimeClass)
 	if err != nil {
-		e.Log.Error(err, "Failed to get cache states, keeping previous cache states in dataset status")
+		if IsExecutionPodUnavailable(err) {
+			// Expected transient condition: no ready execution pod (zero replicas, rolling
+			// update, node failure). Keep the previous cache states untouched and retry on
+			// the next reconcile instead of surfacing an error state.
+			e.Log.Info("Execution pod is temporarily unavailable, keeping previous cache states in dataset status",
+				"name", e.name, "namespace", e.namespace, "reason", err.Error())
+		} else {
+			e.Log.Error(err, "Failed to get cache states, keeping previous cache states in dataset status")
+		}
 		// not blocking the sync flow when failed to get cache states
 		return nil
 	}
