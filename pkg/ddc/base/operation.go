@@ -119,7 +119,36 @@ func (e *EngineOperationReconciler) reconcilePending(ctx cruntime.ReconcileReque
 		return utils.NoRequeue()
 	}
 
-	// 2. set current data operation to dataset
+	// 2. for scheduled (cron) operations, gate every execution round on the schedule:
+	// the target dataset occupation is taken only when a scheduled time is due, and no
+	// workload pod is released before the occupation of the current round is acquired.
+	if scheduler, ok := operation.(dataoperation.ScheduledOperation); ok && scheduler.IsScheduled() {
+		roundOpen, requeueAfter, err := scheduler.ReconcileScheduledRound(
+			ctx,
+			opStatus,
+			func() error {
+				return SetDataOperationInTargetDataset(ctx, operation, e.Engine)
+			},
+			func() error {
+				return ReleaseTargetDataset(ctx, operation)
+			})
+		if err != nil {
+			log.Error(err, "failed to reconcile scheduled round, will retry")
+			return utils.RequeueAfterInterval(20 * time.Second)
+		}
+		if roundOpen {
+			// the status has been advanced to Executing by the scheduler, the status update
+			// will trigger another reconciliation, no need to requeue here
+			return utils.NoRequeue()
+		}
+		if requeueAfter <= 0 {
+			requeueAfter = 20 * time.Second
+		}
+		log.V(1).Info("no scheduled round due, requeue later", "requeueAfter", requeueAfter)
+		return utils.RequeueAfterInterval(requeueAfter)
+	}
+
+	// 3. set current data operation to dataset
 	err := SetDataOperationInTargetDataset(ctx, operation, e.Engine)
 	if err != nil {
 		return utils.RequeueAfterInterval(20 * time.Second)

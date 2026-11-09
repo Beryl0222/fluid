@@ -23,4 +23,22 @@ const (
 
 	BackupLocationPath     = "BackupLocationPath"
 	BackupLocationNodeName = "BackupLocationNodeName"
+	// BackupExecutionJob records the job name of a cron backup round for diagnosis
+	BackupExecutionJob = "BackupExecutionJob"
+	// BackupExecutionPod records the pod name of the current (or last) backup round for diagnosis
+	BackupExecutionPod = "BackupExecutionPod"
+
+	// ExecutionIDAnnotation is stamped onto the Job (and propagates to Pods) of each cron
+	// backup round to make the scheduled execution generation recognizable from Kubernetes objects.
+	ExecutionIDAnnotation = "databackup.fluid.io/execution-id"
+
+	// CronJobLabel is the label carried by the Job/Pod of a cron DataBackup, its value is the CronJob name.
+	// It shares the same key used by other cron data operations so jobs can be listed generically.
+	CronJobLabel = "cronjob"
+
+	// ReasonInvalidCronSchedule is the condition reason when the cron schedule is missing or invalid.
+	ReasonInvalidCronSchedule = "InvalidCronSchedule"
+	// ReasonBackupMissed is the condition reason recorded when a scheduled round is skipped
+	// because it is older than the missed schedule threshold.
+	ReasonBackupMissed = "BackupScheduleMissed"
 )

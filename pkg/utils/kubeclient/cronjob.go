@@ -48,3 +48,41 @@ func GetCronJobStatus(client client.Client, key types.NamespacedName) (*batchv1.
 		LastSuccessfulTime: cronjob.Status.LastSuccessfulTime,
 	}, nil
 }
+
+// SetCronJobSuspend updates the suspend flag of the CronJob only when it differs from the
+// expected value, so the call is idempotent across reconciliations. It supports both
+// batch/v1 and the deprecated batch/v1beta1 CronJob API.
+func SetCronJobSuspend(c client.Client, key types.NamespacedName, suspend bool) (changed bool, err error) {
+	return SetCronJobSuspendWithContext(context.TODO(), c, key, suspend)
+}
+
+// SetCronJobSuspendWithContext is the context aware variant of SetCronJobSuspend.
+func SetCronJobSuspendWithContext(ctx context.Context, c client.Client, key types.NamespacedName, suspend bool) (changed bool, err error) {
+	if compatibility.IsBatchV1CronJobSupported() {
+		var cronjob batchv1.CronJob
+		if err = c.Get(ctx, key, &cronjob); err != nil {
+			return false, err
+		}
+		if cronjob.Spec.Suspend != nil && *cronjob.Spec.Suspend == suspend {
+			return false, nil
+		}
+		cronjob.Spec.Suspend = &suspend
+		if err = c.Update(ctx, &cronjob); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	var cronjob batchv1beta1.CronJob
+	if err = c.Get(ctx, key, &cronjob); err != nil {
+		return false, err
+	}
+	if cronjob.Spec.Suspend != nil && *cronjob.Spec.Suspend == suspend {
+		return false, nil
+	}
+	cronjob.Spec.Suspend = &suspend
+	if err = c.Update(ctx, &cronjob); err != nil {
+		return false, err
+	}
+	return true, nil
+}

@@ -25,6 +25,7 @@ import (
 // DataBackupValue defines the value yaml file used in DataBackup helm chart
 type DataBackupValue struct {
 	DataBackup      DataBackup `yaml:"dataBackup"`
+	Owner           *common.OwnerReference `yaml:"owner,omitempty"`
 	common.UserInfo `yaml:",inline"`
 	InitUsers       common.InitUsers `yaml:"initUsers,omitempty"`
 }
@@ -42,6 +43,10 @@ type DataBackup struct {
 	PVCName        string `yaml:"pvcName,omitempty"`
 	Path           string `yaml:"path,omitempty"`
 	RuntimeType    string `yaml:"runtimeType,omitempty"`
+	// Policy is the execution policy, including Once and Cron. Defaults to Once.
+	Policy string `yaml:"policy,omitempty"`
+	// Schedule is the cron expression used only when Policy is Cron.
+	Schedule string `yaml:"schedule,omitempty"`
 	// image pull secrets
 	ImagePullSecrets []corev1.LocalObjectReference `yaml:"imagePullSecrets,omitempty"`
 	Affinity         *corev1.Affinity              `yaml:"affinity,omitempty"`

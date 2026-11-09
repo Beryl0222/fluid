@@ -2218,6 +2218,21 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_DataBackupSpec(ref common.Refer
 							Format:      "int32",
 						},
 					},
+					"policy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Policy defines the execution policy of the DataBackup, default is Once which runs the backup exactly one time. When set to Cron, the DataBackup runs repeatedly according to the Schedule and each scheduled time forms an independent backup execution round.",
+							Default:     "Once",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"schedule": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Schedule is the schedule in standard 5-field cron format (minute hour day-of-month month day-of-week). It is required and takes effect only when Policy is set to Cron, see https://en.wikipedia.org/wiki/Cron.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
 			},
 		},
@@ -5968,6 +5983,13 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_OperationStatus(ref common.Refe
 						SchemaProps: spec.SchemaProps{
 							Description: "LastSuccessfulTime is the last time the cron operation successfully completed",
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"currentExecutionId": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CurrentExecutionID is the identity of the currently tracked scheduled execution round. It is derived from the scheduled time of the round and is also stamped onto the workload of the round, so that an execution round can always be recognized and reconciled from Kubernetes objects after controller restarts. It is cleared once the round finishes (either complete or failed). Only used by cron-style operations.",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 					"waitingFor": {

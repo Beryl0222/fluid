@@ -22,6 +22,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	batchv1 "k8s.io/api/batch/v1"
+	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,6 +37,7 @@ import (
 	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
 	"github.com/fluid-cloudnative/fluid/pkg/utils"
+	"github.com/fluid-cloudnative/fluid/pkg/utils/compatibility"
 )
 
 const controllerName string = "DataBackupController"
@@ -108,10 +111,22 @@ func (r *DataBackupReconciler) Reconcile(context context.Context, req ctrl.Reque
 
 // SetupWithManager sets up the controller with the given controller manager
 func (r *DataBackupReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		WithOptions(options).
-		For(&datav1alpha1.DataBackup{}).
-		Complete(r)
+	if compatibility.IsBatchV1CronJobSupported() {
+		return ctrl.NewControllerManagedBy(mgr).
+			WithOptions(options).
+			For(&datav1alpha1.DataBackup{}).
+			Owns(&batchv1.Job{}).
+			Owns(&batchv1.CronJob{}).
+			Complete(r)
+	} else {
+		ctrl.Log.Info("batch/v1 cronjobs cannot be found in cluster, fallback to watch batch/v1beta1 cronjobs for compatibility")
+		return ctrl.NewControllerManagedBy(mgr).
+			WithOptions(options).
+			For(&datav1alpha1.DataBackup{}).
+			Owns(&batchv1.Job{}).
+			Owns(&batchv1beta1.CronJob{}).
+			Complete(r)
+	}
 }
 
 func (r *DataBackupReconciler) ControllerName() string {

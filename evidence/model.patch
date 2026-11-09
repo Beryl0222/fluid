@@ -1,0 +1,2441 @@
+diff --git a/api/v1alpha1/databackup_types.go b/api/v1alpha1/databackup_types.go
+index 01c6c4d..0e12f29 100644
+--- a/api/v1alpha1/databackup_types.go
++++ b/api/v1alpha1/databackup_types.go
+@@ -37,6 +37,18 @@ type DataBackupSpec struct {
+ 	// TTLSecondsAfterFinished is the time second to clean up data operations after finished or failed
+ 	// +optional
+ 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
++	// Policy defines the execution policy of the DataBackup, default is Once which
++	// runs the backup exactly one time. When set to Cron, the DataBackup runs
++	// repeatedly according to the Schedule and each scheduled time forms an
++	// independent backup execution round.
++	// +kubebuilder:default:=Once
++	// +kubebuilder:validation:Enum=Once;Cron
++	// +optional
++	Policy Policy `json:"policy,omitempty"`
++	// Schedule is the schedule in standard 5-field cron format (minute hour day-of-month month day-of-week).
++	// It is required and takes effect only when Policy is set to Cron, see https://en.wikipedia.org/wiki/Cron.
++	// +optional
++	Schedule string `json:"schedule,omitempty"`
+ }
+ 
+ // +kubebuilder:printcolumn:name="Dataset",type="string",JSONPath=`.spec.dataset`
+@@ -44,6 +56,7 @@ type DataBackupSpec struct {
+ // +kubebuilder:printcolumn:name="Path",type="string",JSONPath=`.status.infos.BackupLocationPath`
+ // +kubebuilder:printcolumn:name="NodeName",type="string",JSONPath=`.status.infos.BackupLocationNodeName`
+ // +kubebuilder:printcolumn:name="Duration",type="string",JSONPath=`.status.duration`
++// +kubebuilder:printcolumn:name="LastSchedule",type="date",JSONPath=`.status.lastScheduleTime`
+ // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=`.metadata.creationTimestamp`
+ // +kubebuilder:object:root=true
+ // +kubebuilder:subresource:status
+diff --git a/api/v1alpha1/openapi_generated.go b/api/v1alpha1/openapi_generated.go
+index ee62078..18f6881 100644
+--- a/api/v1alpha1/openapi_generated.go
++++ b/api/v1alpha1/openapi_generated.go
+@@ -2218,6 +2218,21 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_DataBackupSpec(ref common.Refer
+ 							Format:      "int32",
+ 						},
+ 					},
++					"policy": {
++						SchemaProps: spec.SchemaProps{
++							Description: "Policy defines the execution policy of the DataBackup, default is Once which runs the backup exactly one time. When set to Cron, the DataBackup runs repeatedly according to the Schedule and each scheduled time forms an independent backup execution round.",
++							Default:     "Once",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
++					"schedule": {
++						SchemaProps: spec.SchemaProps{
++							Description: "Schedule is the schedule in standard 5-field cron format (minute hour day-of-month month day-of-week). It is required and takes effect only when Policy is set to Cron, see https://en.wikipedia.org/wiki/Cron.",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
+ 				},
+ 			},
+ 		},
+@@ -5970,6 +5985,13 @@ func schema_fluid_cloudnative_fluid_api_v1alpha1_OperationStatus(ref common.Refe
+ 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+ 						},
+ 					},
++					"currentExecutionId": {
++						SchemaProps: spec.SchemaProps{
++							Description: "CurrentExecutionID is the identity of the currently tracked scheduled execution round. It is derived from the scheduled time of the round and is also stamped onto the workload of the round, so that an execution round can always be recognized and reconciled from Kubernetes objects after controller restarts. It is cleared once the round finishes (either complete or failed). Only used by cron-style operations.",
++							Type:        []string{"string"},
++							Format:      "",
++						},
++					},
+ 					"waitingFor": {
+ 						SchemaProps: spec.SchemaProps{
+ 							Description: "WaitingStatus stores information about waiting operation.",
+diff --git a/api/v1alpha1/status.go b/api/v1alpha1/status.go
+index 4f98bca..5794b65 100644
+--- a/api/v1alpha1/status.go
++++ b/api/v1alpha1/status.go
+@@ -150,6 +150,13 @@ type OperationStatus struct {
+ 	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
+ 	// LastSuccessfulTime is the last time the cron operation successfully completed
+ 	LastSuccessfulTime *metav1.Time `json:"lastSuccessfulTime,omitempty"`
++	// CurrentExecutionID is the identity of the currently tracked scheduled execution round.
++	// It is derived from the scheduled time of the round and is also stamped onto the
++	// workload of the round, so that an execution round can always be recognized and
++	// reconciled from Kubernetes objects after controller restarts. It is cleared once
++	// the round finishes (either complete or failed). Only used by cron-style operations.
++	// +optional
++	CurrentExecutionID string `json:"currentExecutionId,omitempty"`
+ 	// WaitingStatus stores information about waiting operation.
+ 	WaitingFor WaitingStatus `json:"waitingFor,omitempty"`
+ 
+diff --git a/api/v1alpha1/swagger.json b/api/v1alpha1/swagger.json
+index dc4460d..8d70125 100644
+--- a/api/v1alpha1/swagger.json
++++ b/api/v1alpha1/swagger.json
+@@ -1131,6 +1131,15 @@
+           "description": "TTLSecondsAfterFinished is the time second to clean up data operations after finished or failed",
+           "type": "integer",
+           "format": "int32"
++        },
++        "policy": {
++          "description": "Policy defines the execution policy of the DataBackup, default is Once which runs the backup exactly one time. When set to Cron, the DataBackup runs repeatedly according to the Schedule and each scheduled time forms an independent backup execution round.",
++          "type": "string",
++          "default": "Once"
++        },
++        "schedule": {
++          "description": "Schedule is the schedule in standard 5-field cron format (minute hour day-of-month month day-of-week). It is required and takes effect only when Policy is set to Cron, see https://en.wikipedia.org/wiki/Cron.",
++          "type": "string"
+         }
+       }
+     },
+@@ -3207,6 +3216,10 @@
+           "description": "LastSuccessfulTime is the last time the cron operation successfully completed",
+           "$ref": "#/definitions/v1.Time"
+         },
++        "currentExecutionId": {
++          "description": "CurrentExecutionID is the identity of the currently tracked scheduled execution round. It is derived from the scheduled time of the round and is also stamped onto the workload of the round, so that an execution round can always be recognized and reconciled from Kubernetes objects after controller restarts. It is cleared once the round finishes (either complete or failed). Only used by cron-style operations.",
++          "type": "string"
++        },
+         "nodeAffinity": {
+           "description": "NodeAffinity records the node affinity for operation pods",
+           "$ref": "#/definitions/v1.NodeAffinity"
+diff --git a/charts/fluid-databackup/alluxio/templates/_databackup_pod.tpl b/charts/fluid-databackup/alluxio/templates/_databackup_pod.tpl
+new file mode 100644
+index 0000000..470c435
+--- /dev/null
++++ b/charts/fluid-databackup/alluxio/templates/_databackup_pod.tpl
+@@ -0,0 +1,136 @@
++{{/*
++Shared pod spec for the DataBackup. It is rendered either as the spec of the standalone
++Pod used by the Once policy or as the spec of the pod template of the CronJob Job used by
++the Cron policy. Keep the body at column zero and include it with `nindent` so both
++workloads stay byte-for-byte equivalent.
++*/}}
++{{- define "fluid.databackup.podSpec" -}}
++{{- if .Values.dataBackup.nodeName }}
++nodeName: {{ .Values.dataBackup.nodeName }}
++{{- end }}
++{{- with .Values.dataBackup.imagePullSecrets }}
++imagePullSecrets:
++{{- toYaml . | nindent 2 }}
++{{- end }}
++{{ if .Values.initUsers.enabled -}}
++initContainers:
++  - name: init-users
++    image: {{ .Values.initUsers.image }}:{{ .Values.initUsers.imageTag }}
++    imagePullPolicy: {{ .Values.initUsers.imagePullPolicy }}
++    command: ["/entrypoint.sh"]
++    args:
++      - "init_users"
++    env:
++      {{- if .Values.initUsers.envUsers }}
++      - name: FLUID_INIT_USERS
++        value: {{.Values.initUsers.envUsers | quote }}
++      {{- end }}
++    volumeMounts:
++      - name: dir
++        mountPath: /tmp
++      - name: user
++        mountPath: /tmp/passwd
++      - name: group
++        mountPath: /tmp/group
++{{- end }}
++containers:
++  - name: tool
++    command: ["/bin/sh", "-c"]
++    args:
++      - "/scripts/databackup.sh"
++    image: {{ .Values.dataBackup.image }}
++    imagePullPolicy: IfNotPresent
++    securityContext:
++      runAsUser: {{ .Values.user }}
++      runAsGroup: {{ .Values.group }}
++    env:
++      {{- if .Values.dataBackup.javaEnv }}
++      - name: ALLUXIO_JAVA_OPTS
++        value: {{ .Values.dataBackup.javaEnv | quote }}
++      {{- end }}
++      {{- if .Values.dataBackup.namespace }}
++      - name: DATASET_NAMESPACE
++        value: {{ .Values.dataBackup.namespace | quote }}
++      {{- end }}
++      {{- if .Values.dataBackup.dataset }}
++      - name: DATASET_NAME
++        value: {{ .Values.dataBackup.dataset | quote }}
++      {{- end }}
++      {{- if .Values.dataBackup.pvcName }}
++      - name: BACKUP_PVC
++        value: {{ .Values.dataBackup.pvcName | quote }}
++      {{- end }}
++      {{- if .Values.dataBackup.path }}
++      - name: BACKUP_PATH
++        value: {{ .Values.dataBackup.path | quote }}
++      {{- end }}
++    volumeMounts:
++      {{- if .Values.dataBackup.workdir }}
++      - name: backup
++        mountPath: /alluxio_backups
++      {{- end }}
++      - mountPath: /scripts
++        name: script
++      {{- if .Values.dataBackup.pvcName }}
++      - mountPath: /pvc
++        name: pvc
++      {{- else }}
++      - mountPath: /host
++        name: host
++      {{- end }}
++      {{- if .Values.initUsers.enabled }}
++      - name: user
++        mountPath: /etc/passwd
++        readOnly: true
++      - name: group
++        mountPath: /etc/group
++        readOnly: true
++      {{- end}}
++{{- if .Values.dataBackup.affinity }}
++affinity:
++{{ toYaml .Values.dataBackup.affinity | indent 2 }}
++{{- end }}
++
++restartPolicy: Never
++volumes:
++  {{- if .Values.dataBackup.workdir }}
++  - name: backup
++    hostPath:
++      {{- if .Values.dataBackup.namespace }}
++      path: {{ .Values.dataBackup.workdir  }}/alluxio-backup/{{ .Values.dataBackup.namespace }}/{{  .Values.dataBackup.dataset }}
++      {{- else }}
++      path: {{ .Values.dataBackup.workdir  }}/alluxio-backup/default/{{ .Values.dataBackup.dataset }}
++      {{- end }}
++      type: DirectoryOrCreate
++  {{- end }}
++  {{- if .Values.dataBackup.pvcName }}
++  - name: pvc
++    persistentVolumeClaim:
++      claimName: {{ .Values.dataBackup.pvcName }}
++  {{- else }}
++  - name: host
++    hostPath:
++      path: {{ .Values.dataBackup.path }}
++  {{- end }}
++  - name: script
++    configMap:
++      name: {{ .Values.dataBackup.name }}-script
++      items:
++          - key: databackuper.alluxio
++            path: databackup.sh
++            mode: 365
++  {{- if .Values.initUsers.enabled }}
++  - name: dir
++    hostPath:
++      path: {{ .Values.initUsers.dir }}
++      type: DirectoryOrCreate
++  - name: user
++    hostPath:
++      path: {{ .Values.initUsers.dir }}/passwd
++      type: FileOrCreate
++  - name: group
++    hostPath:
++      path: {{ .Values.initUsers.dir }}/group
++      type: FileOrCreate
++  {{- end }}
++{{- end -}}
+diff --git a/charts/fluid-databackup/alluxio/templates/cronjob.yaml b/charts/fluid-databackup/alluxio/templates/cronjob.yaml
+new file mode 100644
+index 0000000..a3dd986
+--- /dev/null
++++ b/charts/fluid-databackup/alluxio/templates/cronjob.yaml
+@@ -0,0 +1,63 @@
++{{- if eq (lower .Values.dataBackup.policy) "cron" }}
++apiVersion: {{ ternary "batch/v1" "batch/v1beta1" (.Capabilities.APIVersions.Has "batch/v1/CronJob") }}
++kind: CronJob
++metadata:
++  name: {{ printf "%s-backup" .Release.Name }}
++  labels:
++    release: {{ .Release.Name }}
++    role: databackup-cronjob
++    app: alluxio
++    targetDataset: {{ .Values.dataBackup.dataset }}
++    databackup: {{ .Values.dataBackup.name }}
++    fluid.io/jobPolicy: cron
++    {{- include "library.fluid.labels" . | nindent 4 }}
++  ownerReferences:
++  {{- if .Values.owner.enabled }}
++    - apiVersion: {{ .Values.owner.apiVersion }}
++      blockOwnerDeletion: {{ .Values.owner.blockOwnerDeletion }}
++      controller: {{ .Values.owner.controller }}
++      kind: {{ .Values.owner.kind }}
++      name: {{ .Values.owner.name }}
++      uid: {{ .Values.owner.uid }}
++  {{- end }}
++spec:
++  # The CronJob is created suspended. The controller only unsuspends it for the current scheduled
++  # round after it has acquired the target Dataset occupation, and suspends it again as soon as the
++  # round Job has been observed, so that exactly one backup Pod is in flight per scheduled time.
++  schedule: {{ required "schedule should be set when policy is cron" .Values.dataBackup.schedule | quote }}
++  suspend: true
++  concurrencyPolicy: Forbid
++  startingDeadlineSeconds: 600
++  successfulJobsHistoryLimit: 3
++  failedJobsHistoryLimit: 3
++  jobTemplate:
++    metadata:
++      labels:
++        release: {{ .Release.Name }}
++        role: databackup-job
++        app: alluxio
++        cronjob: {{ printf "%s-backup" .Release.Name }}
++        targetDataset: {{ .Values.dataBackup.dataset }}
++        databackup: {{ .Values.dataBackup.name }}
++        fluid.io/jobPolicy: cron
++        {{- include "library.fluid.labels" . | nindent 8 }}
++    spec:
++      # do not retry a failed backup within the same round; the next scheduled time forms a new round
++      backoffLimit: 0
++      completions: 1
++      parallelism: 1
++      template:
++        metadata:
++          annotations:
++            sidecar.istio.io/inject: "false"
++          labels:
++            release: {{ .Release.Name }}
++            role: databackup-pod
++            app: alluxio
++            cronjob: {{ printf "%s-backup" .Release.Name }}
++            targetDataset: {{ .Values.dataBackup.dataset }}
++            databackup: {{ .Values.dataBackup.name }}
++            {{- include "library.fluid.labels" . | nindent 12 }}
++        spec:
++{{- include "fluid.databackup.podSpec" . | nindent 10 }}
++{{- end }}
+diff --git a/charts/fluid-databackup/alluxio/templates/databackup.yaml b/charts/fluid-databackup/alluxio/templates/databackup.yaml
+index 3a71221..a364746 100644
+--- a/charts/fluid-databackup/alluxio/templates/databackup.yaml
++++ b/charts/fluid-databackup/alluxio/templates/databackup.yaml
+@@ -1,3 +1,4 @@
++{{- if ne (lower .Values.dataBackup.policy) "cron" }}
+ apiVersion: v1
+ kind: Pod
+ metadata:
+@@ -8,131 +9,5 @@ metadata:
+   labels:
+     {{- include "library.fluid.labels" . | nindent 4 }}
+ spec:
+-  {{- if .Values.dataBackup.nodeName }}
+-  nodeName: {{ .Values.dataBackup.nodeName }}
+-  {{- end }}
+-  {{- with .Values.dataBackup.imagePullSecrets }}
+-  imagePullSecrets:
+-    {{- toYaml . | nindent 4 }}
+-  {{- end }}
+-  {{ if .Values.initUsers.enabled -}}
+-  initContainers:
+-    - name: init-users
+-      image: {{ .Values.initUsers.image }}:{{ .Values.initUsers.imageTag }}
+-      imagePullPolicy: {{ .Values.initUsers.imagePullPolicy }}
+-      command: ["/entrypoint.sh"]
+-      args:
+-        - "init_users"
+-      env:
+-        {{- if .Values.initUsers.envUsers }}
+-        - name: FLUID_INIT_USERS
+-          value: {{.Values.initUsers.envUsers | quote }}
+-        {{- end }}
+-      volumeMounts:
+-        - name: dir
+-          mountPath: /tmp
+-        - name: user
+-          mountPath: /tmp/passwd
+-        - name: group
+-          mountPath: /tmp/group
+-  {{- end }}
+-  containers:
+-    - name: tool
+-      command: ["/bin/sh", "-c"]
+-      args:
+-        - "/scripts/databackup.sh"
+-      image: {{ .Values.dataBackup.image }}
+-      imagePullPolicy: IfNotPresent
+-      securityContext:
+-        runAsUser: {{ .Values.user }}
+-        runAsGroup: {{ .Values.group }}
+-      env:
+-        {{- if .Values.dataBackup.javaEnv }}
+-        - name: ALLUXIO_JAVA_OPTS
+-          value: {{ .Values.dataBackup.javaEnv | quote }}
+-        {{- end }}
+-        {{- if .Values.dataBackup.namespace }}
+-        - name: DATASET_NAMESPACE
+-          value: {{ .Values.dataBackup.namespace | quote }}
+-        {{- end }}
+-        {{- if .Values.dataBackup.dataset }}
+-        - name: DATASET_NAME
+-          value: {{ .Values.dataBackup.dataset | quote }}
+-        {{- end }}
+-        {{- if .Values.dataBackup.pvcName }}
+-        - name: BACKUP_PVC
+-          value: {{ .Values.dataBackup.pvcName | quote }}
+-        {{- end }}
+-        {{- if .Values.dataBackup.path }}
+-        - name: BACKUP_PATH
+-          value: {{ .Values.dataBackup.path | quote }}
+-        {{- end }}
+-      volumeMounts:
+-        {{- if .Values.dataBackup.workdir }}
+-        - name: backup
+-          mountPath: /alluxio_backups
+-        {{- end }}
+-        - mountPath: /scripts
+-          name: script
+-        {{- if .Values.dataBackup.pvcName }}
+-        - mountPath: /pvc
+-          name: pvc
+-        {{- else }}
+-        - mountPath: /host
+-          name: host
+-        {{- end }}
+-        {{- if .Values.initUsers.enabled }}
+-        - name: user
+-          mountPath: /etc/passwd
+-          readOnly: true
+-        - name: group
+-          mountPath: /etc/group
+-          readOnly: true
+-        {{- end}}
+-  {{- if .Values.dataBackup.affinity }}
+-  affinity:
+-{{ toYaml .Values.dataBackup.affinity | indent 4 }}
+-  {{- end }}
+-
+-  restartPolicy: Never
+-  volumes:
+-    {{- if .Values.dataBackup.workdir }}
+-    - name: backup
+-      hostPath:
+-        {{- if .Values.dataBackup.namespace }}
+-        path: {{ .Values.dataBackup.workdir  }}/alluxio-backup/{{ .Values.dataBackup.namespace }}/{{  .Values.dataBackup.dataset }}
+-        {{- else }}
+-        path: {{ .Values.dataBackup.workdir  }}/alluxio-backup/default/{{ .Values.dataBackup.dataset }}
+-        {{- end }}
+-        type: DirectoryOrCreate
+-    {{- end }}
+-    {{- if .Values.dataBackup.pvcName }}
+-    - name: pvc
+-      persistentVolumeClaim:
+-        claimName: {{ .Values.dataBackup.pvcName }}
+-    {{- else }}
+-    - name: host
+-      hostPath:
+-        path: {{ .Values.dataBackup.path }}
+-    {{- end }}
+-    - name: script
+-      configMap:
+-        name: {{ .Values.dataBackup.name }}-script
+-        items:
+-            - key: databackuper.alluxio
+-              path: databackup.sh
+-              mode: 365
+-    {{- if .Values.initUsers.enabled }}
+-    - name: dir
+-      hostPath:
+-        path: {{ .Values.initUsers.dir }}
+-        type: DirectoryOrCreate
+-    - name: user
+-      hostPath:
+-        path: {{ .Values.initUsers.dir }}/passwd
+-        type: FileOrCreate
+-    - name: group
+-      hostPath:
+-        path: {{ .Values.initUsers.dir }}/group
+-        type: FileOrCreate
+-    {{- end }}
+\ No newline at end of file
++{{- include "fluid.databackup.podSpec" . | nindent 2 }}
++{{- end }}
+diff --git a/charts/fluid-databackup/alluxio/values.yaml b/charts/fluid-databackup/alluxio/values.yaml
+index fb6a0b4..81ed1d3 100644
+--- a/charts/fluid-databackup/alluxio/values.yaml
++++ b/charts/fluid-databackup/alluxio/values.yaml
+@@ -45,6 +45,13 @@ dataBackup:
+   # Description: optional image pull secrets on DataLoad pods
+   imagePullSecrets: []
+ 
++  # Optional
++  # Description: execution policy of the DataBackup, either Once (default, run one time)
++  # or Cron (run repeatedly according to schedule). Only standard 5-field cron format is
++  # supported: minute hour day-of-month month day-of-week.
++  policy: Once
++  # schedule: "0 2 * * *"
++
+   affinity:
+ 
+ initUsers:
+diff --git a/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml b/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml
+index b9a8f98..8c66713 100644
+--- a/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml
++++ b/charts/fluid/fluid/crds/data.fluid.io_databackups.yaml
+@@ -34,6 +34,9 @@ spec:
+     - jsonPath: .status.duration
+       name: Duration
+       type: string
++    - jsonPath: .status.lastScheduleTime
++      name: LastSchedule
++      type: date
+     - jsonPath: .metadata.creationTimestamp
+       name: Age
+       type: date
+@@ -53,6 +56,12 @@ spec:
+                 type: string
+               dataset:
+                 type: string
++              policy:
++                default: Once
++                enum:
++                - Once
++                - Cron
++                type: string
+               runAfter:
+                 properties:
+                   affinityStrategy:
+@@ -136,6 +145,8 @@ spec:
+                 - uid
+                 - user
+                 type: object
++              schedule:
++                type: string
+               ttlSecondsAfterFinished:
+                 format: int32
+                 type: integer
+@@ -164,6 +175,8 @@ spec:
+                   - type
+                   type: object
+                 type: array
++              currentExecutionId:
++                type: string
+               duration:
+                 type: string
+               infos:
+diff --git a/config/crd/bases/data.fluid.io_databackups.yaml b/config/crd/bases/data.fluid.io_databackups.yaml
+index b9a8f98..8c66713 100644
+--- a/config/crd/bases/data.fluid.io_databackups.yaml
++++ b/config/crd/bases/data.fluid.io_databackups.yaml
+@@ -34,6 +34,9 @@ spec:
+     - jsonPath: .status.duration
+       name: Duration
+       type: string
++    - jsonPath: .status.lastScheduleTime
++      name: LastSchedule
++      type: date
+     - jsonPath: .metadata.creationTimestamp
+       name: Age
+       type: date
+@@ -53,6 +56,12 @@ spec:
+                 type: string
+               dataset:
+                 type: string
++              policy:
++                default: Once
++                enum:
++                - Once
++                - Cron
++                type: string
+               runAfter:
+                 properties:
+                   affinityStrategy:
+@@ -136,6 +145,8 @@ spec:
+                 - uid
+                 - user
+                 type: object
++              schedule:
++                type: string
+               ttlSecondsAfterFinished:
+                 format: int32
+                 type: integer
+@@ -164,6 +175,8 @@ spec:
+                   - type
+                   type: object
+                 type: array
++              currentExecutionId:
++                type: string
+               duration:
+                 type: string
+               infos:
+diff --git a/pkg/controllers/v1alpha1/databackup/cron_handler_test.go b/pkg/controllers/v1alpha1/databackup/cron_handler_test.go
+new file mode 100644
+index 0000000..e3ac8f6
+--- /dev/null
++++ b/pkg/controllers/v1alpha1/databackup/cron_handler_test.go
+@@ -0,0 +1,297 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package databackup
++
++import (
++	"context"
++	"time"
++
++	"github.com/agiledragon/gomonkey/v2"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/compatibility"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++)
++
++const (
++	testBackupName  = "test"
++	testDatasetName = "test-dataset"
++	testCronJobName = "test-charts-backup"
++	testExecutionID = "20261109T100000"
++)
++
++func cronTestScheme() *runtime.Scheme {
++	s := runtime.NewScheme()
++	_ = v1alpha1.AddToScheme(s)
++	_ = corev1.AddToScheme(s)
++	_ = batchv1.AddToScheme(s)
++	return s
++}
++
++func cronDataBackup() *v1alpha1.DataBackup {
++	return &v1alpha1.DataBackup{
++		ObjectMeta: v1.ObjectMeta{
++			Name:      testBackupName,
++			Namespace: "default",
++		},
++		Spec: v1alpha1.DataBackupSpec{
++			Dataset:    testDatasetName,
++			BackupPath: "local:///tmp/backup",
++			Policy:     v1alpha1.Cron,
++			Schedule:   "* * * * *",
++		},
++		Status: v1alpha1.OperationStatus{
++			Phase:             common.PhaseExecuting,
++			CurrentExecutionID: testExecutionID,
++			LastScheduleTime:   ptrTime(2026, 11, 9, 10, 0),
++		},
++	}
++}
++
++func ptrTime(year int, month time.Month, day, hour, minute int) *v1.Time {
++	t := v1.NewTime(time.Date(year, month, day, hour, minute, 0, 0, time.UTC))
++	return &t
++}
++
++func lockedDataset() *v1alpha1.Dataset {
++	return &v1alpha1.Dataset{
++		ObjectMeta: v1.ObjectMeta{
++			Name:      testDatasetName,
++			Namespace: "default",
++		},
++		Status: v1alpha1.DatasetStatus{
++			OperationRef: map[string]string{
++				"DataBackup": testBackupName,
++			},
++		},
++	}
++}
++
++func suspendedCronJob(suspended bool) *batchv1.CronJob {
++	return &batchv1.CronJob{
++		ObjectMeta: v1.ObjectMeta{
++			Name:      testCronJobName,
++			Namespace: "default",
++		},
++		Spec: batchv1.CronJobSpec{
++			Schedule:          "* * * * *",
++			Suspend:           &suspended,
++			ConcurrencyPolicy: batchv1.ForbidConcurrent,
++		},
++	}
++}
++
++func roundJob(finished bool, succeed bool, finishTime *v1.Time) *batchv1.Job {
++	job := &batchv1.Job{
++		ObjectMeta: v1.ObjectMeta{
++			Name:      testCronJobName + "-abcde",
++			Namespace: "default",
++			Labels: map[string]string{
++				cdatabackup.CronJobLabel: testCronJobName,
++			},
++			CreationTimestamp: *ptrTime(2026, 11, 9, 10, 0),
++		},
++		Spec: batchv1.JobSpec{
++			Selector: &v1.LabelSelector{
++				MatchLabels: map[string]string{"job-name": testCronJobName + "-abcde"},
++			},
++		},
++	}
++	if finished {
++		condType := batchv1.JobFailed
++		if succeed {
++			condType = batchv1.JobComplete
++		}
++		job.Status.Conditions = []batchv1.JobCondition{
++			{
++				Type:               condType,
++				Status:             corev1.ConditionTrue,
++				LastTransitionTime: *finishTime,
++			},
++		}
++	}
++	return job
++}
++
++func roundPod(phase corev1.PodPhase) *corev1.Pod {
++	return &corev1.Pod{
++		ObjectMeta: v1.ObjectMeta{
++			Name:      testCronJobName + "-abcde-pod",
++			Namespace: "default",
++			Labels:    map[string]string{"job-name": testCronJobName + "-abcde"},
++		},
++		Spec:   corev1.PodSpec{NodeName: "node-1"},
++		Status: corev1.PodStatus{Phase: phase},
++	}
++}
++
++var _ = Describe("CronHandler", func() {
++	var patch *gomonkey.Patches
++
++	BeforeEach(func() {
++		patch = gomonkey.ApplyFunc(compatibility.IsBatchV1CronJobSupported, func() bool {
++			return true
++		})
++	})
++
++	AfterEach(func() {
++		if patch != nil {
++			patch.Reset()
++		}
++	})
++
++	newHandler := func(objects ...runtime.Object) (*CronHandler, *v1alpha1.DataBackup) {
++		db := cronDataBackup()
++		objs := append([]runtime.Object{db}, objects...)
++		c := fake.NewFakeClientWithScheme(cronTestScheme(), objs...)
++		return &CronHandler{
++			Client:     c,
++			Log:        fake.NullLogger(),
++			Recorder:   record.NewFakeRecorder(20),
++			dataBackup: db,
++		}, db
++	}
++
++	ctx := func() cruntime.ReconcileRequestContext {
++		return cruntime.ReconcileRequestContext{Log: fake.NullLogger()}
++	}
++
++	It("unsuspends the CronJob to release one job when the dataset occupation is held but no job exists yet", func() {
++		cj := suspendedCronJob(true)
++		handler, db := newHandler(lockedDataset(), cj)
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhaseExecuting))
++
++		updated := &batchv1.CronJob{}
++		Expect(handler.Client.Get(context.TODO(), types.NamespacedName{Namespace: "default", Name: testCronJobName}, updated)).To(Succeed())
++		Expect(updated.Spec.Suspend).NotTo(BeNil())
++		Expect(*updated.Spec.Suspend).To(BeFalse())
++	})
++
++	It("returns to Pending when the job is missing and the dataset occupation is not held", func() {
++		cj := suspendedCronJob(true)
++		handler, db := newHandler(cj)
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhasePending))
++		// execution identity is kept so the same scheduled time is never started twice
++		Expect(result.CurrentExecutionID).To(Equal(testExecutionID))
++	})
++
++	It("suspends the CronJob and keeps Executing while the round job is running", func() {
++		cj := suspendedCronJob(false)
++		job := roundJob(false, false, nil)
++		pod := roundPod(corev1.PodRunning)
++		handler, db := newHandler(lockedDataset(), cj, job, pod)
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhaseExecuting))
++		Expect(result.Infos[cdatabackup.BackupExecutionJob]).To(Equal(job.Name))
++		Expect(result.Infos[cdatabackup.BackupExecutionPod]).To(Equal(pod.Name))
++
++		updated := &batchv1.CronJob{}
++		Expect(handler.Client.Get(context.TODO(), types.NamespacedName{Namespace: "default", Name: testCronJobName}, updated)).To(Succeed())
++		Expect(*updated.Spec.Suspend).To(BeTrue())
++
++		// the round identity is stamped onto the job for recognition from Kubernetes objects
++		updatedJob := &batchv1.Job{}
++		Expect(handler.Client.Get(context.TODO(), types.NamespacedName{Namespace: "default", Name: job.Name}, updatedJob)).To(Succeed())
++		Expect(updatedJob.Annotations[cdatabackup.ExecutionIDAnnotation]).To(Equal(testExecutionID))
++	})
++
++	It("records Complete with the successful time and diagnosable information when the round job succeeds", func() {
++		finish := ptrTime(2026, 11, 9, 10, 2)
++		cj := suspendedCronJob(false)
++		job := roundJob(true, true, finish)
++		pod := roundPod(corev1.PodSucceeded)
++		handler, db := newHandler(lockedDataset(), cj, job, pod)
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhaseComplete))
++		Expect(result.LastSuccessfulTime).To(Equal(db.Status.LastScheduleTime))
++		Expect(result.Conditions).To(HaveLen(1))
++		Expect(result.Conditions[0].Reason).To(Equal("BackupSuccessful"))
++		Expect(result.Conditions[0].Message).To(ContainSubstring(testExecutionID))
++		Expect(result.Infos[cdatabackup.BackupExecutionPod]).To(Equal(pod.Name))
++	})
++
++	It("records Failed with a diagnosable message when the round job fails", func() {
++		finish := ptrTime(2026, 11, 9, 10, 2)
++		cj := suspendedCronJob(false)
++		job := roundJob(true, false, finish)
++		pod := roundPod(corev1.PodFailed)
++		handler, db := newHandler(lockedDataset(), cj, job, pod)
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhaseFailed))
++		Expect(result.Conditions).To(HaveLen(1))
++		Expect(result.Conditions[0].Reason).To(Equal("BackupFailed"))
++		Expect(result.Conditions[0].Message).To(ContainSubstring(pod.Name))
++	})
++
++	It("closes the round to Pending on re-observation of the terminal job and keeps the failure condition", func() {
++		finish := ptrTime(2026, 11, 9, 10, 2)
++		cj := suspendedCronJob(false)
++		job := roundJob(true, false, finish)
++		pod := roundPod(corev1.PodFailed)
++		handler, db := newHandler(lockedDataset(), cj, job, pod)
++		db.Status.Phase = common.PhaseFailed
++		db.Status.Conditions = []v1alpha1.Condition{
++			{Type: common.Failed, Status: corev1.ConditionTrue, Reason: "BackupFailed"},
++		}
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhasePending))
++		Expect(result.CurrentExecutionID).To(BeEmpty())
++		Expect(result.Duration).To(Equal("-"))
++		// terminal condition is retained for diagnosis while waiting for the next round
++		Expect(result.Conditions).To(HaveLen(1))
++		Expect(result.Conditions[0].Reason).To(Equal("BackupFailed"))
++	})
++
++	It("keeps a Failed status untouched when the failure is caused by an invalid schedule", func() {
++		cj := suspendedCronJob(false)
++		handler, db := newHandler(lockedDataset(), cj)
++		db.Status.Phase = common.PhaseFailed
++		db.Status.CurrentExecutionID = ""
++		db.Status.Conditions = []v1alpha1.Condition{
++			{Type: common.Failed, Status: corev1.ConditionTrue, Reason: cdatabackup.ReasonInvalidCronSchedule},
++		}
++
++		result, err := handler.GetOperationStatus(ctx(), &db.Status)
++		Expect(err).NotTo(HaveOccurred())
++		Expect(result.Phase).To(Equal(common.PhaseFailed))
++	})
++})
+diff --git a/pkg/controllers/v1alpha1/databackup/cron_schedule.go b/pkg/controllers/v1alpha1/databackup/cron_schedule.go
+new file mode 100644
+index 0000000..78b41e8
+--- /dev/null
++++ b/pkg/controllers/v1alpha1/databackup/cron_schedule.go
+@@ -0,0 +1,186 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package databackup
++
++import (
++	"time"
++
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	datav1alpha1 "github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
++	cronparse "github.com/fluid-cloudnative/fluid/pkg/utils/cron"
++)
++
++const (
++	// missedScheduleThreshold bounds how late a scheduled time is still made up.
++	// If the controller was absent longer than this, the missed round is skipped instead
++	// of running a stale backup, while newer rounds keep being scheduled normally.
++	missedScheduleThreshold = 10 * time.Minute
++	// maxScheduledRequeueInterval caps the wait when the next schedule is far away so that
++	// clock drift and late spec changes are still picked up in bounded time.
++	maxScheduledRequeueInterval = 10 * time.Minute
++	// executionIDTimeFormat derives the recognizable identity of an execution round from
++	// its scheduled time (UTC). The token only contains digits and the letter T, so it is
++	// safe to use as a label or annotation value.
++	executionIDTimeFormat = "20060102T150405"
++)
++
++// executionID returns the identity of the backup round scheduled at the given time.
++func executionID(scheduledTime time.Time) string {
++	return scheduledTime.UTC().Format(executionIDTimeFormat)
++}
++
++// ReconcileScheduledRound implements dataoperation.ScheduledOperation. It is the only place that
++// decides which scheduled round the DataBackup currently belongs to. All decisions are derived
++// from the DataBackup status (LastScheduleTime, CurrentExecutionID) and the parsed schedule, so
++// controller restarts converge without ever starting the same scheduled time twice.
++func (r *dataBackupOperation) ReconcileScheduledRound(
++	ctx cruntime.ReconcileRequestContext,
++	opStatus *datav1alpha1.OperationStatus,
++	acquireOccupation func() error,
++	releaseOccupation func() error,
++) (roundOpen bool, requeueAfter time.Duration, err error) {
++	log := ctx.Log.WithName("ReconcileScheduledRound")
++	dataBackup := r.dataBackup
++	now := time.Now()
++
++	// 1. A round already recorded as open must be driven to completion before any new round is
++	// considered. Re-enter Executing (idempotent) after making sure the dataset occupation is held.
++	// This covers controller restarts at any in-flight moment (CronJob present but Pod not yet
++	// observed, Pod running, Pod terminated before status was written, ...).
++	if len(opStatus.CurrentExecutionID) != 0 {
++		if err = acquireOccupation(); err != nil {
++			log.Error(err, "failed to acquire dataset occupation for the open backup round",
++				"executionID", opStatus.CurrentExecutionID)
++			return false, 0, err
++		}
++		if opStatus.Phase != common.PhaseExecuting {
++			opStatus.Phase = common.PhaseExecuting
++			if err = r.UpdateOperationApiStatus(opStatus); err != nil {
++				return false, 0, err
++			}
++		}
++		return true, 0, nil
++	}
++
++	// 2. No open round: release any stale occupation. The operation is idempotent and tolerates a
++	// dataset that has already been deleted, so no OperationRef is left behind after a restart.
++	if err = releaseOccupation(); err != nil {
++		log.Error(err, "failed to release stale dataset occupation")
++		return false, 0, err
++	}
++
++	// 3. parse the schedule. The schedule was already validated in the None phase before any
++	// workload existed; this additionally reports an expression edited into an invalid value
++	// without ever creating or releasing a workload.
++	schedule, parseErr := cronparse.Parse(dataBackup.Spec.Schedule)
++	if parseErr != nil {
++		log.Error(parseErr, "invalid cron schedule, no backup round will be started")
++		r.Recorder.Eventf(dataBackup, v1.EventTypeWarning, cdatabackup.ReasonInvalidCronSchedule,
++			"Invalid cron schedule %q: %v", dataBackup.Spec.Schedule, parseErr)
++		// record the diagnosable condition once; keep the phase Pending and do not touch any workload
++		if len(opStatus.Conditions) != 1 || opStatus.Conditions[0].Reason != cdatabackup.ReasonInvalidCronSchedule {
++			opStatus.Conditions = []datav1alpha1.Condition{
++				{
++					Type:               common.Failed,
++					Status:             v1.ConditionTrue,
++					Reason:             cdatabackup.ReasonInvalidCronSchedule,
++					Message:            parseErr.Error(),
++					LastProbeTime:      metav1.NewTime(now),
++					LastTransitionTime: metav1.NewTime(now),
++				},
++			}
++			_ = r.UpdateOperationApiStatus(opStatus)
++		}
++		return false, 20 * time.Second, parseErr
++	}
++
++	// 4. determine the scheduled time window. Scheduled times are exclusive after the lower bound,
++	// which is either the object creation time (first round) or the last scheduled time, so the
++	// same scheduled time can never be started for a second time.
++	after := dataBackup.CreationTimestamp.Time
++	if opStatus.LastScheduleTime != nil {
++		after = opStatus.LastScheduleTime.Time
++	}
++	windowStart := now.Add(-missedScheduleThreshold)
++	if windowStart.Before(after) {
++		windowStart = after
++	}
++
++	// enumerate scheduled times inside (windowStart, now]; the window is short and the minimum
++	// cron granularity is one minute, so this loop stays small.
++	var due time.Time
++	cursor := windowStart
++	for {
++		var next time.Time
++		next, err = schedule.Next(cursor)
++		if err != nil {
++			log.Error(err, "failed to compute next scheduled time")
++			return false, 0, err
++		}
++		if next.After(now) {
++			break
++		}
++		due = next
++		cursor = next
++	}
++
++	// 5. no scheduled time due: wait until the next schedule without holding the dataset occupation.
++	if due.IsZero() {
++		var next time.Time
++		next, err = schedule.Next(now)
++		if err != nil {
++			return false, 0, err
++		}
++		requeueAfter = next.Sub(now)
++		if requeueAfter > maxScheduledRequeueInterval {
++			requeueAfter = maxScheduledRequeueInterval
++		}
++		if requeueAfter < time.Second {
++			requeueAfter = time.Second
++		}
++		log.V(1).Info("no backup schedule due, wait for the next round", "nextSchedule", next, "requeueAfter", requeueAfter)
++		return false, requeueAfter, nil
++	}
++
++	// 6. a scheduled time is due: take the target dataset occupation first and only then record the
++	// open round with its recognizable identity. The workload is released later in the Executing phase.
++	if err = acquireOccupation(); err != nil {
++		log.Error(err, "failed to acquire dataset occupation for the scheduled backup round", "scheduledTime", due)
++		return false, 0, err
++	}
++
++	id := executionID(due)
++	scheduledAt := metav1.NewTime(due)
++	opStatus.Phase = common.PhaseExecuting
++	opStatus.Duration = "Unfinished"
++	opStatus.Conditions = []datav1alpha1.Condition{}
++	opStatus.LastScheduleTime = &scheduledAt
++	opStatus.CurrentExecutionID = id
++
++	if err = r.UpdateOperationApiStatus(opStatus); err != nil {
++		return false, 0, err
++	}
++	r.Recorder.Eventf(dataBackup, v1.EventTypeNormal, "BackupRoundScheduled",
++		"Scheduled backup round %s (scheduled at %s) acquired dataset occupation", id, due.Format(time.RFC3339))
++	log.Info("scheduled backup round opened", "executionID", id, "scheduledTime", due)
++	return true, 0, nil
++}
+diff --git a/pkg/controllers/v1alpha1/databackup/cron_schedule_test.go b/pkg/controllers/v1alpha1/databackup/cron_schedule_test.go
+new file mode 100644
+index 0000000..29cabdc
+--- /dev/null
++++ b/pkg/controllers/v1alpha1/databackup/cron_schedule_test.go
+@@ -0,0 +1,193 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package databackup
++
++import (
++	"time"
++
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++
++	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
++	"github.com/fluid-cloudnative/fluid/pkg/common"
++	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
++	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/fake"
++	corev1 "k8s.io/api/core/v1"
++	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/tools/record"
++	ctrl "sigs.k8s.io/controller-runtime"
++)
++
++func gateScheme() *runtime.Scheme {
++	s := runtime.NewScheme()
++	_ = v1alpha1.AddToScheme(s)
++	_ = corev1.AddToScheme(s)
++	return s
++}
++
++func gateOperation(db *v1alpha1.DataBackup) *dataBackupOperation {
++	return &dataBackupOperation{
++		Client:     fake.NewFakeClientWithScheme(gateScheme(), db),
++		Log:        ctrl.Log.WithName("test"),
++		Recorder:   record.NewFakeRecorder(20),
++		dataBackup: db,
++	}
++}
++
++var _ = Describe("ReconcileScheduledRound", func() {
++	ctx := cruntime.ReconcileRequestContext{Log: fake.NullLogger()}
++
++	It("re-enters Executing for an already open round without advancing the scheduled time", func() {
++		db := cronDataBackup()
++		db.Status.Phase = common.PhasePending
++		last := db.Status.LastScheduleTime
++		op := gateOperation(db)
++
++		acquired, released := 0, 0
++		open, _, err := op.ReconcileScheduledRound(ctx, &db.Status, func() error {
++			acquired++
++			return nil
++		}, func() error {
++			released++
++			return nil
++		})
++		Expect(err).NotTo(HaveOccurred())
++		Expect(open).To(BeTrue())
++		Expect(acquired).To(Equal(1))
++		Expect(released).To(Equal(0))
++		Expect(db.Status.Phase).To(Equal(common.PhaseExecuting))
++		Expect(db.Status.LastScheduleTime).To(Equal(last))
++		Expect(db.Status.CurrentExecutionID).To(Equal(testExecutionID))
++	})
++
++	It("starts exactly one new round when a scheduled time is due, recording the time and identity", func() {
++		db := cronDataBackup()
++		db.ObjectMeta.CreationTimestamp = v1.NewTime(time.Now().Add(-5 * time.Minute))
++		db.Status = v1alpha1.OperationStatus{Phase: common.PhasePending}
++
++		op := gateOperation(db)
++		acquired := 0
++		open, _, err := op.ReconcileScheduledRound(ctx, &db.Status, func() error {
++			acquired++
++			return nil
++		}, func() error { return nil })
++		Expect(err).NotTo(HaveOccurred())
++		Expect(open).To(BeTrue())
++		Expect(acquired).To(Equal(1))
++		Expect(db.Status.Phase).To(Equal(common.PhaseExecuting))
++		Expect(db.Status.LastScheduleTime).NotTo(BeNil())
++		Expect(db.Status.CurrentExecutionID).NotTo(BeEmpty())
++
++		// the same scheduled time must never be started again
++		Expect(db.Status.CurrentExecutionID).To(Equal(executionID(db.Status.LastScheduleTime.Time)))
++	})
++
++	It("waits for the next schedule without acquiring the occupation when no scheduled time is due", func() {
++		db := cronDataBackup()
++		db.Spec.Schedule = "0 0 1 1 *"
++		last := v1.NewTime(time.Now().Add(-15 * time.Second))
++		db.Status = v1alpha1.OperationStatus{
++			Phase:           common.PhasePending,
++			LastScheduleTime: &last,
++		}
++
++		op := gateOperation(db)
++		acquired, released := 0, 0
++		open, requeueAfter, err := op.ReconcileScheduledRound(ctx, &db.Status, func() error {
++			acquired++
++			return nil
++		}, func() error {
++			released++
++			return nil
++		})
++		Expect(err).NotTo(HaveOccurred())
++		Expect(open).To(BeFalse())
++		Expect(acquired).To(Equal(0))
++		Expect(released).To(Equal(1))
++		Expect(requeueAfter).To(BeNumerically(">", 0))
++		Expect(requeueAfter).To(BeNumerically("<=", maxScheduledRequeueInterval))
++		Expect(db.Status.Phase).To(Equal(common.PhasePending))
++	})
++
++	It("reports a clear error without opening a round when the schedule is invalid", func() {
++		db := cronDataBackup()
++		db.Spec.Schedule = "not-a-cron"
++		db.Status = v1alpha1.OperationStatus{Phase: common.PhasePending}
++
++		op := gateOperation(db)
++		acquired := 0
++		open, _, err := op.ReconcileScheduledRound(ctx, &db.Status, func() error {
++			acquired++
++			return nil
++		}, func() error { return nil })
++		Expect(err).To(HaveOccurred())
++		Expect(open).To(BeFalse())
++		Expect(acquired).To(Equal(0))
++		Expect(db.Status.Conditions).To(HaveLen(1))
++		Expect(db.Status.Conditions[0].Reason).To(Equal(cdatabackup.ReasonInvalidCronSchedule))
++	})
++})
++
++var _ = Describe("cron policy selection", func() {
++	It("validates the cron schedule in Validate", func() {
++		db := cronDataBackup()
++		db.Spec.Schedule = ""
++		op := gateOperation(db)
++		conditions, err := op.Validate(cruntime.ReconcileRequestContext{Log: fake.NullLogger()})
++		Expect(err).To(HaveOccurred())
++		Expect(conditions).To(HaveLen(1))
++		Expect(conditions[0].Reason).To(Equal(cdatabackup.ReasonInvalidCronSchedule))
++
++		db.Spec.Schedule = "invalid"
++		conditions, err = op.Validate(cruntime.ReconcileRequestContext{Log: fake.NullLogger()})
++		Expect(err).To(HaveOccurred())
++		Expect(conditions[0].Reason).To(Equal(cdatabackup.ReasonInvalidCronSchedule))
++
++		db.Spec.Schedule = "0 2 * * *"
++		conditions, err = op.Validate(cruntime.ReconcileRequestContext{Log: fake.NullLogger()})
++		Expect(err).NotTo(HaveOccurred())
++		Expect(conditions).To(BeNil())
++	})
++
++	It("selects the cron handler and no TTL for Cron policy", func() {
++		db := cronDataBackup()
++		op := gateOperation(db)
++		Expect(op.IsScheduled()).To(BeTrue())
++		_, ok := op.GetStatusHandler().(*CronHandler)
++		Expect(ok).To(BeTrue())
++		ttl, err := op.GetTTL()
++		Expect(err).NotTo(HaveOccurred())
++		Expect(ttl).To(BeNil())
++	})
++
++	It("keeps the Once handler and TTL behavior for default Once policy", func() {
++		db := cronDataBackup()
++		db.Spec.Policy = v1alpha1.Once
++		ttlVal := int32(300)
++		db.Spec.TTLSecondsAfterFinished = &ttlVal
++		op := gateOperation(db)
++		Expect(op.IsScheduled()).To(BeFalse())
++		_, ok := op.GetStatusHandler().(*OnceHandler)
++		Expect(ok).To(BeTrue())
++		ttl, err := op.GetTTL()
++		Expect(err).NotTo(HaveOccurred())
++		Expect(ttl).NotTo(BeNil())
++		Expect(*ttl).To(Equal(int32(300)))
++	})
++})
+diff --git a/pkg/controllers/v1alpha1/databackup/databackup_controller.go b/pkg/controllers/v1alpha1/databackup/databackup_controller.go
+index 00ea9cd..81d8e2d 100644
+--- a/pkg/controllers/v1alpha1/databackup/databackup_controller.go
++++ b/pkg/controllers/v1alpha1/databackup/databackup_controller.go
+@@ -22,6 +22,8 @@ import (
+ 
+ 	"github.com/go-logr/logr"
+ 	"github.com/pkg/errors"
++	batchv1 "k8s.io/api/batch/v1"
++	batchv1beta1 "k8s.io/api/batch/v1beta1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/client-go/tools/record"
+ 	ctrl "sigs.k8s.io/controller-runtime"
+@@ -35,6 +37,7 @@ import (
+ 	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
+ 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/compatibility"
+ )
+ 
+ const controllerName string = "DataBackupController"
+@@ -108,10 +111,22 @@ func (r *DataBackupReconciler) Reconcile(context context.Context, req ctrl.Reque
+ 
+ // SetupWithManager sets up the controller with the given controller manager
+ func (r *DataBackupReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
+-	return ctrl.NewControllerManagedBy(mgr).
+-		WithOptions(options).
+-		For(&datav1alpha1.DataBackup{}).
+-		Complete(r)
++	if compatibility.IsBatchV1CronJobSupported() {
++		return ctrl.NewControllerManagedBy(mgr).
++			WithOptions(options).
++			For(&datav1alpha1.DataBackup{}).
++			Owns(&batchv1.Job{}).
++			Owns(&batchv1.CronJob{}).
++			Complete(r)
++	} else {
++		ctrl.Log.Info("batch/v1 cronjobs cannot be found in cluster, fallback to watch batch/v1beta1 cronjobs for compatibility")
++		return ctrl.NewControllerManagedBy(mgr).
++			WithOptions(options).
++			For(&datav1alpha1.DataBackup{}).
++			Owns(&batchv1.Job{}).
++			Owns(&batchv1beta1.CronJob{}).
++			Complete(r)
++	}
+ }
+ 
+ func (r *DataBackupReconciler) ControllerName() string {
+diff --git a/pkg/controllers/v1alpha1/databackup/implement.go b/pkg/controllers/v1alpha1/databackup/implement.go
+index 6e9e4b3..ca1995b 100644
+--- a/pkg/controllers/v1alpha1/databackup/implement.go
++++ b/pkg/controllers/v1alpha1/databackup/implement.go
+@@ -37,6 +37,7 @@ import (
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
+ 	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
++	cronparse "github.com/fluid-cloudnative/fluid/pkg/utils/cron"
+ )
+ 
+ type dataBackupOperation struct {
+@@ -68,12 +69,24 @@ func (r *dataBackupOperation) UpdateStatusInfoForCompleted(infos map[string]stri
+ 	infos[cdatabackup.BackupLocationPath] = dataBackup.Spec.BackupPath
+ 
+ 	if strings.HasPrefix(dataBackup.Spec.BackupPath, common.PathScheme.String()) {
++		// For cron backups the pod name is generated by the CronJob per round, so prefer the
++		// pod recorded for the current round by the cron status handler. Once backups keep using
++		// the fixed <name>-pod convention.
+ 		podName := dataBackup.GetName() + "-pod"
++		if r.isCronPolicy() {
++			if roundPodName := infos[cdatabackup.BackupExecutionPod]; len(roundPodName) > 0 {
++				podName = roundPodName
++			}
++		}
+ 		backupPod, err := kubeclient.GetPodByName(r.Client, podName, dataBackup.GetNamespace())
+ 		if err != nil {
+ 			r.Log.Error(err, "Failed to get backup pod")
+ 			return fmt.Errorf("failed to get backup pod")
+ 		}
++		if backupPod == nil {
++			r.Log.Info("Backup pod not found yet, will retry", "podName", podName)
++			return fmt.Errorf("backup pod %s is not found", podName)
++		}
+ 		infos[cdatabackup.BackupLocationNodeName] = backupPod.Spec.NodeName
+ 	} else {
+ 		infos[cdatabackup.BackupLocationNodeName] = "NA"
+@@ -99,6 +112,37 @@ func (r *dataBackupOperation) Validate(ctx runtime.ReconcileRequestContext) ([]d
+ 			},
+ 		}, err
+ 	}
++
++	// 1. validate the cron schedule before any workload is created so that an invalid or missing
++	// expression gets a clear feedback instead of a rejected CronJob later on.
++	if r.isCronPolicy() {
++		if strings.TrimSpace(dataBackup.Spec.Schedule) == "" {
++			err := fmt.Errorf("schedule must be set in standard cron format when policy is Cron")
++			return []datav1alpha1.Condition{
++				{
++					Type:               common.Failed,
++					Status:             v1.ConditionTrue,
++					Reason:             cdatabackup.ReasonInvalidCronSchedule,
++					Message:            err.Error(),
++					LastProbeTime:      metav1.NewTime(time.Now()),
++					LastTransitionTime: metav1.NewTime(time.Now()),
++				},
++			}, err
++		}
++		if _, err := cronparse.Parse(dataBackup.Spec.Schedule); err != nil {
++			validateErr := fmt.Errorf("invalid cron schedule: %w", err)
++			return []datav1alpha1.Condition{
++				{
++					Type:               common.Failed,
++					Status:             v1.ConditionTrue,
++					Reason:             cdatabackup.ReasonInvalidCronSchedule,
++					Message:            err.Error(),
++					LastProbeTime:      metav1.NewTime(time.Now()),
++					LastTransitionTime: metav1.NewTime(time.Now()),
++				},
++			}, validateErr
++		}
++	}
+ 	return nil, nil
+ }
+ 
+@@ -137,13 +181,38 @@ func (r *dataBackupOperation) UpdateOperationApiStatus(opStatus *datav1alpha1.Op
+ }
+ 
+ func (r *dataBackupOperation) GetStatusHandler() dataoperation.StatusHandler {
+-	return &OnceHandler{}
++	if r.isCronPolicy() {
++		return &CronHandler{
++			Client:     r.Client,
++			Log:        r.Log,
++			Recorder:   r.Recorder,
++			dataBackup: r.dataBackup,
++		}
++	}
++	return &OnceHandler{dataBackup: r.dataBackup}
++}
++
++// isCronPolicy reports whether the DataBackup runs under the Cron policy. An empty policy
++// defaults to Once, which keeps existing (once-only) behavior unchanged.
++func (r *dataBackupOperation) isCronPolicy() bool {
++	return r.dataBackup.Spec.Policy == datav1alpha1.Cron
++}
++
++// IsScheduled implements dataoperation.ScheduledOperation.
++func (r *dataBackupOperation) IsScheduled() bool {
++	return r.isCronPolicy()
+ }
+ 
+ // GetTTL implements dataoperation.OperationInterface.
+ func (r *dataBackupOperation) GetTTL() (ttl *int32, err error) {
+-	ttl = r.dataBackup.Spec.TTLSecondsAfterFinished
+-	return
++	if r.isCronPolicy() {
++		// Cron backups are long-lived objects that run round after round, no TTL cleanup is provided.
++		return nil, nil
++	}
++	if r.dataBackup.Spec.Policy == "" || r.dataBackup.Spec.Policy == datav1alpha1.Once {
++		return r.dataBackup.Spec.TTLSecondsAfterFinished, nil
++	}
++	return nil, fmt.Errorf("unknown policy type: %s", r.dataBackup.Spec.Policy)
+ }
+ 
+ func (r *dataBackupOperation) GetParallelTaskNumber() int32 {
+diff --git a/pkg/controllers/v1alpha1/databackup/status_handler.go b/pkg/controllers/v1alpha1/databackup/status_handler.go
+index 9a1196b..7f62e24 100644
+--- a/pkg/controllers/v1alpha1/databackup/status_handler.go
++++ b/pkg/controllers/v1alpha1/databackup/status_handler.go
+@@ -17,16 +17,28 @@
+ package databackup
+ 
+ import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
+ 	"time"
+ 
++	"github.com/go-logr/logr"
++	batchv1 "k8s.io/api/batch/v1"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
+ 	"github.com/fluid-cloudnative/fluid/api/v1alpha1"
+ 	"github.com/fluid-cloudnative/fluid/pkg/common"
++	cdatabackup "github.com/fluid-cloudnative/fluid/pkg/databackup"
+ 	"github.com/fluid-cloudnative/fluid/pkg/dataoperation"
+ 	"github.com/fluid-cloudnative/fluid/pkg/runtime"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/helm"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/kubeclient"
+-	v1 "k8s.io/api/core/v1"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
+ type OnceHandler struct {
+@@ -35,6 +47,20 @@ type OnceHandler struct {
+ 
+ var _ dataoperation.StatusHandler = &OnceHandler{}
+ 
++// CronHandler converges a cron DataBackup from its Kubernetes workloads (CronJob/Job/Pod).
++// It never guesses the state from in-memory information: every decision is re-derived from
++// cluster objects on every reconciliation, which makes controller restarts and intermediate
++// states (CronJob created but Pod missing, Pod terminated with a conflicting status write, ...)
++// converge idempotently.
++type CronHandler struct {
++	client.Client
++	Log        logr.Logger
++	Recorder   record.EventRecorder
++	dataBackup *v1alpha1.DataBackup
++}
++
++var _ dataoperation.StatusHandler = &CronHandler{}
++
+ // UpdateStatusByHelmStatus update the operation status according to helm job status
+ func (o *OnceHandler) GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *v1alpha1.OperationStatus) (result *v1alpha1.OperationStatus, err error) {
+ 	result = opStatus.DeepCopy()
+@@ -90,3 +116,262 @@ func (o *OnceHandler) GetOperationStatus(ctx runtime.ReconcileRequestContext, op
+ 	}
+ 	return
+ }
++
++// GetOperationStatus implements dataoperation.StatusHandler for cron DataBackups.
++func (c *CronHandler) GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *v1alpha1.OperationStatus) (result *v1alpha1.OperationStatus, err error) {
++	result = opStatus.DeepCopy()
++	object := c.dataBackup
++	releaseName := utils.GetDataBackupReleaseName(object.GetName())
++	cronjobName := utils.GetDataBackupCronJobName(releaseName)
++	cronjobKey := types.NamespacedName{Namespace: object.GetNamespace(), Name: cronjobName}
++
++	// 1. load the CronJob. When the helm release exists but the CronJob is missing (or its status
++	// is not observable yet), delete the release so the Executing phase recreates it and retries.
++	// GetCronJobStatus is also used as the existence probe; the scheduled time is tracked
++	// authoritatively in the DataBackup status rather than copied from the CronJob status.
++	if _, err = kubeclient.GetCronJobStatus(c.Client, cronjobKey); err != nil {
++		if utils.IgnoreNotFound(err) == nil {
++			ctx.Log.Info("Related CronJob missing, will delete helm chart and retry", "cronjobName", cronjobName)
++			if err = helm.DeleteReleaseIfExists(releaseName, object.GetNamespace()); err != nil {
++				ctx.Log.Error(err, "can't delete DataBackup release", "releaseName", releaseName)
++				return
++			}
++			return
++		}
++		ctx.Log.Error(err, "can't get DataBackup cronjob", "cronjobName", cronjobName)
++		return
++	}
++
++	// A Failed phase caused by an invalid schedule is a configuration error rather than a round
++	// failure: leave the status untouched so the object stays Failed with the clear reason.
++	if opStatus.Phase == common.PhaseFailed && len(opStatus.Conditions) > 0 &&
++		opStatus.Conditions[0].Reason == cdatabackup.ReasonInvalidCronSchedule {
++		return result, nil
++	}
++
++	// 2. find the Job of the current round: jobs are labeled with the CronJob name, take the newest.
++	jobs, err := utils.ListDataOperationJobByCronjob(c.Client, cronjobKey)
++	if err != nil {
++		ctx.Log.Error(err, "can't list DataBackup jobs by cronjob", "cronjobName", cronjobName)
++		return
++	}
++	currentJob := newestJob(jobs)
++
++	// 3. CronJob created but this round's Job/Pod has not shown up yet. Release the CronJob
++	// (unsuspend) only while this round holds the target dataset occupation. If the occupation is
++	// gone, bounce back to Pending where the schedule gate re-acquires it before re-entering the
++	// round (CurrentExecutionID is kept so the same scheduled time is never started twice).
++	if currentJob == nil {
++		owned, ownErr := c.holdsDatasetOccupation()
++		if ownErr != nil {
++			ctx.Log.Error(ownErr, "failed to check dataset occupation before releasing backup job")
++			err = ownErr
++			return
++		}
++		if !owned {
++			ctx.Log.Info("dataset occupation is not held by this backup, suspend the CronJob and return to Pending to acquire the occupation again")
++			// close the gate first so that no backup job can be released while the occupation is missing
++			if _, ownErr = kubeclient.SetCronJobSuspend(c.Client, cronjobKey, true); ownErr != nil {
++				ctx.Log.Error(ownErr, "failed to suspend CronJob while the dataset occupation is missing")
++				err = ownErr
++				return
++			}
++			result.Phase = common.PhasePending
++			return result, nil
++		}
++		if _, err = kubeclient.SetCronJobSuspend(c.Client, cronjobKey, false); err != nil {
++			ctx.Log.Error(err, "failed to unsuspend CronJob to release the backup job")
++			return
++		}
++		ctx.Log.V(1).Info("cron backup round released, waiting for the job to show up", "executionID", opStatus.CurrentExecutionID)
++		return result, nil
++	}
++
++	// 4. the round Job exists: close the gate immediately so the next schedule cannot start an
++	// overlapping Job while this round is being observed. concurrencyPolicy=Forbid in the chart
++	// is the second line of defense.
++	if _, err = kubeclient.SetCronJobSuspend(c.Client, cronjobKey, true); err != nil {
++		ctx.Log.Error(err, "failed to suspend CronJob after the round job showed up")
++		return
++	}
++
++	// stamp the recognizable generation identity onto the Job (idempotent), so after a controller
++	// restart the round is identifiable from the Kubernetes object itself.
++	c.stampExecutionID(currentJob, opStatus.CurrentExecutionID)
++
++	roundPod := c.newestRoundPod(ctx, currentJob)
++	if result.Infos == nil {
++		result.Infos = map[string]string{}
++	}
++	result.Infos[cdatabackup.BackupExecutionJob] = currentJob.Name
++	if roundPod != nil {
++		result.Infos[cdatabackup.BackupExecutionPod] = roundPod.Name
++	}
++
++	finishedJobCondition := kubeclient.GetFinishedJobCondition(currentJob)
++
++	// 5a. job still running: keep Executing. Defensively, if a newer job is running while the
++	// previous round was already terminal, return to Pending (the occupation has already been
++	// released by the Complete/Failed reconciliation) and let the gate start the next round.
++	if finishedJobCondition == nil {
++		if opStatus.Phase == common.PhaseComplete || opStatus.Phase == common.PhaseFailed {
++			ctx.Log.Info("a newer round job is running, return to Pending for the next round")
++			result.Phase = common.PhasePending
++			result.Duration = "-"
++			result.CurrentExecutionID = ""
++		}
++		return result, nil
++	}
++
++	// 5b. finished job observed while the previous terminal status is already recorded: close the
++	// round and wait for the next schedule. The terminal condition is preserved on purpose so the
++	// failure (or success) result stays diagnosable while the object is Pending.
++	if opStatus.Phase == common.PhaseComplete || opStatus.Phase == common.PhaseFailed {
++		result.Phase = common.PhasePending
++		result.Duration = "-"
++		result.CurrentExecutionID = ""
++		return result, nil
++	}
++
++	// 5c. first observation of the finished round: record a diagnosable terminal result.
++	finishTime := finishedJobCondition.LastTransitionTime.Time
++	result.Duration = utils.CalculateDuration(currentJob.CreationTimestamp.Time, finishTime)
++
++	podInfo := "no pod observed"
++	if roundPod != nil {
++		podInfo = fmt.Sprintf("job %s pod %s (phase %s)", currentJob.Name, roundPod.Name, roundPod.Status.Phase)
++		if msg := podFailureMessage(roundPod); len(msg) > 0 {
++			podInfo += ": " + msg
++		}
++	} else {
++		podInfo = fmt.Sprintf("job %s (no pod observed): %s", currentJob.Name, finishedJobCondition.Message)
++	}
++
++	if finishedJobCondition.Type == batchv1.JobComplete {
++		result.Phase = common.PhaseComplete
++		if opStatus.LastScheduleTime != nil {
++			result.LastSuccessfulTime = opStatus.LastScheduleTime
++		}
++		result.Conditions = []v1alpha1.Condition{
++			{
++				Type:               common.Complete,
++				Status:             v1.ConditionTrue,
++				Reason:             "BackupSuccessful",
++				Message:            fmt.Sprintf("Backup round %s completed successfully, %s", opStatus.CurrentExecutionID, podInfo),
++				LastProbeTime:      metav1.NewTime(time.Now()),
++				LastTransitionTime: finishedJobCondition.LastTransitionTime,
++			},
++		}
++		c.Recorder.Eventf(object, v1.EventTypeNormal, common.DataOperationSucceed,
++			"DataBackup round %s succeeded", opStatus.CurrentExecutionID)
++	} else {
++		result.Phase = common.PhaseFailed
++		result.Conditions = []v1alpha1.Condition{
++			{
++				Type:               common.Failed,
++				Status:             v1.ConditionTrue,
++				Reason:             "BackupFailed",
++				Message:            fmt.Sprintf("Backup round %s failed, %s", opStatus.CurrentExecutionID, podInfo),
++				LastProbeTime:      metav1.NewTime(time.Now()),
++				LastTransitionTime: finishedJobCondition.LastTransitionTime,
++			},
++		}
++		c.Recorder.Eventf(object, v1.EventTypeWarning, common.DataOperationFailed,
++			"DataBackup round %s failed: %s", opStatus.CurrentExecutionID, finishedJobCondition.Message)
++	}
++	return result, nil
++}
++
++// holdsDatasetOccupation reports whether the target Dataset OperationRef currently points to this
++// DataBackup. The occupation can only be held by one backup round at a time.
++func (c *CronHandler) holdsDatasetOccupation() (bool, error) {
++	dataset, err := utils.GetDataset(c.Client, c.dataBackup.Spec.Dataset, c.dataBackup.Namespace)
++	if err != nil {
++		if utils.IgnoreNotFound(err) == nil {
++			return false, nil
++		}
++		return false, err
++	}
++	refs := dataset.GetDataOperationInProgress(string(dataoperation.DataBackupType))
++	for _, ref := range strings.Split(refs, ",") {
++		if ref == c.dataBackup.GetName() {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// stampExecutionID annotates the round Job with the scheduled generation identity.
++func (c *CronHandler) stampExecutionID(job *batchv1.Job, id string) {
++	if len(id) == 0 {
++		return
++	}
++	if job.Annotations != nil && job.Annotations[cdatabackup.ExecutionIDAnnotation] == id {
++		return
++	}
++	jobToUpdate := job.DeepCopy()
++	if jobToUpdate.Annotations == nil {
++		jobToUpdate.Annotations = map[string]string{}
++	}
++	jobToUpdate.Annotations[cdatabackup.ExecutionIDAnnotation] = id
++	if err := c.Update(context.TODO(), jobToUpdate); err != nil {
++		// non-fatal: the identity is also held by the DataBackup status, the annotation is retried later
++		c.Log.Info("failed to stamp execution id on round job, will retry", "job", job.Name, "executionID", id, "err", err.Error())
++	}
++}
++
++// newestRoundPod returns the newest pod belonging to the round Job, or nil when the pod has not
++// shown up yet (e.g. right after the CronJob created the Job).
++func (c *CronHandler) newestRoundPod(ctx runtime.ReconcileRequestContext, job *batchv1.Job) *v1.Pod {
++	pods, err := kubeclient.ListPodsForJob(c.Client, job)
++	if err != nil {
++		ctx.Log.Error(err, "failed to list pods for round job", "job", job.Name)
++		return nil
++	}
++	if len(pods) == 0 {
++		return nil
++	}
++	sort.Slice(pods, func(i, j int) bool {
++		if !pods[i].CreationTimestamp.Equal(&pods[j].CreationTimestamp) {
++			return pods[i].CreationTimestamp.After(pods[j].CreationTimestamp.Time)
++		}
++		return pods[i].Name > pods[j].Name
++	})
++	return &pods[0]
++}
++
++// newestJob returns the newest job in the list, which represents the current backup round.
++func newestJob(jobs []batchv1.Job) *batchv1.Job {
++	if len(jobs) == 0 {
++		return nil
++	}
++	sorted := make([]batchv1.Job, len(jobs))
++	copy(sorted, jobs)
++	sort.Slice(sorted, func(i, j int) bool {
++		if !sorted[i].CreationTimestamp.Equal(&sorted[j].CreationTimestamp) {
++			return sorted[i].CreationTimestamp.After(sorted[j].CreationTimestamp.Time)
++		}
++		return sorted[i].Name > sorted[j].Name
++	})
++	return &sorted[0]
++}
++
++// podFailureMessage extracts a human readable termination message from the backup pod so that the
++// failure condition is directly diagnosable.
++func podFailureMessage(pod *v1.Pod) string {
++	if pod == nil {
++		return ""
++	}
++	for _, cs := range pod.Status.ContainerStatuses {
++		if cs.State.Terminated != nil && len(cs.State.Terminated.Message) > 0 {
++			return fmt.Sprintf("container %s terminated: %s", cs.Name, cs.State.Terminated.Message)
++		}
++		if cs.LastTerminationState.Terminated != nil && len(cs.LastTerminationState.Terminated.Message) > 0 {
++			return fmt.Sprintf("container %s last terminated: %s", cs.Name, cs.LastTerminationState.Terminated.Message)
++		}
++	}
++	if len(pod.Status.Message) > 0 {
++		return pod.Status.Message
++	}
++	return ""
++}
+diff --git a/pkg/databackup/constants.go b/pkg/databackup/constants.go
+index b4a7270..2a920e3 100644
+--- a/pkg/databackup/constants.go
++++ b/pkg/databackup/constants.go
+@@ -23,4 +23,22 @@ const (
+ 
+ 	BackupLocationPath     = "BackupLocationPath"
+ 	BackupLocationNodeName = "BackupLocationNodeName"
++	// BackupExecutionJob records the job name of a cron backup round for diagnosis
++	BackupExecutionJob = "BackupExecutionJob"
++	// BackupExecutionPod records the pod name of the current (or last) backup round for diagnosis
++	BackupExecutionPod = "BackupExecutionPod"
++
++	// ExecutionIDAnnotation is stamped onto the Job (and propagates to Pods) of each cron
++	// backup round to make the scheduled execution generation recognizable from Kubernetes objects.
++	ExecutionIDAnnotation = "databackup.fluid.io/execution-id"
++
++	// CronJobLabel is the label carried by the Job/Pod of a cron DataBackup, its value is the CronJob name.
++	// It shares the same key used by other cron data operations so jobs can be listed generically.
++	CronJobLabel = "cronjob"
++
++	// ReasonInvalidCronSchedule is the condition reason when the cron schedule is missing or invalid.
++	ReasonInvalidCronSchedule = "InvalidCronSchedule"
++	// ReasonBackupMissed is the condition reason recorded when a scheduled round is skipped
++	// because it is older than the missed schedule threshold.
++	ReasonBackupMissed = "BackupScheduleMissed"
+ )
+diff --git a/pkg/databackup/value.go b/pkg/databackup/value.go
+index 3a5fc9b..091237c 100644
+--- a/pkg/databackup/value.go
++++ b/pkg/databackup/value.go
+@@ -25,6 +25,7 @@ import (
+ // DataBackupValue defines the value yaml file used in DataBackup helm chart
+ type DataBackupValue struct {
+ 	DataBackup      DataBackup `yaml:"dataBackup"`
++	Owner           *common.OwnerReference `yaml:"owner,omitempty"`
+ 	common.UserInfo `yaml:",inline"`
+ 	InitUsers       common.InitUsers `yaml:"initUsers,omitempty"`
+ }
+@@ -42,6 +43,10 @@ type DataBackup struct {
+ 	PVCName        string `yaml:"pvcName,omitempty"`
+ 	Path           string `yaml:"path,omitempty"`
+ 	RuntimeType    string `yaml:"runtimeType,omitempty"`
++	// Policy is the execution policy, including Once and Cron. Defaults to Once.
++	Policy string `yaml:"policy,omitempty"`
++	// Schedule is the cron expression used only when Policy is Cron.
++	Schedule string `yaml:"schedule,omitempty"`
+ 	// image pull secrets
+ 	ImagePullSecrets []corev1.LocalObjectReference `yaml:"imagePullSecrets,omitempty"`
+ 	Affinity         *corev1.Affinity              `yaml:"affinity,omitempty"`
+diff --git a/pkg/dataoperation/interface.go b/pkg/dataoperation/interface.go
+index 15eb63c..2b25bb6 100644
+--- a/pkg/dataoperation/interface.go
++++ b/pkg/dataoperation/interface.go
+@@ -19,6 +19,8 @@ package dataoperation
+ //go:generate mockgen -source=interface.go -destination=mock/mock_operation.go -package=mock
+ 
+ import (
++	"time"
++
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+@@ -81,3 +83,31 @@ type StatusHandler interface {
+ 	// GetOperationStatus get operation status according to helm chart status
+ 	GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus) (result *datav1alpha1.OperationStatus, err error)
+ }
++
++// ScheduledOperation is optionally implemented by operations whose executions are organized
++// into schedule driven rounds (cron policy). It is consulted during the Pending phase before
++// the target dataset's operation occupation is taken, so that a workload pod is released only
++// after the occupation of the current round is acquired and rounds never overlap.
++type ScheduledOperation interface {
++	// IsScheduled reports whether the operation is currently driven by a schedule.
++	IsScheduled() bool
++
++	// ReconcileScheduledRound converges the Pending phase for a scheduled operation. It must be
++	// idempotent and derive every decision from Kubernetes objects so that it keeps converging
++	// after controller restarts or intermediate workload states:
++	//   - when a scheduled round is already open in opStatus but not closed yet, it ensures the
++	//     dataset occupation is held and returns roundOpen=true to re-enter the Executing phase;
++	//   - when a new scheduled time is due, it invokes acquireOccupation exactly once, records the
++	//     scheduled time and the round identity, advances the phase to Executing and returns
++	//     roundOpen=true;
++	//   - when no scheduled time is due, it releases any stale occupation, stays in Pending and
++	//     returns roundOpen=false together with the duration after which to reconcile again.
++	// The same scheduled time must never be started twice; releasing the occupation is delegated to
++	// releaseOccupation so that a stale occupation can be healed without leaving an OperationRef behind.
++	ReconcileScheduledRound(
++		ctx runtime.ReconcileRequestContext,
++		opStatus *datav1alpha1.OperationStatus,
++		acquireOccupation func() error,
++		releaseOccupation func() error,
++	) (roundOpen bool, requeueAfter time.Duration, err error)
++}
+diff --git a/pkg/ddc/alluxio/backup_data.go b/pkg/ddc/alluxio/backup_data.go
+index ce198fb..64229aa 100644
+--- a/pkg/ddc/alluxio/backup_data.go
++++ b/pkg/ddc/alluxio/backup_data.go
+@@ -30,6 +30,7 @@ import (
+ 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils"
+ 	"github.com/fluid-cloudnative/fluid/pkg/utils/docker"
++	"github.com/fluid-cloudnative/fluid/pkg/utils/transformer"
+ 	"gopkg.in/yaml.v2"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+@@ -125,6 +126,8 @@ func (e *AlluxioEngine) generateDataBackupValueFile(ctx cruntime.ReconcileReques
+ 		Workdir:          workdir,
+ 		RuntimeType:      common.AlluxioRuntime,
+ 		ImagePullSecrets: imagePullSecrets,
++		Policy:           string(databackup.Spec.Policy),
++		Schedule:         databackup.Spec.Schedule,
+ 	}
+ 
+ 	dataset, err := utils.GetDataset(e.Client, dataBackup.Dataset, dataBackup.Namespace)
+@@ -148,6 +151,10 @@ func (e *AlluxioEngine) generateDataBackupValueFile(ctx cruntime.ReconcileReques
+ 
+ 	dataBackupValue := cdatabackup.DataBackupValue{DataBackup: dataBackup}
+ 
++	// owner reference makes the CronJob (and its Jobs/Pods) garbage collected together with
++	// the DataBackup object, and allows owner based watches to enqueue the DataBackup.
++	dataBackupValue.Owner = transformer.GenerateOwnerReferenceFromObject(databackup)
++
+ 	dataBackupValue.InitUsers = common.InitUsers{
+ 		Enabled: false,
+ 	}
+diff --git a/pkg/ddc/base/operation.go b/pkg/ddc/base/operation.go
+index 563b309..f3e9020 100644
+--- a/pkg/ddc/base/operation.go
++++ b/pkg/ddc/base/operation.go
+@@ -119,7 +119,36 @@ func (e *EngineOperationReconciler) reconcilePending(ctx cruntime.ReconcileReque
+ 		return utils.NoRequeue()
+ 	}
+ 
+-	// 2. set current data operation to dataset
++	// 2. for scheduled (cron) operations, gate every execution round on the schedule:
++	// the target dataset occupation is taken only when a scheduled time is due, and no
++	// workload pod is released before the occupation of the current round is acquired.
++	if scheduler, ok := operation.(dataoperation.ScheduledOperation); ok && scheduler.IsScheduled() {
++		roundOpen, requeueAfter, err := scheduler.ReconcileScheduledRound(
++			ctx,
++			opStatus,
++			func() error {
++				return SetDataOperationInTargetDataset(ctx, operation, e.Engine)
++			},
++			func() error {
++				return ReleaseTargetDataset(ctx, operation)
++			})
++		if err != nil {
++			log.Error(err, "failed to reconcile scheduled round, will retry")
++			return utils.RequeueAfterInterval(20 * time.Second)
++		}
++		if roundOpen {
++			// the status has been advanced to Executing by the scheduler, the status update
++			// will trigger another reconciliation, no need to requeue here
++			return utils.NoRequeue()
++		}
++		if requeueAfter <= 0 {
++			requeueAfter = 20 * time.Second
++		}
++		log.V(1).Info("no scheduled round due, requeue later", "requeueAfter", requeueAfter)
++		return utils.RequeueAfterInterval(requeueAfter)
++	}
++
++	// 3. set current data operation to dataset
+ 	err := SetDataOperationInTargetDataset(ctx, operation, e.Engine)
+ 	if err != nil {
+ 		return utils.RequeueAfterInterval(20 * time.Second)
+diff --git a/pkg/utils/cron/schedule.go b/pkg/utils/cron/schedule.go
+new file mode 100644
+index 0000000..120083b
+--- /dev/null
++++ b/pkg/utils/cron/schedule.go
+@@ -0,0 +1,268 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Package cron provides a self-contained parser for the standard 5-field cron
++// format (minute hour day-of-month month day-of-week). It exists so that fluid can
++// validate schedules and compute scheduled times without depending on an external
++// cron library, which keeps schedule decisions inside the controller instead of
++// leaving them to the workload only.
++package cron
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	// fieldCount is the number of space separated fields of a standard cron expression.
++	fieldCount = 5
++	// bitset size, covers all field ranges.
++	bitSize = 64
++)
++
++// Schedule is a parsed cron expression. Each field is stored as a bitset in which
++// bit n is set when value n matches.
++type Schedule struct {
++	expression string
++	minute     uint64
++	hour       uint64
++	dom        uint64 // 1-31
++	month      uint64 // 1-12
++	dow        uint64 // 0-6, Sunday = 0
++
++	// domStar/dowStar track whether the corresponding field is unrestricted ("*"),
++	// which decides the OR rule between day-of-month and day-of-week.
++	domStar bool
++	dowStar bool
++}
++
++var (
++	monthNames = map[string]uint{
++		"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
++		"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
++	}
++	dowNames = map[string]uint{
++		"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
++	}
++)
++
++// Parse parses a standard 5-field cron expression and returns an error describing
++// exactly which field is invalid when the expression is not supported.
++func Parse(expression string) (*Schedule, error) {
++	fields := strings.Fields(strings.TrimSpace(expression))
++	if len(fields) == 0 {
++		return nil, fmt.Errorf("empty cron schedule, expect 5 fields: minute hour day-of-month month day-of-week")
++	}
++	if len(fields) != fieldCount {
++		return nil, fmt.Errorf("invalid cron schedule %q: expected exactly 5 fields (minute hour day-of-month month day-of-week), got %d",
++			expression, len(fields))
++	}
++
++	s := &Schedule{expression: expression}
++	var err error
++	fieldNames := [fieldCount]string{"minute", "hour", "day-of-month", "month", "day-of-week"}
++	ranges := [fieldCount][2]uint{
++		{0, 59},
++		{0, 23},
++		{1, 31},
++		{1, 12},
++		{0, 6},
++	}
++
++	if s.minute, err = parseField(fields[0], ranges[0], fieldNames[0], nil); err != nil {
++		return nil, err
++	}
++	if s.hour, err = parseField(fields[1], ranges[1], fieldNames[1], nil); err != nil {
++		return nil, err
++	}
++	if s.dom, s.domStar, err = parseDayOfMonth(fields[2]); err != nil {
++		return nil, err
++	}
++	if s.month, err = parseField(fields[3], ranges[3], fieldNames[3], monthNames); err != nil {
++		return nil, err
++	}
++	if s.dow, s.dowStar, err = parseDayOfWeek(fields[4]); err != nil {
++		return nil, err
++	}
++
++	return s, nil
++}
++
++// Expression returns the original cron expression.
++func (s *Schedule) Expression() string {
++	return s.expression
++}
++
++// Next returns the earliest time strictly after t that matches the schedule.
++// The returned time keeps the location of t and is truncated to whole minutes.
++// An error is only returned if no match can be found within 5 years, which
++// indicates an over-constrained schedule.
++func (s *Schedule) Next(t time.Time) (time.Time, error) {
++	// start at the next whole minute
++	next := t.Add(time.Minute - time.Duration(t.Second())*time.Second - time.Duration(t.Nanosecond())*time.Nanosecond)
++	// guard against pathological expressions such as "0 0 31 2 *" (Feb 31st never exists)
++	limit := next.AddDate(5, 0, 0)
++
++	for next.Before(limit) {
++		if s.month&(1<<uint(next.Month())) == 0 {
++			// jump to the first day of the next month
++			next = time.Date(next.Year(), next.Month()+1, 1, 0, 0, 0, 0, next.Location())
++			continue
++		}
++
++		if !s.dayMatches(next) {
++			next = time.Date(next.Year(), next.Month(), next.Day()+1, 0, 0, 0, 0, next.Location())
++			continue
++		}
++
++		if s.hour&(1<<uint(next.Hour())) == 0 {
++			next = time.Date(next.Year(), next.Month(), next.Day(), next.Hour()+1, 0, 0, 0, next.Location())
++			continue
++		}
++
++		if s.minute&(1<<uint(next.Minute())) != 0 {
++			return next, nil
++		}
++		next = next.Add(time.Minute)
++	}
++
++	return time.Time{}, fmt.Errorf("no scheduled time found within 5 years for cron schedule %q", s.expression)
++}
++
++// dayMatches implements the traditional cron OR semantics: when either the
++// day-of-month or day-of-week field is unrestricted, the non-restricted field
++// dictates; when both are restricted, a day matches if either field matches.
++func (s *Schedule) dayMatches(t time.Time) bool {
++	domMatch := s.dom&(1<<uint(t.Day())) != 0
++	dowMatch := s.dow&(1<<uint(t.Weekday())) != 0
++
++	if s.domStar || s.dowStar {
++		return domMatch && dowMatch
++	}
++	return domMatch || dowMatch
++}
++
++func parseDayOfMonth(field string) (bits uint64, star bool, err error) {
++	if field == "*" || field == "?" {
++		return (1 << bitSize) - 1, true, nil
++	}
++	bits, err = parseField(field, [2]uint{1, 31}, "day-of-month", nil)
++	return bits, false, err
++}
++
++func parseDayOfWeek(field string) (bits uint64, star bool, err error) {
++	if field == "*" || field == "?" {
++		return (1 << bitSize) - 1, true, nil
++	}
++	// dow accepts 0-6 (Sunday = 0) and 7 as an alias of Sunday.
++	bits, err = parseField(field, [2]uint{0, 7}, "day-of-week", dowNames)
++	if err != nil {
++		return 0, false, err
++	}
++	if bits&(1<<7) != 0 {
++		bits |= 1 << 0
++		bits &^= 1 << 7
++	}
++	return bits, false, nil
++}
++
++// parseField parses one cron field into a bitset over [min, max].
++func parseField(field string, r [2]uint, fieldName string, names map[string]uint) (uint64, error) {
++	var bits uint64
++	for _, part := range strings.Split(field, ",") {
++		if part == "" {
++			return 0, fmt.Errorf("invalid %s field %q: empty value", fieldName, field)
++		}
++
++		// step syntax: range/step
++		rangePart := part
++		var step uint64 = 1
++		if idx := strings.Index(part, "/"); idx >= 0 {
++			stepStr := part[idx+1:]
++			step64, err := strconv.ParseUint(stepStr, 10, 64)
++			if err != nil || step64 == 0 {
++				return 0, fmt.Errorf("invalid %s field %q: step %q is not a positive integer", fieldName, field, stepStr)
++			}
++			step = step64
++			rangePart = part[:idx]
++			if rangePart == "" {
++				return 0, fmt.Errorf("invalid %s field %q: missing range before step", fieldName, field)
++			}
++		}
++
++		var start, end uint
++		switch {
++		case rangePart == "*":
++			start, end = r[0], r[1]
++		case strings.Contains(rangePart, "-"):
++			values := strings.Split(rangePart, "-")
++			if len(values) != 2 {
++				return 0, fmt.Errorf("invalid %s field %q: malformed range %q", fieldName, field, rangePart)
++			}
++			var err error
++			if start, err = parseValue(values[0], r, fieldName, field, names); err != nil {
++				return 0, err
++			}
++			if end, err = parseValue(values[1], r, fieldName, field, names); err != nil {
++				return 0, err
++			}
++		default:
++			v, err := parseValue(rangePart, r, fieldName, field, names)
++			if err != nil {
++				return 0, err
++			}
++			if strings.Contains(part, "/") {
++				// "n/step" means from n up to the upper bound.
++				start, end = v, r[1]
++			} else {
++				start, end = v, v
++			}
++		}
++
++		if start < r[0] || end > r[1] || start > end {
++			return 0, fmt.Errorf("invalid %s field %q: value out of range [%d, %d]", fieldName, field, r[0], r[1])
++		}
++
++		for v := start; v <= end; v += uint(step) {
++			if v < bitSize {
++				bits |= 1 << v
++			}
++		}
++	}
++
++	if bits == 0 {
++		return 0, fmt.Errorf("invalid %s field %q: no values matched", fieldName, field)
++	}
++	return bits, nil
++}
++
++func parseValue(token string, r [2]uint, fieldName, field string, names map[string]uint) (uint, error) {
++	if v, err := strconv.ParseUint(token, 10, 64); err == nil {
++		if uint(v) < r[0] || uint(v) > r[1] {
++			return 0, fmt.Errorf("invalid %s field %q: value %s is out of range [%d, %d]", fieldName, field, token, r[0], r[1])
++		}
++		return uint(v), nil
++	}
++
++	if names != nil {
++		if v, ok := names[strings.ToLower(token)]; ok {
++			return v, nil
++		}
++	}
++	return 0, fmt.Errorf("invalid %s field %q: %q is not a valid value", fieldName, field, token)
++}
+diff --git a/pkg/utils/cron/schedule_test.go b/pkg/utils/cron/schedule_test.go
+new file mode 100644
+index 0000000..216c9d0
+--- /dev/null
++++ b/pkg/utils/cron/schedule_test.go
+@@ -0,0 +1,138 @@
++/*
++Copyright 2026 The Fluid Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cron
++
++import (
++	"testing"
++	"time"
++)
++
++func mustParse(t *testing.T, expr string) *Schedule {
++	t.Helper()
++	s, err := Parse(expr)
++	if err != nil {
++		t.Fatalf("Parse(%q) returned unexpected error: %v", expr, err)
++	}
++	return s
++}
++
++func TestParseInvalid(t *testing.T) {
++	invalid := []string{
++		"",
++		"   ",
++		"* * * *",
++		"* * * * * *",
++		"60 * * * *",
++		"* 24 * * *",
++		"* * 32 * *",
++		"* * * 13 *",
++		"* * * * 8",
++		"*/a * * * *",
++		"*/0 * * * *",
++		"5-3 * * * *",
++		"1,,2 * * * *",
++		"abc * * * *",
++		"? * * * *",
++	}
++	for _, expr := range invalid {
++		if _, err := Parse(expr); err == nil {
++			t.Errorf("Parse(%q) expected error, got nil", expr)
++		}
++	}
++}
++
++func TestNextBasic(t *testing.T) {
++	loc := time.UTC
++	now := time.Date(2026, 11, 9, 10, 30, 25, 0, loc)
++
++	cases := []struct {
++		expr string
++		want time.Time
++	}{
++		{"* * * * *", time.Date(2026, 11, 9, 10, 31, 0, 0, loc)},
++		{"0 * * * *", time.Date(2026, 11, 9, 11, 0, 0, 0, loc)},
++		{"0 0 * * *", time.Date(2026, 11, 10, 0, 0, 0, 0, loc)},
++		{"*/15 * * * *", time.Date(2026, 11, 9, 10, 45, 0, 0, loc)},
++		{"0 0 1 * *", time.Date(2026, 12, 1, 0, 0, 0, 0, loc)},
++		{"0 9 ? * MON-FRI", time.Date(2026, 11, 10, 9, 0, 0, 0, loc)}, // 2026-11-09 is Monday; next weekday 9am is Tue 10th
++		{"30 10 * * *", time.Date(2026, 11, 10, 10, 30, 0, 0, loc)},  // same minute already passed
++		{"0 0 1 1 *", time.Date(2027, 1, 1, 0, 0, 0, 0, loc)},
++	}
++
++	for _, c := range cases {
++		s := mustParse(t, c.expr)
++		got, err := s.Next(now)
++		if err != nil {
++			t.Fatalf("Next for %q returned error: %v", c.expr, err)
++		}
++		if !got.Equal(c.want) {
++			t.Errorf("Next(%q) = %v, want %v", c.expr, got, c.want)
++		}
++	}
++}
++
++func TestNextNamesAndSundayAlias(t *testing.T) {
++	loc := time.UTC
++	now := time.Date(2026, 11, 9, 10, 30, 0, 0, loc) // Monday
++
++	// named month + named weekday: every Saturday in December, the first one after Nov 9 is Dec 5 2026.
++	s := mustParse(t, "0 0 * DEC SAT")
++	got, err := s.Next(now)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if !got.Equal(time.Date(2026, 12, 5, 0, 0, 0, 0, loc)) || got.Weekday() != time.Saturday {
++		t.Errorf("expected Saturday 2026-12-05, got %v (%v)", got, got.Weekday())
++	}
++
++	// 7 should be treated as Sunday
++	sun := mustParse(t, "0 0 * * 7")
++	got, err = sun.Next(now)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if got.Weekday() != time.Sunday {
++		t.Errorf("expected Sunday, got %v", got.Weekday())
++	}
++}
++
++func TestDayOfMonthOrDayOfWeekSemantics(t *testing.T) {
++	loc := time.UTC
++	// "0 0 15 * MON" matches 15th of month OR every Monday.
++	s := mustParse(t, "0 0 15 * MON")
++	from := time.Date(2026, 11, 9, 10, 30, 0, 0, loc) // Monday Nov 9
++	got, err := s.Next(from)
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	// Next match is Monday Nov 16 (weekday rule), since the 15th (Sunday) is before that?
++	// Nov 15 2026 is a Sunday and still after Nov 9, so the 15th matches via dom rule first.
++	if !got.Equal(time.Date(2026, 11, 15, 0, 0, 0, 0, loc)) {
++		t.Errorf("got %v, want 2026-11-15 00:00 (day-of-month match)", got)
++	}
++}
++
++func TestTruncatesSeconds(t *testing.T) {
++	s := mustParse(t, "* * * * *")
++	got, err := s.Next(time.Date(2026, 11, 9, 10, 30, 59, 999, time.UTC))
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if got.Second() != 0 || got.Nanosecond() != 0 {
++		t.Errorf("expected whole minute, got %v", got)
++	}
++}
+diff --git a/pkg/utils/databackup.go b/pkg/utils/databackup.go
+index ae19705..63121cf 100644
+--- a/pkg/utils/databackup.go
++++ b/pkg/utils/databackup.go
+@@ -67,6 +67,12 @@ func GetDataBackupPodName(name string) string {
+ 	return fmt.Sprintf("%s-pod", name)
+ }
+ 
++// GetDataBackupCronJobName returns DataBackup CronJob's name given the DataBackup helm release's name.
++// It is only used by DataBackup with Cron policy.
++func GetDataBackupCronJobName(releaseName string) string {
++	return fmt.Sprintf("%s-backup", releaseName)
++}
++
+ // ParseBackupRestorePath parse the BackupPath in spec of DataBackup or the RestorePath in spec of Dataset
+ func ParseBackupRestorePath(backupRestorePath string) (pvcName string, path string, err error) {
+ 	if backupRestorePath == "" {
+diff --git a/pkg/utils/kubeclient/cronjob.go b/pkg/utils/kubeclient/cronjob.go
+index 629cb6d..1efc7d4 100644
+--- a/pkg/utils/kubeclient/cronjob.go
++++ b/pkg/utils/kubeclient/cronjob.go
+@@ -48,3 +48,41 @@ func GetCronJobStatus(client client.Client, key types.NamespacedName) (*batchv1.
+ 		LastSuccessfulTime: cronjob.Status.LastSuccessfulTime,
+ 	}, nil
+ }
++
++// SetCronJobSuspend updates the suspend flag of the CronJob only when it differs from the
++// expected value, so the call is idempotent across reconciliations. It supports both
++// batch/v1 and the deprecated batch/v1beta1 CronJob API.
++func SetCronJobSuspend(c client.Client, key types.NamespacedName, suspend bool) (changed bool, err error) {
++	return SetCronJobSuspendWithContext(context.TODO(), c, key, suspend)
++}
++
++// SetCronJobSuspendWithContext is the context aware variant of SetCronJobSuspend.
++func SetCronJobSuspendWithContext(ctx context.Context, c client.Client, key types.NamespacedName, suspend bool) (changed bool, err error) {
++	if compatibility.IsBatchV1CronJobSupported() {
++		var cronjob batchv1.CronJob
++		if err = c.Get(ctx, key, &cronjob); err != nil {
++			return false, err
++		}
++		if cronjob.Spec.Suspend != nil && *cronjob.Spec.Suspend == suspend {
++			return false, nil
++		}
++		cronjob.Spec.Suspend = &suspend
++		if err = c.Update(ctx, &cronjob); err != nil {
++			return false, err
++		}
++		return true, nil
++	}
++
++	var cronjob batchv1beta1.CronJob
++	if err = c.Get(ctx, key, &cronjob); err != nil {
++		return false, err
++	}
++	if cronjob.Spec.Suspend != nil && *cronjob.Spec.Suspend == suspend {
++		return false, nil
++	}
++	cronjob.Spec.Suspend = &suspend
++	if err = c.Update(ctx, &cronjob); err != nil {
++		return false, err
++	}
++	return true, nil
++}
+diff --git a/pkg/utils/kubeclient/job.go b/pkg/utils/kubeclient/job.go
+index f525048..dbc0161 100644
+--- a/pkg/utils/kubeclient/job.go
++++ b/pkg/utils/kubeclient/job.go
+@@ -92,3 +92,25 @@ func GetFinishedJobCondition(job *v1.Job) *v1.JobCondition {
+ 	}
+ 	return nil
+ }
++
++// ListPodsForJob lists all pods that belong to the given Job according to the
++// Job's pod selector.
++func ListPodsForJob(c client.Client, job *v1.Job) (pods []corev1.Pod, err error) {
++	return ListPodsForJobWithContext(context.TODO(), c, job)
++}
++
++// ListPodsForJobWithContext is the context aware variant of ListPodsForJob.
++func ListPodsForJobWithContext(ctx context.Context, c client.Client, job *v1.Job) (pods []corev1.Pod, err error) {
++	selector, err := metav1.LabelSelectorAsSelector(job.Spec.Selector)
++	if err != nil {
++		return nil, fmt.Errorf("error converting Job %s in namespace %s selector: %w", job.Name, job.Namespace, err)
++	}
++	var podList corev1.PodList
++	if err = c.List(ctx, &podList, &client.ListOptions{
++		Namespace:     job.Namespace,
++		LabelSelector: selector,
++	}); err != nil {
++		return nil, fmt.Errorf("error listing pods for Job %s in namespace %s: %w", job.Name, job.Namespace, err)
++	}
++	return podList.Items, nil
++}

@@ -30,6 +30,7 @@ import (
 	cruntime "github.com/fluid-cloudnative/fluid/pkg/runtime"
 	"github.com/fluid-cloudnative/fluid/pkg/utils"
 	"github.com/fluid-cloudnative/fluid/pkg/utils/docker"
+	"github.com/fluid-cloudnative/fluid/pkg/utils/transformer"
 	"gopkg.in/yaml.v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -125,6 +126,8 @@ func (e *AlluxioEngine) generateDataBackupValueFile(ctx cruntime.ReconcileReques
 		Workdir:          workdir,
 		RuntimeType:      common.AlluxioRuntime,
 		ImagePullSecrets: imagePullSecrets,
+		Policy:           string(databackup.Spec.Policy),
+		Schedule:         databackup.Spec.Schedule,
 	}
 
 	dataset, err := utils.GetDataset(e.Client, dataBackup.Dataset, dataBackup.Namespace)
@@ -147,6 +150,10 @@ func (e *AlluxioEngine) generateDataBackupValueFile(ctx cruntime.ReconcileReques
 	}
 
 	dataBackupValue := cdatabackup.DataBackupValue{DataBackup: dataBackup}
+
+	// owner reference makes the CronJob (and its Jobs/Pods) garbage collected together with
+	// the DataBackup object, and allows owner based watches to enqueue the DataBackup.
+	dataBackupValue.Owner = transformer.GenerateOwnerReferenceFromObject(databackup)
 
 	dataBackupValue.InitUsers = common.InitUsers{
 		Enabled: false,

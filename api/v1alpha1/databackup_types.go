@@ -37,6 +37,18 @@ type DataBackupSpec struct {
 	// TTLSecondsAfterFinished is the time second to clean up data operations after finished or failed
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+	// Policy defines the execution policy of the DataBackup, default is Once which
+	// runs the backup exactly one time. When set to Cron, the DataBackup runs
+	// repeatedly according to the Schedule and each scheduled time forms an
+	// independent backup execution round.
+	// +kubebuilder:default:=Once
+	// +kubebuilder:validation:Enum=Once;Cron
+	// +optional
+	Policy Policy `json:"policy,omitempty"`
+	// Schedule is the schedule in standard 5-field cron format (minute hour day-of-month month day-of-week).
+	// It is required and takes effect only when Policy is set to Cron, see https://en.wikipedia.org/wiki/Cron.
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
 }
 
 // +kubebuilder:printcolumn:name="Dataset",type="string",JSONPath=`.spec.dataset`
@@ -44,6 +56,7 @@ type DataBackupSpec struct {
 // +kubebuilder:printcolumn:name="Path",type="string",JSONPath=`.status.infos.BackupLocationPath`
 // +kubebuilder:printcolumn:name="NodeName",type="string",JSONPath=`.status.infos.BackupLocationNodeName`
 // +kubebuilder:printcolumn:name="Duration",type="string",JSONPath=`.status.duration`
+// +kubebuilder:printcolumn:name="LastSchedule",type="date",JSONPath=`.status.lastScheduleTime`
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

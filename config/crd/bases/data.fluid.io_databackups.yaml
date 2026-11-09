@@ -34,6 +34,9 @@ spec:
     - jsonPath: .status.duration
       name: Duration
       type: string
+    - jsonPath: .status.lastScheduleTime
+      name: LastSchedule
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -52,6 +55,12 @@ spec:
               backupPath:
                 type: string
               dataset:
+                type: string
+              policy:
+                default: Once
+                enum:
+                - Once
+                - Cron
                 type: string
               runAfter:
                 properties:
@@ -136,6 +145,8 @@ spec:
                 - uid
                 - user
                 type: object
+              schedule:
+                type: string
               ttlSecondsAfterFinished:
                 format: int32
                 type: integer
@@ -164,6 +175,8 @@ spec:
                   - type
                   type: object
                 type: array
+              currentExecutionId:
+                type: string
               duration:
                 type: string
               infos:

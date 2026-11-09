@@ -1,0 +1,136 @@
+{{/*
+Shared pod spec for the DataBackup. It is rendered either as the spec of the standalone
+Pod used by the Once policy or as the spec of the pod template of the CronJob Job used by
+the Cron policy. Keep the body at column zero and include it with `nindent` so both
+workloads stay byte-for-byte equivalent.
+*/}}
+{{- define "fluid.databackup.podSpec" -}}
+{{- if .Values.dataBackup.nodeName }}
+nodeName: {{ .Values.dataBackup.nodeName }}
+{{- end }}
+{{- with .Values.dataBackup.imagePullSecrets }}
+imagePullSecrets:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{ if .Values.initUsers.enabled -}}
+initContainers:
+  - name: init-users
+    image: {{ .Values.initUsers.image }}:{{ .Values.initUsers.imageTag }}
+    imagePullPolicy: {{ .Values.initUsers.imagePullPolicy }}
+    command: ["/entrypoint.sh"]
+    args:
+      - "init_users"
+    env:
+      {{- if .Values.initUsers.envUsers }}
+      - name: FLUID_INIT_USERS
+        value: {{.Values.initUsers.envUsers | quote }}
+      {{- end }}
+    volumeMounts:
+      - name: dir
+        mountPath: /tmp
+      - name: user
+        mountPath: /tmp/passwd
+      - name: group
+        mountPath: /tmp/group
+{{- end }}
+containers:
+  - name: tool
+    command: ["/bin/sh", "-c"]
+    args:
+      - "/scripts/databackup.sh"
+    image: {{ .Values.dataBackup.image }}
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      runAsUser: {{ .Values.user }}
+      runAsGroup: {{ .Values.group }}
+    env:
+      {{- if .Values.dataBackup.javaEnv }}
+      - name: ALLUXIO_JAVA_OPTS
+        value: {{ .Values.dataBackup.javaEnv | quote }}
+      {{- end }}
+      {{- if .Values.dataBackup.namespace }}
+      - name: DATASET_NAMESPACE
+        value: {{ .Values.dataBackup.namespace | quote }}
+      {{- end }}
+      {{- if .Values.dataBackup.dataset }}
+      - name: DATASET_NAME
+        value: {{ .Values.dataBackup.dataset | quote }}
+      {{- end }}
+      {{- if .Values.dataBackup.pvcName }}
+      - name: BACKUP_PVC
+        value: {{ .Values.dataBackup.pvcName | quote }}
+      {{- end }}
+      {{- if .Values.dataBackup.path }}
+      - name: BACKUP_PATH
+        value: {{ .Values.dataBackup.path | quote }}
+      {{- end }}
+    volumeMounts:
+      {{- if .Values.dataBackup.workdir }}
+      - name: backup
+        mountPath: /alluxio_backups
+      {{- end }}
+      - mountPath: /scripts
+        name: script
+      {{- if .Values.dataBackup.pvcName }}
+      - mountPath: /pvc
+        name: pvc
+      {{- else }}
+      - mountPath: /host
+        name: host
+      {{- end }}
+      {{- if .Values.initUsers.enabled }}
+      - name: user
+        mountPath: /etc/passwd
+        readOnly: true
+      - name: group
+        mountPath: /etc/group
+        readOnly: true
+      {{- end}}
+{{- if .Values.dataBackup.affinity }}
+affinity:
+{{ toYaml .Values.dataBackup.affinity | indent 2 }}
+{{- end }}
+
+restartPolicy: Never
+volumes:
+  {{- if .Values.dataBackup.workdir }}
+  - name: backup
+    hostPath:
+      {{- if .Values.dataBackup.namespace }}
+      path: {{ .Values.dataBackup.workdir  }}/alluxio-backup/{{ .Values.dataBackup.namespace }}/{{  .Values.dataBackup.dataset }}
+      {{- else }}
+      path: {{ .Values.dataBackup.workdir  }}/alluxio-backup/default/{{ .Values.dataBackup.dataset }}
+      {{- end }}
+      type: DirectoryOrCreate
+  {{- end }}
+  {{- if .Values.dataBackup.pvcName }}
+  - name: pvc
+    persistentVolumeClaim:
+      claimName: {{ .Values.dataBackup.pvcName }}
+  {{- else }}
+  - name: host
+    hostPath:
+      path: {{ .Values.dataBackup.path }}
+  {{- end }}
+  - name: script
+    configMap:
+      name: {{ .Values.dataBackup.name }}-script
+      items:
+          - key: databackuper.alluxio
+            path: databackup.sh
+            mode: 365
+  {{- if .Values.initUsers.enabled }}
+  - name: dir
+    hostPath:
+      path: {{ .Values.initUsers.dir }}
+      type: DirectoryOrCreate
+  - name: user
+    hostPath:
+      path: {{ .Values.initUsers.dir }}/passwd
+      type: FileOrCreate
+  - name: group
+    hostPath:
+      path: {{ .Values.initUsers.dir }}/group
+      type: FileOrCreate
+  {{- end }}
+{{- end -}}

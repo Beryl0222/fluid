@@ -45,6 +45,13 @@ dataBackup:
   # Description: optional image pull secrets on DataLoad pods
   imagePullSecrets: []
 
+  # Optional
+  # Description: execution policy of the DataBackup, either Once (default, run one time)
+  # or Cron (run repeatedly according to schedule). Only standard 5-field cron format is
+  # supported: minute hour day-of-month month day-of-week.
+  policy: Once
+  # schedule: "0 2 * * *"
+
   affinity:
 
 initUsers:

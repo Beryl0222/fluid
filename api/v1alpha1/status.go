@@ -150,6 +150,13 @@ type OperationStatus struct {
 	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
 	// LastSuccessfulTime is the last time the cron operation successfully completed
 	LastSuccessfulTime *metav1.Time `json:"lastSuccessfulTime,omitempty"`
+	// CurrentExecutionID is the identity of the currently tracked scheduled execution round.
+	// It is derived from the scheduled time of the round and is also stamped onto the
+	// workload of the round, so that an execution round can always be recognized and
+	// reconciled from Kubernetes objects after controller restarts. It is cleared once
+	// the round finishes (either complete or failed). Only used by cron-style operations.
+	// +optional
+	CurrentExecutionID string `json:"currentExecutionId,omitempty"`
 	// WaitingStatus stores information about waiting operation.
 	WaitingFor WaitingStatus `json:"waitingFor,omitempty"`
 

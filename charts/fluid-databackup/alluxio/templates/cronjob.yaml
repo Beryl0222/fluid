@@ -1,0 +1,63 @@
+{{- if eq (lower .Values.dataBackup.policy) "cron" }}
+apiVersion: {{ ternary "batch/v1" "batch/v1beta1" (.Capabilities.APIVersions.Has "batch/v1/CronJob") }}
+kind: CronJob
+metadata:
+  name: {{ printf "%s-backup" .Release.Name }}
+  labels:
+    release: {{ .Release.Name }}
+    role: databackup-cronjob
+    app: alluxio
+    targetDataset: {{ .Values.dataBackup.dataset }}
+    databackup: {{ .Values.dataBackup.name }}
+    fluid.io/jobPolicy: cron
+    {{- include "library.fluid.labels" . | nindent 4 }}
+  ownerReferences:
+  {{- if .Values.owner.enabled }}
+    - apiVersion: {{ .Values.owner.apiVersion }}
+      blockOwnerDeletion: {{ .Values.owner.blockOwnerDeletion }}
+      controller: {{ .Values.owner.controller }}
+      kind: {{ .Values.owner.kind }}
+      name: {{ .Values.owner.name }}
+      uid: {{ .Values.owner.uid }}
+  {{- end }}
+spec:
+  # The CronJob is created suspended. The controller only unsuspends it for the current scheduled
+  # round after it has acquired the target Dataset occupation, and suspends it again as soon as the
+  # round Job has been observed, so that exactly one backup Pod is in flight per scheduled time.
+  schedule: {{ required "schedule should be set when policy is cron" .Values.dataBackup.schedule | quote }}
+  suspend: true
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        release: {{ .Release.Name }}
+        role: databackup-job
+        app: alluxio
+        cronjob: {{ printf "%s-backup" .Release.Name }}
+        targetDataset: {{ .Values.dataBackup.dataset }}
+        databackup: {{ .Values.dataBackup.name }}
+        fluid.io/jobPolicy: cron
+        {{- include "library.fluid.labels" . | nindent 8 }}
+    spec:
+      # do not retry a failed backup within the same round; the next scheduled time forms a new round
+      backoffLimit: 0
+      completions: 1
+      parallelism: 1
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+          labels:
+            release: {{ .Release.Name }}
+            role: databackup-pod
+            app: alluxio
+            cronjob: {{ printf "%s-backup" .Release.Name }}
+            targetDataset: {{ .Values.dataBackup.dataset }}
+            databackup: {{ .Values.dataBackup.name }}
+            {{- include "library.fluid.labels" . | nindent 12 }}
+        spec:
+{{- include "fluid.databackup.podSpec" . | nindent 10 }}
+{{- end }}

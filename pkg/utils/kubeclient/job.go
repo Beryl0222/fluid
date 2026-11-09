@@ -92,3 +92,25 @@ func GetFinishedJobCondition(job *v1.Job) *v1.JobCondition {
 	}
 	return nil
 }
+
+// ListPodsForJob lists all pods that belong to the given Job according to the
+// Job's pod selector.
+func ListPodsForJob(c client.Client, job *v1.Job) (pods []corev1.Pod, err error) {
+	return ListPodsForJobWithContext(context.TODO(), c, job)
+}
+
+// ListPodsForJobWithContext is the context aware variant of ListPodsForJob.
+func ListPodsForJobWithContext(ctx context.Context, c client.Client, job *v1.Job) (pods []corev1.Pod, err error) {
+	selector, err := metav1.LabelSelectorAsSelector(job.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("error converting Job %s in namespace %s selector: %w", job.Name, job.Namespace, err)
+	}
+	var podList corev1.PodList
+	if err = c.List(ctx, &podList, &client.ListOptions{
+		Namespace:     job.Namespace,
+		LabelSelector: selector,
+	}); err != nil {
+		return nil, fmt.Errorf("error listing pods for Job %s in namespace %s: %w", job.Name, job.Namespace, err)
+	}
+	return podList.Items, nil
+}

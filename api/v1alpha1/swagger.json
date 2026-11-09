@@ -1131,6 +1131,15 @@
           "description": "TTLSecondsAfterFinished is the time second to clean up data operations after finished or failed",
           "type": "integer",
           "format": "int32"
+        },
+        "policy": {
+          "description": "Policy defines the execution policy of the DataBackup, default is Once which runs the backup exactly one time. When set to Cron, the DataBackup runs repeatedly according to the Schedule and each scheduled time forms an independent backup execution round.",
+          "type": "string",
+          "default": "Once"
+        },
+        "schedule": {
+          "description": "Schedule is the schedule in standard 5-field cron format (minute hour day-of-month month day-of-week). It is required and takes effect only when Policy is set to Cron, see https://en.wikipedia.org/wiki/Cron.",
+          "type": "string"
         }
       }
     },
@@ -3206,6 +3215,10 @@
         "lastSuccessfulTime": {
           "description": "LastSuccessfulTime is the last time the cron operation successfully completed",
           "$ref": "#/definitions/v1.Time"
+        },
+        "currentExecutionId": {
+          "description": "CurrentExecutionID is the identity of the currently tracked scheduled execution round. It is derived from the scheduled time of the round and is also stamped onto the workload of the round, so that an execution round can always be recognized and reconciled from Kubernetes objects after controller restarts. It is cleared once the round finishes (either complete or failed). Only used by cron-style operations.",
+          "type": "string"
         },
         "nodeAffinity": {
           "description": "NodeAffinity records the node affinity for operation pods",

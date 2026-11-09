@@ -19,6 +19,8 @@ package dataoperation
 //go:generate mockgen -source=interface.go -destination=mock/mock_operation.go -package=mock
 
 import (
+	"time"
+
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -80,4 +82,32 @@ type OperationInterface interface {
 type StatusHandler interface {
 	// GetOperationStatus get operation status according to helm chart status
 	GetOperationStatus(ctx runtime.ReconcileRequestContext, opStatus *datav1alpha1.OperationStatus) (result *datav1alpha1.OperationStatus, err error)
+}
+
+// ScheduledOperation is optionally implemented by operations whose executions are organized
+// into schedule driven rounds (cron policy). It is consulted during the Pending phase before
+// the target dataset's operation occupation is taken, so that a workload pod is released only
+// after the occupation of the current round is acquired and rounds never overlap.
+type ScheduledOperation interface {
+	// IsScheduled reports whether the operation is currently driven by a schedule.
+	IsScheduled() bool
+
+	// ReconcileScheduledRound converges the Pending phase for a scheduled operation. It must be
+	// idempotent and derive every decision from Kubernetes objects so that it keeps converging
+	// after controller restarts or intermediate workload states:
+	//   - when a scheduled round is already open in opStatus but not closed yet, it ensures the
+	//     dataset occupation is held and returns roundOpen=true to re-enter the Executing phase;
+	//   - when a new scheduled time is due, it invokes acquireOccupation exactly once, records the
+	//     scheduled time and the round identity, advances the phase to Executing and returns
+	//     roundOpen=true;
+	//   - when no scheduled time is due, it releases any stale occupation, stays in Pending and
+	//     returns roundOpen=false together with the duration after which to reconcile again.
+	// The same scheduled time must never be started twice; releasing the occupation is delegated to
+	// releaseOccupation so that a stale occupation can be healed without leaving an OperationRef behind.
+	ReconcileScheduledRound(
+		ctx runtime.ReconcileRequestContext,
+		opStatus *datav1alpha1.OperationStatus,
+		acquireOccupation func() error,
+		releaseOccupation func() error,
+	) (roundOpen bool, requeueAfter time.Duration, err error)
 }

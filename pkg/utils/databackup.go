@@ -67,6 +67,12 @@ func GetDataBackupPodName(name string) string {
 	return fmt.Sprintf("%s-pod", name)
 }
 
+// GetDataBackupCronJobName returns DataBackup CronJob's name given the DataBackup helm release's name.
+// It is only used by DataBackup with Cron policy.
+func GetDataBackupCronJobName(releaseName string) string {
+	return fmt.Sprintf("%s-backup", releaseName)
+}
+
 // ParseBackupRestorePath parse the BackupPath in spec of DataBackup or the RestorePath in spec of Dataset
 func ParseBackupRestorePath(backupRestorePath string) (pvcName string, path string, err error) {
 	if backupRestorePath == "" {
